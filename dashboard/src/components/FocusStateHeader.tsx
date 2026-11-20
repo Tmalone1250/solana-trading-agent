@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { Activity, Download, ShieldAlert, ShieldCheck, Wallet } from "lucide-react";
 import { FocusState, TelemetryPayload, formatShortTime, formatSol } from "@/lib/types";
 
@@ -29,11 +30,42 @@ const STATE_STYLES: Record<FocusState, { badge: string; dot: string; label: stri
 };
 
 export function FocusStateHeader({ telemetry, agentUrl, error, lastFetchedAt }: Props) {
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+
   const stateKey: FocusState = telemetry?.focus_state ?? "SCANNING";
   const st = STATE_STYLES[stateKey] ?? STATE_STYLES.SCANNING;
   const isLive = telemetry?.execution_mode === "live";
   const dailyPnl = telemetry?.daily_pnl_sol ?? 0;
   const halted = telemetry?.daily_max_loss_hit ?? false;
+
+  async function handleExportCsv() {
+    if (exporting) return;
+    setExporting(true);
+    setExportError(null);
+    try {
+      const res = await fetch(`${agentUrl}/api/export/actions.csv`, {
+        method: "GET",
+        cache: "no-store",
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "solana_actions.csv";
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setExportError(err instanceof Error ? err.message : "Export failed");
+    } finally {
+      setExporting(false);
+    }
+  }
 
   return (
     <header className="rounded-2xl border border-slate-800/80 bg-slate-900/70 p-4 backdrop-blur sm:p-5">
@@ -77,15 +109,20 @@ export function FocusStateHeader({ telemetry, agentUrl, error, lastFetchedAt }: 
             </span>
           )}
 
-          <a
-            href={`${agentUrl}/api/export/actions.csv`}
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center gap-1.5 rounded-full border border-slate-700/80 bg-slate-950/80 px-2.5 py-1 font-mono text-[11px] font-medium text-slate-200 transition hover:border-sky-500/60 hover:text-sky-300"
+          <button
+            type="button"
+            onClick={handleExportCsv}
+            disabled={exporting}
+            className="inline-flex cursor-pointer items-center gap-1.5 rounded-full border border-slate-700/80 bg-slate-950/80 px-2.5 py-1 font-mono text-[11px] font-medium text-slate-200 transition hover:border-sky-500/60 hover:text-sky-300 disabled:cursor-wait disabled:opacity-60"
           >
             <Download className="h-3 w-3 text-sky-400" />
-            Export CSV
-          </a>
+            {exporting ? "Exporting..." : "Export CSV"}
+          </button>
+          {exportError && (
+            <span className="font-mono text-[11px] text-rose-400">
+              CSV export failed: {exportError}
+            </span>
+          )}
         </div>
 
         {/* Right: Equity, Daily PnL, Circuit Breaker */}
