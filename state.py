@@ -90,6 +90,7 @@ class PendingOrder(BaseModel):
     apply_cooldown: bool = False
     entry_liquidity_usd: float = 0.0
     run_peak_sol: Optional[float] = None
+    strategy: str = ""
     rationale: str = ""
 
 

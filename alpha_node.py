@@ -324,7 +324,7 @@ async def alpha_node(
     answers = await decision_client.decide(input_text=input_text, questions=questions)
 
     decisions: list[AlphaDecision] = []
-    approved_pairs: list[tuple[AlphaDecision, dict[str, Any], bool, float]] = []
+    approved_pairs: list[tuple[AlphaDecision, dict[str, Any], bool, float, str]] = []
 
     for idx, (cand, leg2, scalper) in enumerate(zip(safe_candidates, leg2_results, scalper_results)):
         prefix = f"t{idx}"
@@ -445,7 +445,9 @@ async def alpha_node(
                 scalper_eligible=scalper.eligible,
                 dist_from_1h_high_pct=scalper.dist_from_1h_high_pct,
             )
-            approved_pairs.append((dec, cand, leg2_fast_track and not standard_approved, leg2_score))
+            approved_pairs.append(
+                (dec, cand, leg2_fast_track and not standard_approved, leg2_score, scalper.setup_type)
+            )
             continue
 
         # Blocked by Scalper Expert Entry Engine (retain in watchlist)
@@ -477,12 +479,22 @@ async def alpha_node(
         # Immediate eviction at >= 0.85, OR 2 consecutive cycles at >= 0.75 -> 20m cooldown
         prev_vamp_strikes = int((watchlist_by_mint.get(dec.mint) or {}).get("vamp_strikes") or 0)
         if dec.is_copycat_vamp >= config.VAMP_EVICT_THRESHOLD:
+            evict_reason = f"HIGH_VAMP ({dec.is_copycat_vamp:.2f} >= {config.VAMP_EVICT_THRESHOLD:.2f})"
             db.remove_from_watchlist(dec.mint)
             db.set_cooldown_minutes(
                 dec.mint,
                 minutes=config.VAMP_DROP_COOLDOWN_MINUTES,
-                reason=f"HIGH_VAMP ({dec.is_copycat_vamp:.2f} >= {config.VAMP_EVICT_THRESHOLD:.2f})",
+                reason=evict_reason,
                 now=now_dt,
+            )
+            db.log_action(
+                mode=config.EXECUTION_MODE,
+                action="EVICT",
+                symbol=dec.symbol,
+                asset_id=dec.mint,
+                strategy=scalper.setup_type,
+                reason=evict_reason,
+                timestamp_utc=now_iso,
             )
             logger.info(
                 "[Alpha] $%s | action=%s (%.2f) | narr=%.1f mom=%.1f vamp=%.2f leg2=%.0f/100 -> EVICTED (vamp >= %.2f, %dm cooldown)",
@@ -502,15 +514,25 @@ async def alpha_node(
         if dec.is_copycat_vamp >= config.VAMP_WARN_THRESHOLD:
             new_vamp_strikes = prev_vamp_strikes + 1
             if new_vamp_strikes >= config.VAMP_CONSECUTIVE_STRIKES:
+                evict_reason = (
+                    f"CONSECUTIVE_VAMP ({dec.is_copycat_vamp:.2f} >= {config.VAMP_WARN_THRESHOLD:.2f}, "
+                    f"{new_vamp_strikes}/{config.VAMP_CONSECUTIVE_STRIKES} strikes)"
+                )
                 db.remove_from_watchlist(dec.mint)
                 db.set_cooldown_minutes(
                     dec.mint,
                     minutes=config.VAMP_DROP_COOLDOWN_MINUTES,
-                    reason=(
-                        f"CONSECUTIVE_VAMP ({dec.is_copycat_vamp:.2f} >= {config.VAMP_WARN_THRESHOLD:.2f}, "
-                        f"{new_vamp_strikes}/{config.VAMP_CONSECUTIVE_STRIKES} strikes)"
-                    ),
+                    reason=evict_reason,
                     now=now_dt,
+                )
+                db.log_action(
+                    mode=config.EXECUTION_MODE,
+                    action="EVICT",
+                    symbol=dec.symbol,
+                    asset_id=dec.mint,
+                    strategy=scalper.setup_type,
+                    reason=evict_reason,
+                    timestamp_utc=now_iso,
                 )
                 logger.info(
                     "[Alpha] $%s | action=%s (%.2f) | narr=%.1f mom=%.1f vamp=%.2f leg2=%.0f/100 -> EVICTED (vamp >= %.2f x%d strikes, %dm cooldown)",
@@ -532,15 +554,25 @@ async def alpha_node(
             dec.narrative_strength < config.LOW_SCORE_EVICT_THRESHOLD
             and dec.momentum_quality < config.LOW_SCORE_EVICT_THRESHOLD
         ):
+            evict_reason = (
+                f"LOW_SCORE (narr={dec.narrative_strength:.2f}, "
+                f"mom={dec.momentum_quality:.2f} < {config.LOW_SCORE_EVICT_THRESHOLD:.1f})"
+            )
             db.remove_from_watchlist(dec.mint)
             db.set_cooldown_minutes(
                 dec.mint,
                 minutes=config.LOW_SCORE_COOLDOWN_MINUTES,
-                reason=(
-                    f"LOW_SCORE (narr={dec.narrative_strength:.2f}, "
-                    f"mom={dec.momentum_quality:.2f} < {config.LOW_SCORE_EVICT_THRESHOLD:.1f})"
-                ),
+                reason=evict_reason,
                 now=now_dt,
+            )
+            db.log_action(
+                mode=config.EXECUTION_MODE,
+                action="EVICT",
+                symbol=dec.symbol,
+                asset_id=dec.mint,
+                strategy=scalper.setup_type,
+                reason=evict_reason,
+                timestamp_utc=now_iso,
             )
             logger.info(
                 "[Alpha] $%s | action=%s (%.2f) | narr=%.1f mom=%.1f vamp=%.2f leg2=%.0f/100 -> EVICTED (narr < %.1f & mom < %.1f, %dm cooldown)",
@@ -565,12 +597,22 @@ async def alpha_node(
                 added_dt = added_dt.replace(tzinfo=timezone.utc)
             elapsed_min = (now_dt - added_dt).total_seconds() / 60.0
             if elapsed_min > config.STALE_WATCH_TIMEOUT_MINUTES:
+                evict_reason = f"STALE_WATCH ({elapsed_min:.1f}m > {config.STALE_WATCH_TIMEOUT_MINUTES}m)"
                 db.remove_from_watchlist(dec.mint)
                 db.set_cooldown_minutes(
                     dec.mint,
                     minutes=config.STALE_WATCH_COOLDOWN_MINUTES,
-                    reason=f"STALE_WATCH ({elapsed_min:.1f}m > {config.STALE_WATCH_TIMEOUT_MINUTES}m)",
+                    reason=evict_reason,
                     now=now_dt,
+                )
+                db.log_action(
+                    mode=config.EXECUTION_MODE,
+                    action="EVICT",
+                    symbol=dec.symbol,
+                    asset_id=dec.mint,
+                    strategy=scalper.setup_type,
+                    reason=evict_reason,
+                    timestamp_utc=now_iso,
                 )
                 logger.info(
                     "[Alpha] $%s | action=%s (%.2f) | narr=%.1f mom=%.1f vamp=%.2f leg2=%.0f/100 -> EVICTED (stale %.1fm > %dm, %dm cooldown)",
@@ -635,7 +677,7 @@ async def alpha_node(
         ),
         reverse=True,
     )
-    winner, winner_cand, is_leg2_only, _ = approved_pairs[0]
+    winner, winner_cand, is_leg2_only, _, winner_setup = approved_pairs[0]
 
     order = PendingOrder(
         side="BUY",
@@ -646,6 +688,7 @@ async def alpha_node(
         target_state_after_fill=FocusState.IN_POSITION,
         apply_cooldown=False,
         entry_liquidity_usd=float(winner_cand.get("liquidity_usd") or 0.0),
+        strategy="LEG2_ENTRY" if is_leg2_only else winner_setup,
         rationale=winner.rationale,
     )
     return {

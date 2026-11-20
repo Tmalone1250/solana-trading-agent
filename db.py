@@ -11,6 +11,23 @@ import duckdb
 
 from state import FocusState
 
+ACTION_LOG_COLUMNS = [
+    "timestamp_utc",
+    "bot",
+    "mode",
+    "action",
+    "symbol",
+    "asset_id",
+    "qty",
+    "notional",
+    "unit",
+    "price_or_value",
+    "pnl_amount",
+    "pnl_pct",
+    "strategy",
+    "reason",
+]
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -127,6 +144,32 @@ class AgentDatabase:
                     last_evaluated_at VARCHAR,
                     latest_scores_json VARCHAR,
                     candidate_json VARCHAR NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE SEQUENCE IF NOT EXISTS action_log_id_seq START 1
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS action_log (
+                    id INTEGER DEFAULT nextval('action_log_id_seq') PRIMARY KEY,
+                    timestamp_utc VARCHAR NOT NULL,
+                    bot VARCHAR NOT NULL DEFAULT 'solana_meme',
+                    mode VARCHAR NOT NULL,
+                    action VARCHAR NOT NULL,
+                    symbol VARCHAR NOT NULL,
+                    asset_id VARCHAR NOT NULL,
+                    qty DOUBLE,
+                    notional DOUBLE,
+                    unit VARCHAR NOT NULL DEFAULT 'SOL',
+                    price_or_value DOUBLE,
+                    pnl_amount DOUBLE,
+                    pnl_pct DOUBLE,
+                    strategy VARCHAR,
+                    reason VARCHAR
                 )
                 """
             )
@@ -572,6 +615,96 @@ class AgentDatabase:
                 }
             )
         return closed
+
+    def log_action(
+        self,
+        *,
+        mode: str,
+        action: str,
+        symbol: str,
+        asset_id: str,
+        qty: Optional[float] = None,
+        notional: Optional[float] = None,
+        unit: str = "SOL",
+        price_or_value: Optional[float] = None,
+        pnl_amount: Optional[float] = None,
+        pnl_pct: Optional[float] = None,
+        strategy: str = "",
+        reason: str = "",
+        bot: str = "solana_meme",
+        timestamp_utc: Optional[str] = None,
+    ) -> None:
+        """Append a real action row to DuckDB action_log (never routine scan ticks)."""
+        ts = timestamp_utc or utc_now_iso()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO action_log (
+                    timestamp_utc, bot, mode, action, symbol, asset_id,
+                    qty, notional, unit, price_or_value, pnl_amount, pnl_pct,
+                    strategy, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    ts,
+                    bot,
+                    mode,
+                    action.upper(),
+                    symbol,
+                    asset_id,
+                    qty,
+                    notional,
+                    unit,
+                    price_or_value,
+                    pnl_amount,
+                    pnl_pct,
+                    strategy,
+                    reason,
+                ],
+            )
+
+    def get_action_log(
+        self,
+        *,
+        limit: int = 1000,
+        actions: Optional[list[str]] = None,
+    ) -> list[dict[str, Any]]:
+        """Query action_log newest-first with optional action type filtering."""
+        cols_sql = ", ".join(ACTION_LOG_COLUMNS)
+        with self._lock:
+            if actions:
+                clean = [a.strip().upper() for a in actions if a.strip()]
+                if clean:
+                    placeholders = ", ".join("?" for _ in clean)
+                    rows = self._conn.execute(
+                        f"SELECT {cols_sql} FROM action_log WHERE UPPER(action) IN ({placeholders}) ORDER BY id DESC LIMIT ?",
+                        [*clean, int(limit)],
+                    ).fetchall()
+                else:
+                    rows = self._conn.execute(
+                        f"SELECT {cols_sql} FROM action_log ORDER BY id DESC LIMIT ?",
+                        [int(limit)],
+                    ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    f"SELECT {cols_sql} FROM action_log ORDER BY id DESC LIMIT ?",
+                    [int(limit)],
+                ).fetchall()
+        return [dict(zip(ACTION_LOG_COLUMNS, r)) for r in rows]
+
+    def has_circuit_breaker_today(self, now: Optional[datetime] = None) -> bool:
+        """Avoid duplicating CIRCUIT_BREAKER rows on repeated halted ticks in the same UTC day."""
+        today = (now or utc_now()).date().isoformat()
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT 1 FROM action_log
+                WHERE action = 'CIRCUIT_BREAKER' AND timestamp_utc LIKE ?
+                LIMIT 1
+                """,
+                [f"{today}%"],
+            ).fetchone()
+        return row is not None
 
     def log_decision(
         self,

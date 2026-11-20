@@ -1,6 +1,6 @@
 "use client";
 
-import { Activity, ShieldAlert, ShieldCheck, Wallet } from "lucide-react";
+import { Activity, Download, ShieldAlert, ShieldCheck, Wallet } from "lucide-react";
 import { FocusState, TelemetryPayload, formatShortTime, formatSol } from "@/lib/types";
 
 interface Props {
@@ -76,6 +76,16 @@ export function FocusStateHeader({ telemetry, agentUrl, error, lastFetchedAt }: 
               lane: {telemetry.hunting_lane}
             </span>
           )}
+
+          <a
+            href={`${agentUrl}/api/export/actions.csv`}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1.5 rounded-full border border-slate-700/80 bg-slate-950/80 px-2.5 py-1 font-mono text-[11px] font-medium text-slate-200 transition hover:border-sky-500/60 hover:text-sky-300"
+          >
+            <Download className="h-3 w-3 text-sky-400" />
+            Export CSV
+          </a>
         </div>
 
         {/* Right: Equity, Daily PnL, Circuit Breaker */}

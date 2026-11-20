@@ -312,12 +312,22 @@ def _evict_stale_or_cooled_watchlist(
         elapsed_min = (now_dt - added_dt).total_seconds() / 60.0
 
         if elapsed_min > config.STALE_WATCH_TIMEOUT_MINUTES:
+            stale_reason = f"STALE_WATCH ({elapsed_min:.1f}m > {config.STALE_WATCH_TIMEOUT_MINUTES}m)"
             db.remove_from_watchlist(mint)
             db.set_cooldown_minutes(
                 mint,
                 minutes=config.STALE_WATCH_COOLDOWN_MINUTES,
-                reason=f"STALE_WATCH ({elapsed_min:.1f}m > {config.STALE_WATCH_TIMEOUT_MINUTES}m)",
+                reason=stale_reason,
                 now=now_dt,
+            )
+            db.log_action(
+                mode=config.EXECUTION_MODE,
+                action="EVICT",
+                symbol=symbol,
+                asset_id=mint,
+                strategy="WATCHLIST_STALE",
+                reason=stale_reason,
+                timestamp_utc=now_dt.isoformat(),
             )
             logger.info(
                 "[Scanner] $%s | in_slot=%.1fm > %dm -> EVICTED (stale watch, %dm cooldown)",
@@ -346,20 +356,34 @@ async def scanner_node(
         return {"raw_candidates": [], "active_watchlist": db.get_watchlist()}
 
     # Daily max loss circuit breaker
+    now_dt = now or utc_now()
     daily_start = float(state.get("daily_start_sol") or config.PAPER_STARTING_SOL)
     daily_pnl = float(state.get("daily_pnl_sol") or 0.0)
     if daily_start > 0 and (-daily_pnl / daily_start) >= config.DAILY_MAX_LOSS_PCT:
+        loss_pct = (-daily_pnl / daily_start) * 100.0
         logger.warning(
             "Daily max loss limit reached (%.2f%%). Halting scans.",
-            (-daily_pnl / daily_start) * 100.0,
+            loss_pct,
         )
+        if not db.has_circuit_breaker_today(now=now_dt):
+            db.log_action(
+                mode=config.EXECUTION_MODE,
+                action="CIRCUIT_BREAKER",
+                symbol="PORTFOLIO",
+                asset_id="SOL",
+                notional=round(daily_start, 6),
+                pnl_amount=round(daily_pnl, 6),
+                pnl_pct=round(-loss_pct, 2),
+                strategy="DAILY_MAX_LOSS",
+                reason=f"DAILY_MAX_LOSS_HIT ({loss_pct:.2f}% >= {config.DAILY_MAX_LOSS_PCT * 100:.0f}%)",
+                timestamp_utc=now_dt.isoformat(),
+            )
         return {
             "raw_candidates": [],
             "active_watchlist": db.get_watchlist(),
             "halted_daily_loss": True,
         }
 
-    now_dt = now or utc_now()
     current_ms = now_ms if now_ms is not None else int(now_dt.timestamp() * 1000)
 
     # 1. Evict stale (>15m) or cooled-down watchlist entries

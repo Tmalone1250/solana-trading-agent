@@ -281,6 +281,15 @@ async def safety_gate_node(
                         reason=f"SAFETY_REJECT: {reason_str}",
                         now=now,
                     )
+                    db.log_action(
+                        mode=config.EXECUTION_MODE,
+                        action="EVICT",
+                        symbol=symbol,
+                        asset_id=mint,
+                        strategy="SAFETY_GATE",
+                        reason=f"SAFETY_REJECT: {reason_str}",
+                        timestamp_utc=now.isoformat() if now else None,
+                    )
                 logger.info(
                     "[SafetyGate] $%s | REJECTED (%s) -> EVICTED (%dm cooldown)",
                     symbol,

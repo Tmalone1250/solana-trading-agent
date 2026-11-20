@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import csv
+import io
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import AgentConfig, load_config
-from db import AgentDatabase, utc_now
+from db import ACTION_LOG_COLUMNS, AgentDatabase, utc_now
 
 
 def create_telemetry_app(
@@ -152,6 +154,30 @@ def create_telemetry_app(
             "active_cooldowns": database.get_active_cooldowns(),
             "updated_at": st["updated_at"],
         }
+
+    @app.get("/api/export/actions.csv")
+    def export_actions_csv(
+        limit: int = Query(default=1000, ge=1, le=50_000),
+        actions: Optional[str] = Query(default=None),
+    ) -> Response:
+        action_filter = (
+            [a.strip().upper() for a in actions.split(",") if a.strip()]
+            if actions
+            else None
+        )
+        rows = database.get_action_log(limit=limit, actions=action_filter)
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=ACTION_LOG_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: ("" if row.get(k) is None else row.get(k)) for k in ACTION_LOG_COLUMNS})
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="solana_actions.csv"',
+            },
+        )
 
     return app
 

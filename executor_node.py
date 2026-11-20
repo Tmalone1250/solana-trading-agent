@@ -169,6 +169,18 @@ async def executor_node(
             tx_signature=tx_signature,
             rationale=order.rationale,
         )
+        action_type = "REENTRY_BUY" if order.reason == "LEG_2_REENTRY" else "BUY"
+        db.log_action(
+            mode=config.EXECUTION_MODE,
+            action=action_type,
+            symbol=order.symbol,
+            asset_id=order.mint,
+            qty=float(out_amount),
+            notional=round(spent_sol, 6),
+            price_or_value=round(spent_sol, 6),
+            strategy=order.strategy or order.reason,
+            reason=order.reason,
+        )
         logger.info(
             "[%s] BUY %s: %.4f SOL -> %d tokens (reason=%s)",
             config.EXECUTION_MODE.upper(),
@@ -202,6 +214,19 @@ async def executor_node(
             reason=order.reason,
             tx_signature=tx_signature,
             rationale=order.rationale,
+        )
+        db.log_action(
+            mode=config.EXECUTION_MODE,
+            action="SELL",
+            symbol=order.symbol,
+            asset_id=order.mint,
+            qty=float(order.amount_atomic),
+            notional=round(received_sol, 6),
+            price_or_value=round(received_sol, 6),
+            pnl_amount=round(pnl_sol, 6),
+            pnl_pct=round(pnl_pct * 100.0, 2),
+            strategy=order.strategy or "",
+            reason=order.reason,
         )
 
         if order.target_state_after_fill == FocusState.WATCHING_REENTRY:
