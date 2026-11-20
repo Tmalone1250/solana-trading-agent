@@ -1,0 +1,44 @@
+# Secrets & Environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Python Bytecode & Caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# DuckDB & Runtime Data
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+*.db
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Packaging & Distribution
+build/
+dist/
+*.egg-info/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
