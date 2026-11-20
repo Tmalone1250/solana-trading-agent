@@ -8,7 +8,7 @@ import { WatchlistTable } from "@/components/WatchlistTable";
 import { TelemetryPayload } from "@/lib/types";
 
 const AGENT_URL = (
-  process.env.NEXT_PUBLIC_SOLANA_AGENT_URL || "http://127.0.0.1:8002"
+  process.env.NEXT_PUBLIC_SOLANA_AGENT_URL || "https://solana-api.projectkami.net"
 ).replace(/\/+$/, "");
 
 const POLL_INTERVAL_MS = 3000;
