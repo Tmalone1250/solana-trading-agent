@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from config import AgentConfig, load_config
 from db import AgentDatabase, utc_now
@@ -25,6 +26,13 @@ def create_telemetry_app(
     app = FastAPI(
         title="solana-meme-agent Telemetry API",
         version="1.0.0",
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["GET"],
+        allow_headers=["*"],
     )
 
     @app.get("/health")
@@ -77,6 +85,19 @@ def create_telemetry_app(
             if added_dt.tzinfo is None:
                 added_dt = added_dt.replace(tzinfo=timezone.utc)
             in_slot_sec = max(0.0, (now_dt - added_dt).total_seconds())
+            cand = entry.get("candidate") or {}
+            scores = entry.get("latest_scores") or {}
+            scalper_ok = bool(entry.get("scalper_eligible", False))
+            if scores.get("approved"):
+                slot_status = "APPROVED"
+            elif scores.get("action") == "BUY" and not scalper_ok:
+                slot_status = "BLOCKED"
+            elif not scalper_ok and (in_slot_sec / 60.0) < cfg.MIN_WATCHLIST_SOAK_MINUTES:
+                slot_status = "SOAKING"
+            elif not scalper_ok:
+                slot_status = "BLOCKED"
+            else:
+                slot_status = "READY"
             active_watchlist_payload.append(
                 {
                     "mint": entry["mint"],
@@ -84,14 +105,18 @@ def create_telemetry_app(
                     "pair_address": entry.get("pair_address") or "",
                     "added_at": entry["added_at"],
                     "safety_passed": bool(entry.get("safety_passed", False)),
+                    "market_cap_usd": float(cand.get("market_cap_usd") or 0.0),
+                    "liquidity_usd": float(cand.get("liquidity_usd") or 0.0),
                     "peak_mc": float(entry.get("peak_mc") or 0.0),
                     "low_mc": float(entry.get("low_mc") or 0.0),
                     "leg2_score": float(entry.get("leg2_score") or 0.0),
                     "leg2_breakdown": entry.get("leg2_breakdown"),
+                    "vamp_strikes": int(entry.get("vamp_strikes") or 0),
                     "rsi_5m": entry.get("rsi_5m"),
                     "setup_type": entry.get("setup_type") or "NONE",
-                    "scalper_eligible": bool(entry.get("scalper_eligible", False)),
+                    "scalper_eligible": scalper_ok,
                     "dist_from_1h_high_pct": entry.get("dist_from_1h_high_pct"),
+                    "status": slot_status,
                     "time_in_slot_seconds": round(in_slot_sec, 1),
                     "time_in_slot_minutes": round(in_slot_sec / 60.0, 2),
                     "last_evaluated_at": entry["last_evaluated_at"],
@@ -123,7 +148,7 @@ def create_telemetry_app(
                 }
                 for d in recent_decisions
             ],
-            "recent_trades": database.get_recent_trades(limit=10),
+            "recent_trades": database.get_recent_closed_trades(limit=15),
             "active_cooldowns": database.get_active_cooldowns(),
             "updated_at": st["updated_at"],
         }

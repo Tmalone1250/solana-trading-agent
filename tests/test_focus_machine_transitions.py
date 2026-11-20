@@ -360,11 +360,25 @@ async def test_langgraph_end_to_end_and_telemetry_api(tmp_path):
     assert result["focus_state"] == FocusState.IN_POSITION.value
     assert result["active_position"]["symbol"] == "GRAD"
 
-    # Verify FastAPI GET /api/telemetry reflects the live DuckDB state
+    # Verify FastAPI GET /api/telemetry reflects the live DuckDB state, CORS, & closed recent_trades
+    db.log_trade(
+        mode="paper",
+        side="SELL",
+        mint="MintClosed1",
+        symbol="WIN",
+        in_amount=1_000_000,
+        out_amount=575_000_000,
+        sol_value=0.575,
+        pnl_sol=0.075,
+        pnl_pct=0.15,
+        reason="TRAILING_TP",
+        tx_signature="paper-sell-1",
+    )
     app = create_telemetry_app(config=cfg, db=db)
     test_client = TestClient(app)
-    resp = test_client.get("/api/telemetry")
+    resp = test_client.get("/api/telemetry", headers={"Origin": "http://localhost:3000"})
     assert resp.status_code == 200
+    assert resp.headers.get("access-control-allow-origin") == "*"
     payload = resp.json()
     assert payload["focus_state"] == "IN_POSITION"
     assert payload["active_mint"] == "MintGrad11111111111111111111111111111111111"
@@ -373,4 +387,14 @@ async def test_langgraph_end_to_end_and_telemetry_api(tmp_path):
     assert payload["live_jupiter_pnl"]["entry_sol"] == 0.5
     assert len(payload["decision_1_rationales"]) == 1
     assert "[DECISION-1 ENTRY] GRAD" in payload["latest_decision_1_rationale"]
+    assert len(payload["recent_trades"]) == 1
+    closed = payload["recent_trades"][0]
+    assert closed["symbol"] == "WIN"
+    assert closed["mint"] == "MintClosed1"
+    assert closed["entry_sol"] == 0.5
+    assert closed["exit_sol"] == 0.575
+    assert closed["pnl_sol"] == 0.075
+    assert closed["pnl_pct"] == 15.0
+    assert closed["exit_reason"] == "TRAILING_TP"
+    assert closed["closed_at"]
     db.close()

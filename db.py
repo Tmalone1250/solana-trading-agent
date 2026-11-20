@@ -540,6 +540,39 @@ class AgentDatabase:
         ]
         return [dict(zip(keys, r)) for r in rows]
 
+    def get_recent_closed_trades(self, limit: int = 15) -> list[dict[str, Any]]:
+        """Return the last N closed trades (SELL fills) with entry/exit SOL and PnL."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT symbol, mint, sol_value, pnl_sol, pnl_pct, reason, timestamp
+                FROM trades
+                WHERE UPPER(side) = 'SELL'
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                [limit],
+            ).fetchall()
+        closed: list[dict[str, Any]] = []
+        for symbol, mint, exit_sol, pnl_sol, pnl_pct, reason, ts in rows:
+            exit_val = float(exit_sol or 0.0)
+            pnl_val = float(pnl_sol or 0.0)
+            entry_val = max(0.0, exit_val - pnl_val)
+            pct_val = float(pnl_pct or 0.0) * 100.0
+            closed.append(
+                {
+                    "symbol": symbol,
+                    "mint": mint,
+                    "entry_sol": round(entry_val, 6),
+                    "exit_sol": round(exit_val, 6),
+                    "pnl_sol": round(pnl_val, 6),
+                    "pnl_pct": round(pct_val, 2),
+                    "exit_reason": reason,
+                    "closed_at": ts,
+                }
+            )
+        return closed
+
     def log_decision(
         self,
         *,

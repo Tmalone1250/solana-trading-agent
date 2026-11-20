@@ -37,6 +37,11 @@ build/
 dist/
 *.egg-info/
 
+# Next.js Dashboard
+dashboard/node_modules/
+dashboard/.next/
+dashboard/.env.local
+
 # IDE & OS
 .vscode/
 .idea/
