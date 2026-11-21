@@ -211,4 +211,67 @@ async def test_coiling_base_retention_and_breakout_ignition_csv_logging(tmp_path
     d1 = next(r for r in rows if r["action"] == "DECISION_1" and r["symbol"] == "IGNITE")
     assert d1["strategy"] == "BREAKOUT_IGNITION"
     assert "ext_ema9=" in d1["reason"] and "vol=" in d1["reason"]
+    # Verify all 6 new breakout_* columns are serialized in DuckDB & /api/export/csv
+    assert int(d1["breakout_score"]) == 100
+    assert d1["breakout_state"] == "IGNITION"
+    assert d1["breakout_timeframe"] == "5m"
+    assert float(d1["breakout_vol_ratio"]) >= 2.0
+    assert float(d1["breakout_ema_ext_pct"]) > 0.0
+    assert d1["breakout_failed_gates"] == ""
+
+    # Verify EVICT row also carries breakout_* columns
+    evict_row = next(r for r in rows if r["action"] == "EVICT" and r["symbol"] == "COIL")
+    assert evict_row["breakout_score"] != ""
+    assert evict_row["breakout_state"] in {"FORMING", "COILING", "IGNITION", "EXTENDED"}
+    assert "VOL_SPIKE(" in evict_row["breakout_failed_gates"]
+
+    # Verify /api/telemetry surfaces breakout_telemetry inside active_watchlist[]
+    db.upsert_watchlist_entry(
+        mint=bo_mint, symbol="IGNITE", added_at=(now_dt - timedelta(minutes=5)).isoformat(),
+        candidate={"mint": bo_mint, "symbol": "IGNITE", "liquidity_usd": 85_000.0, "market_cap_usd": 650_000.0},
+    )
+    await alpha_node(
+        {"focus_state": FocusState.SCANNING.value, "sol_balance": 1.0, "safe_candidates": [bo_cand]},
+        config=cfg, db=db, decision_client=BuyDecision(), now=now_dt,  # type: ignore[arg-type]
+    )
+    tel = tc.get("/api/telemetry").json()
+    slot = next(s for s in tel["active_watchlist"] if s["mint"] == bo_mint)
+    bt = slot["breakout_telemetry"]
+    assert bt is not None
+    assert bt["score"] == 100
+    assert bt["state"] == "IGNITION"
+    assert bt["timeframe"] == "5m"
+    assert "COIL" in bt["passed_gates"] and "RES" in bt["passed_gates"]
+    assert bt["failed_gates"] == []
     db.close()
+
+
+def test_breakout_telemetry_score_states_and_failed_gates_formatting():
+    # Low-volume, non-breakout coil -> COILING/FORMING with formatted VOL_SPIKE(1.7x<2.0x)
+    candles_low_vol = _make_breakout_candles(
+        count=18, breakout_close=1.12, breakout_high=1.13, breakout_low=1.06, breakout_vol=1700.0
+    )
+    res_lv = evaluate_scalper_entry(candles_low_vol, _strong_flow_pair(1.12), time_in_slot_min=5.0)
+    bt_lv = res_lv.breakout_telemetry
+    assert bt_lv is not None
+    assert bt_lv["score"] == 95  # 100 - 5 (partial vol credit for 1.7x >= 1.5x)
+    assert "VOL_SPIKE(1.7x<2.0x)" in bt_lv["failed_gates"]
+
+    # Over-extended breakout -> state == EXTENDED
+    candles_ext = _make_breakout_candles(
+        count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.07, breakout_vol=3500.0
+    )
+    res_ext = evaluate_scalper_entry(candles_ext, _strong_flow_pair(1.34), time_in_slot_min=5.0)
+    assert res_ext.breakout_telemetry is not None
+    assert res_ext.breakout_telemetry["state"] == "EXTENDED"
+    assert any(g.startswith("EXT(") for g in res_ext.breakout_telemetry["failed_gates"])
+
+    # 1m fallback reports timeframe == "1m_fallback"
+    res_1m = evaluate_scalper_entry(
+        _make_breakout_candles(count=5),
+        _strong_flow_pair(1.12),
+        time_in_slot_min=4.0,
+        candles_1m=_make_breakout_candles(count=20, bar_seconds=60),
+    )
+    assert res_1m.breakout_telemetry is not None
+    assert res_1m.breakout_telemetry["timeframe"] == "1m_fallback"

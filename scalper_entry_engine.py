@@ -19,6 +19,7 @@ class ScalperEntryResult(BaseModel):
     dist_from_1h_high_pct: float = 0.0
     rejection_reason: Optional[str] = None
     breakout_metrics: Optional[dict[str, Any]] = None
+    breakout_telemetry: Optional[dict[str, Any]] = None
 
 
 def _normalize_candles(raw_candles: Sequence[Any]) -> list[dict[str, float]]:
@@ -205,9 +206,9 @@ def evaluate_scalper_entry(
     # 1m Candle Fallback: when < 12 5m candles exist, evaluate BREAKOUT_IGNITION on >= 15 1m bars
     if len(candles) < 12:
         if len(norm_1m) >= 15:
-            bi_1m = detect_breakout_ignition(norm_1m, pair_data, bar_minutes=1)
             closes_1m = [c["close"] for c in norm_1m]
             rsi_1m = compute_rsi(closes_1m, period=14)
+            bi_1m = detect_breakout_ignition(norm_1m, pair_data, bar_minutes=1, rsi_val=rsi_1m)
             high_1m = max(c["high"] for c in norm_1m)
             curr_p = float(pair_data.get("price_usd") or pair_data.get("priceUsd") or closes_1m[-1])
             dist_1m = max(0.0, (high_1m - curr_p) / high_1m) if high_1m > 0 else 0.0
@@ -227,8 +228,10 @@ def evaluate_scalper_entry(
                 dist_from_1h_high_pct=round(dist_1m, 4),
                 rejection_reason=" / ".join(fb_reasons) if fb_reasons else None,
                 breakout_metrics=bi_1m.model_dump(),
+                breakout_telemetry=bi_1m.telemetry.model_dump(),
             )
 
+        bi_short = detect_breakout_ignition(candles, pair_data, bar_minutes=5)
         reasons_short: list[str] = []
         if time_in_slot_min < min_soak:
             reasons_short.append(f"soak {time_in_slot_min:.1f}m < {min_soak:.0f}m")
@@ -240,6 +243,8 @@ def evaluate_scalper_entry(
             rsi_5m=rsi_val,
             dist_from_1h_high_pct=0.0,
             rejection_reason=" / ".join(reasons_short),
+            breakout_metrics=bi_short.model_dump(),
+            breakout_telemetry=bi_short.telemetry.model_dump(),
         )
 
     closes = [c["close"] for c in candles]
@@ -253,17 +258,17 @@ def evaluate_scalper_entry(
         max(0.0, (high_1h - current_price) / high_1h) if high_1h > 0 else 0.0
     )
 
+    # Always compute breakout telemetry for live watchlist Breakout Meter
+    breakout_res = detect_breakout_ignition(candles, pair_data, bar_minutes=5, rsi_val=rsi_5m)
+
     # Gate 3: Core Market-Physics Setup (SWEEP_RECLAIM / DISPLACEMENT_RETEST unchanged; BREAKOUT_IGNITION added)
     setup_type = "NONE"
-    breakout_res = None
     if _detect_sweep_reclaim(candles):
         setup_type = "SWEEP_RECLAIM"
     elif _detect_displacement_retest(candles, rsi_5m):
         setup_type = "DISPLACEMENT_RETEST"
-    else:
-        breakout_res = detect_breakout_ignition(candles, pair_data, bar_minutes=5)
-        if breakout_res.detected:
-            setup_type = "BREAKOUT_IGNITION"
+    elif breakout_res.detected:
+        setup_type = "BREAKOUT_IGNITION"
 
     reasons: list[str] = []
 
@@ -308,4 +313,5 @@ def evaluate_scalper_entry(
         dist_from_1h_high_pct=round(dist_from_1h_high_pct, 4),
         rejection_reason=" / ".join(reasons) if reasons else None,
         breakout_metrics=breakout_res.model_dump() if breakout_res is not None else None,
+        breakout_telemetry=breakout_res.telemetry.model_dump() if breakout_res is not None else None,
     )

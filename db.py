@@ -1080,6 +1080,12 @@ class AgentDatabase:
         hold_seconds: Optional[float] = None,
         triggering_whales: Optional[str] = None,
         whale_sol_flow: Optional[float] = None,
+        breakout_score: Optional[int] = None,
+        breakout_state: Optional[str] = None,
+        breakout_timeframe: Optional[str] = None,
+        breakout_vol_ratio: Optional[float] = None,
+        breakout_ema_ext_pct: Optional[float] = None,
+        breakout_failed_gates: Optional[str] = None,
     ) -> None:
         """Append a structured board action row to DuckDB action_log."""
         ts = timestamp_utc or utc_now_iso()
@@ -1111,6 +1117,8 @@ class AgentDatabase:
                     mc_usd, liq_usd, soak_minutes, rsi, leg2_score,
                     narrative_score, momentum_score, vamp_score, buy_confidence,
                     peak_pnl_pct, hold_seconds, triggering_whales, whale_sol_flow,
+                    breakout_score, breakout_state, breakout_timeframe,
+                    breakout_vol_ratio, breakout_ema_ext_pct, breakout_failed_gates,
                 ],
             )
 

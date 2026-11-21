@@ -7,6 +7,18 @@ from typing import Any, Optional, Sequence
 from pydantic import BaseModel
 
 
+class BreakoutTelemetry(BaseModel):
+    """Real-time 0-100 breakout scoring telemetry surfaced in watchlist API & CSV."""
+
+    score: int = 0
+    state: str = "FORMING"  # FORMING | COILING | IGNITION | EXTENDED
+    timeframe: str = "5m"  # 5m | 1m_fallback
+    vol_ratio: float = 0.0
+    ema_ext_pct: float = 0.0
+    passed_gates: list[str] = []
+    failed_gates: list[str] = []
+
+
 class BreakoutIgnitionResult(BaseModel):
     """Structured telemetry & verdict for the BREAKOUT_IGNITION setup."""
 
@@ -24,6 +36,7 @@ class BreakoutIgnitionResult(BaseModel):
     coil_range_pct: float = 0.0
     htf_bullish: bool = False
     rejection_reason: Optional[str] = None
+    telemetry: BreakoutTelemetry = BreakoutTelemetry()
 
 
 def compute_ema_series(values: Sequence[float], period: int) -> list[float]:
@@ -114,22 +127,34 @@ def detect_breakout_ignition(
     *,
     bar_minutes: int = 5,
     max_extension_pct: float = 0.12,
+    rsi_val: Optional[float] = None,
 ) -> BreakoutIgnitionResult:
-    """Detect BREAKOUT_IGNITION on 5m (>=12 bars) or 1m fallback (>=15 bars)."""
-    tf = f"{bar_minutes}m"
+    """Detect BREAKOUT_IGNITION on 5m (>=12 bars) or 1m fallback (>=15 bars) with 0-100 telemetry."""
+    tf = "5m" if bar_minutes == 5 else "1m"
+    tf_label = "5m" if bar_minutes == 5 else "1m_fallback"
     min_bars = 12 if bar_minutes == 5 else 15
     if len(candles) < min_bars:
+        fail_msg = f"BARS({len(candles)}<{min_bars})"
         return BreakoutIgnitionResult(
             detected=False,
             timeframe=tf,
             rejection_reason=f"insufficient {tf} bars ({len(candles)} < {min_bars})",
+            telemetry=BreakoutTelemetry(
+                score=0,
+                state="FORMING",
+                timeframe=tf_label,
+                vol_ratio=0.0,
+                ema_ext_pct=0.0,
+                passed_gates=[],
+                failed_gates=[fail_msg],
+            ),
         )
 
     curr = candles[-1]
     closes = [c["close"] for c in candles]
     price = curr["close"]
 
-    # 1. Coil / Base (at least 3 prior candles: higher lows OR tight range <= 8%)
+    # 1. Coil / Base (20 pts): >= 3 prior candles with higher lows OR tight range <= 8%
     coil_bars = candles[-5:-1] if len(candles) >= 5 else candles[-4:-1]
     coil_low = min(c["low"] for c in coil_bars)
     coil_high = max(c["high"] for c in coil_bars)
@@ -138,7 +163,7 @@ def detect_breakout_ignition(
     higher_lows = len(last3_lows) >= 3 and (last3_lows[0] <= last3_lows[1] <= last3_lows[2]) and (last3_lows[2] > last3_lows[0])
     coil_ok = (coil_range_pct <= 0.08) or higher_lows
 
-    # 2. Resistance Breakout (prior 15m-30m swing high) + strong body conviction (top 35%)
+    # 2. Resistance Break & Body Conviction (25 pts): close > 15m-30m swing high + top 35% body
     swing_lookback = 6 if bar_minutes == 5 else min(30, len(candles) - 1)
     swing_window = candles[-(swing_lookback + 1) : -1]
     swing_high = max(c["high"] for c in swing_window)
@@ -147,28 +172,126 @@ def detect_breakout_ignition(
     breakout_close_ok = curr["close"] > swing_high and curr["close"] > curr["open"]
     conviction_ok = c_range > 0 and body_pos_pct >= 0.65
 
-    # 3. Volume & Flow Spike (>= 2.0x rolling 5-bar avg, buy_ratio >= 62%, m5_buys >= 1.5x 1h avg)
+    # 3. Volume & Flow Spike (25 pts): vol >= 2.0x, buy_ratio >= 62%, m5_buys >= 1.5x 1h avg
     prev_5 = candles[-6:-1]
     avg_vol_5 = sum(c.get("volume", 0.0) for c in prev_5) / len(prev_5) if prev_5 else 0.0
     vol_ratio = (curr.get("volume", 0.0) / avg_vol_5) if avg_vol_5 > 0 else 0.0
     _b5, _s5, buy_ratio_5m, buys_accel = _extract_flow_and_accel(pair_data)
 
-    # 4. MA / VWAP Alignment (EMA9 > EMA21, EMA9 sloping up, price > VWAP)
+    # 4. MA / VWAP / RSI Alignment (15 pts)
     ema9_series = compute_ema_series(closes, period=9)
     ema21_series = compute_ema_series(closes, period=21)
     ema9 = ema9_series[-1]
     ema21 = ema21_series[-1]
     ema9_sloping_up = len(ema9_series) >= 2 and ema9_series[-1] > ema9_series[-2]
+    ema_ok = ema9 > ema21 and ema9_sloping_up
     vwap = compute_vwap(candles[-min(len(candles), 30) :])
-    ma_vwap_ok = ema9 > ema21 and ema9_sloping_up and price > vwap
+    vwap_ok = price > vwap
+    ma_vwap_ok = ema_ok and vwap_ok
+    rsi_ok = True if rsi_val is None else (rsi_val <= 78.0)
 
-    # 5. HTF 15m Context
+    # 5. HTF 15m Context & Anti-Chase Extension (15 pts)
     candles_15m = _aggregate_to_15m(candles, bar_minutes=bar_minutes)
     htf_bullish = _is_htf_15m_bullish(candles_15m, price)
-
-    # 6. Anti-Chase Extension Cap (<= 12% above EMA9 and VWAP)
     ext_ema9 = ((price - ema9) / ema9) if ema9 > 0 else 0.0
     ext_vwap = ((price - vwap) / vwap) if vwap > 0 else 0.0
+    over_extended = ext_ema9 > max_extension_pct or ext_vwap > max_extension_pct
+
+    # Weighted 0-100 score across the 5 pillars (20 + 25 + 25 + 15 + 15 = 100)
+    score = 0
+    passed_gates: list[str] = []
+    failed_gates: list[str] = []
+
+    if coil_ok:
+        score += 20
+        passed_gates.append("COIL")
+    else:
+        if coil_range_pct <= 0.12:
+            score += 10
+        failed_gates.append(f"COIL({coil_range_pct * 100:.1f}%>8.0%)")
+
+    if breakout_close_ok and conviction_ok:
+        score += 25
+        passed_gates.append("RES")
+    elif breakout_close_ok:
+        score += 12
+        failed_gates.append(f"RES_BODY({body_pos_pct * 100:.0f}%<65%)")
+    else:
+        failed_gates.append("RES(no_break)")
+
+    if vol_ratio >= 2.0:
+        score += 10
+        passed_gates.append("VOL")
+    else:
+        if vol_ratio >= 1.5:
+            score += 5
+        failed_gates.append(f"VOL_SPIKE({vol_ratio:.1f}x<2.0x)")
+
+    if buy_ratio_5m >= 0.62:
+        score += 8
+        passed_gates.append("FLOW")
+    else:
+        if buy_ratio_5m >= 0.55:
+            score += 4
+        failed_gates.append(f"BUY_RATIO({buy_ratio_5m * 100:.0f}%<62%)")
+
+    if buys_accel >= 1.5:
+        score += 7
+        passed_gates.append("ACCEL")
+    else:
+        if buys_accel >= 1.2:
+            score += 3
+        failed_gates.append(f"BUY_ACCEL({buys_accel:.1f}x<1.5x)")
+
+    if ema_ok:
+        score += 5
+        passed_gates.append("EMA")
+    else:
+        failed_gates.append("EMA(not_aligned)")
+
+    if vwap_ok:
+        score += 5
+        passed_gates.append("VWAP")
+    else:
+        failed_gates.append("VWAP(below)")
+
+    if rsi_ok:
+        score += 5
+        passed_gates.append("RSI")
+    else:
+        failed_gates.append(f"RSI({rsi_val:.1f}>78)")
+
+    if htf_bullish:
+        score += 7
+        passed_gates.append("HTF")
+    else:
+        failed_gates.append("HTF_15M(bearish)")
+
+    if not over_extended:
+        score += 8
+        passed_gates.append("EXT")
+    else:
+        max_ext_pct = max(ext_ema9, ext_vwap) * 100.0
+        failed_gates.append(f"EXT(+{max_ext_pct:.1f}%>+{max_extension_pct * 100:.0f}%)")
+
+    if over_extended:
+        state = "EXTENDED"
+    elif score >= 75:
+        state = "IGNITION"
+    elif score >= 50:
+        state = "COILING"
+    else:
+        state = "FORMING"
+
+    telemetry = BreakoutTelemetry(
+        score=int(min(100, max(0, score))),
+        state=state,
+        timeframe=tf_label,
+        vol_ratio=round(vol_ratio, 2),
+        ema_ext_pct=round(ext_ema9 * 100.0, 2),
+        passed_gates=passed_gates,
+        failed_gates=failed_gates,
+    )
 
     metrics = dict(
         timeframe=tf,
@@ -183,6 +306,7 @@ def detect_breakout_ignition(
         body_pos_pct=round(body_pos_pct, 3),
         coil_range_pct=round(coil_range_pct, 4),
         htf_bullish=htf_bullish,
+        telemetry=telemetry,
     )
 
     reasons: list[str] = []
@@ -202,7 +326,7 @@ def detect_breakout_ignition(
         reasons.append("EMA9/EMA21/VWAP alignment failed")
     if not htf_bullish:
         reasons.append("15m HTF not bullish")
-    if ext_ema9 > max_extension_pct or ext_vwap > max_extension_pct:
+    if over_extended:
         reasons.append(
             f"over-extended (ema9={ext_ema9 * 100:+.1f}%, vwap={ext_vwap * 100:+.1f}% > +{max_extension_pct * 100:.0f}%)"
         )

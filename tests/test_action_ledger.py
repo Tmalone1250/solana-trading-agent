@@ -220,7 +220,7 @@ async def test_action_ledger_logs_buy_sell_evict_circuit_breaker_and_csv_export(
 
     parsed_all = list(csv.DictReader(io.StringIO(resp_all.text)))
     assert list(parsed_all[0].keys()) == ACTION_LOG_COLUMNS
-    assert len(ACTION_LOG_COLUMNS) == 30
+    assert len(ACTION_LOG_COLUMNS) == 36
     assert len(parsed_all) == 10
     assert all(r["bot"] == "solana_meme" and r["unit"] == "SOL" for r in parsed_all)
     # Every row has enriched equity & daily realized SOL populated

@@ -212,6 +212,7 @@ async def executor_node(
             triggering_wallets=list(order.triggering_wallets),
         )
         action_type = "REENTRY_BUY" if order.reason == "LEG_2_REENTRY" else "BUY"
+        bt = order.breakout_telemetry or {}
         db.log_action(
             mode=config.EXECUTION_MODE,
             action=action_type,
@@ -228,6 +229,12 @@ async def executor_node(
             liq_usd=round(order.entry_liquidity_usd, 2) if order.entry_liquidity_usd else None,
             triggering_whales=",".join(order.triggering_wallets) if order.triggering_wallets else None,
             whale_sol_flow=order.whale_sol_flow,
+            breakout_score=bt.get("score"),
+            breakout_state=bt.get("state"),
+            breakout_timeframe=bt.get("timeframe"),
+            breakout_vol_ratio=bt.get("vol_ratio"),
+            breakout_ema_ext_pct=bt.get("ema_ext_pct"),
+            breakout_failed_gates="; ".join(bt.get("failed_gates") or []) if bt else None,
         )
         logger.info(
             "[%s] BUY %s: %.4f SOL -> %d tokens (reason=%s)",

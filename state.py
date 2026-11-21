@@ -94,6 +94,7 @@ class PendingOrder(BaseModel):
     run_peak_sol: Optional[float] = None
     strategy: str = "SCALPER"
     triggering_wallets: list[str] = Field(default_factory=list)
+    breakout_telemetry: Optional[dict[str, Any]] = None
     rationale: str = ""
 
 

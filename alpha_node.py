@@ -392,7 +392,7 @@ async def alpha_node(
     answers = await decision_client.decide(input_text=input_text, questions=questions)
 
     decisions: list[AlphaDecision] = []
-    approved_pairs: list[tuple[AlphaDecision, dict[str, Any], bool, float, str]] = []
+    approved_pairs: list[tuple[AlphaDecision, dict[str, Any], bool, float, str, Optional[dict[str, Any]]]] = []
 
     for idx, (cand, leg2, scalper) in enumerate(zip(safe_candidates, leg2_results, scalper_results)):
         prefix = f"t{idx}"
@@ -464,7 +464,18 @@ async def alpha_node(
             "scalper_eligible": scalper.eligible,
             "dist_from_1h_high_pct": scalper.dist_from_1h_high_pct,
             "breakout_metrics": scalper.breakout_metrics,
+            "breakout_telemetry": scalper.breakout_telemetry,
             "approved": dec.approved,
+        }
+
+        bt = scalper.breakout_telemetry or {}
+        bt_log_kwargs: dict[str, Any] = {
+            "breakout_score": bt.get("score"),
+            "breakout_state": bt.get("state"),
+            "breakout_timeframe": bt.get("timeframe"),
+            "breakout_vol_ratio": bt.get("vol_ratio"),
+            "breakout_ema_ext_pct": bt.get("ema_ext_pct"),
+            "breakout_failed_gates": "; ".join(bt.get("failed_gates") or []) if bt else None,
         }
 
         db.log_decision(
@@ -523,6 +534,7 @@ async def alpha_node(
             momentum_score=round(dec.momentum_quality, 2),
             vamp_score=round(dec.is_copycat_vamp, 3),
             buy_confidence=round(dec.action_confidence, 3),
+            **bt_log_kwargs,
         )
 
         if approved:
@@ -563,7 +575,7 @@ async def alpha_node(
                 dist_from_1h_high_pct=scalper.dist_from_1h_high_pct,
             )
             approved_pairs.append(
-                (dec, cand, leg2_fast_track and not standard_approved, leg2_score, scalper.setup_type)
+                (dec, cand, leg2_fast_track and not standard_approved, leg2_score, scalper.setup_type, scalper.breakout_telemetry)
             )
             continue
 
@@ -612,6 +624,7 @@ async def alpha_node(
                 strategy=scalper.setup_type,
                 reason=evict_reason,
                 timestamp_utc=now_iso,
+                **bt_log_kwargs,
             )
             logger.info(
                 "[Alpha] $%s | action=%s (%.2f) | narr=%.1f mom=%.1f vamp=%.2f leg2=%.0f/100 -> EVICTED (vamp >= %.2f, %dm cooldown)",
@@ -722,6 +735,7 @@ async def alpha_node(
                 strategy=scalper.setup_type,
                 reason=evict_reason,
                 timestamp_utc=now_iso,
+                **bt_log_kwargs,
             )
             logger.info(
                 "[Alpha] $%s | action=%s (%.2f) | narr=%.1f mom=%.1f vamp=%.2f leg2=%.0f/100 -> EVICTED (narr < %.1f & mom < %.1f, %dm cooldown)",
@@ -835,7 +849,7 @@ async def alpha_node(
         ),
         reverse=True,
     )
-    winner, winner_cand, is_leg2_only, _, winner_setup = approved_pairs[0]
+    winner, winner_cand, is_leg2_only, _, winner_setup, winner_bt = approved_pairs[0]
 
     order = PendingOrder(
         side="BUY",
@@ -847,6 +861,7 @@ async def alpha_node(
         apply_cooldown=False,
         entry_liquidity_usd=float(winner_cand.get("liquidity_usd") or 0.0),
         strategy="LEG2_ENTRY" if is_leg2_only else winner_setup,
+        breakout_telemetry=winner_bt,
         rationale=winner.rationale,
     )
     return {

@@ -38,6 +38,13 @@ ACTION_LOG_COLUMNS: list[str] = [
     "hold_seconds",
     "triggering_whales",
     "whale_sol_flow",
+    # Breakout Ignition telemetry columns
+    "breakout_score",
+    "breakout_state",
+    "breakout_timeframe",
+    "breakout_vol_ratio",
+    "breakout_ema_ext_pct",
+    "breakout_failed_gates",
 ]
 
 ACTION_LOG_MIGRATIONS: list[tuple[str, str]] = [
@@ -57,6 +64,12 @@ ACTION_LOG_MIGRATIONS: list[tuple[str, str]] = [
     ("hold_seconds", "DOUBLE"),
     ("triggering_whales", "VARCHAR"),
     ("whale_sol_flow", "DOUBLE"),
+    ("breakout_score", "INTEGER"),
+    ("breakout_state", "VARCHAR"),
+    ("breakout_timeframe", "VARCHAR"),
+    ("breakout_vol_ratio", "DOUBLE"),
+    ("breakout_ema_ext_pct", "DOUBLE"),
+    ("breakout_failed_gates", "VARCHAR"),
 ]
 
 EXPORT_TYPE_ACTIONS: dict[str, Optional[list[str]]] = {

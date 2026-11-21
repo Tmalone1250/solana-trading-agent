@@ -1,28 +1,29 @@
-# BREAKOUT_IGNITION Setup & Coiling Base Retention Plan
+# Breakout Telemetry Logging & 5-Slot Watchlist Breakout Meter Plan
 
-## Objective
-Add a third chart setup—`BREAKOUT_IGNITION`—to the Scalper Expert Entry Engine without modifying `SWEEP_RECLAIM` or `DISPLACEMENT_RETEST`, so tokens breaking out of tight coiling bases aren't rejected by `near 1h high (< 5%)`, `RSI > 70`, or `< 12 x 5m candles`.
+## 1. Backend: Breakout Scoring & Telemetry (`breakout_ignition.py`, `scalper_entry_engine.py`)
+Return a structured `breakout_telemetry` object for every watchlist mint on every tick:
+- **`score` (0–100 integer)** from 5 weighted pillars:
+  1. Coil / Base (20 pts)
+  2. Resistance Break & Body Conviction (25 pts)
+  3. Volume & Flow Spike (25 pts)
+  4. MA / VWAP / RSI Alignment (15 pts)
+  5. HTF 15m Context & Anti-Chase Extension (15 pts)
+- **`state`**: `EXTENDED` (`> 12%` above EMA9/VWAP), `IGNITION` (`>= 75`), `COILING` (`50–74`), `FORMING` (`< 50`).
+- **`timeframe`**: `"5m"` or `"1m_fallback"`.
+- **`vol_ratio`** (float), **`ema_ext_pct`** (float %), **`passed_gates`** (`list[str]`), **`failed_gates`** (`list[str]` with actual vs threshold, e.g., `VOL_SPIKE(1.7x<2.0x)`).
 
-## 1. `BREAKOUT_IGNITION` Detector (`breakout_ignition.py`)
-Trigger when all 5 conditions pass (on 5m candles, or 1m fallback when `< 12` 5m bars exist and `>= 15` 1m bars are available):
-1. **Coil / Base**: `>= 3` prior candles forming higher lows or a tight range (`range_pct <= 8%`) under local resistance.
-2. **Resistance Breakout + Body Conviction**: Latest candle closes strictly above the prior 15m–30m swing high with close in the top 35% of the candle range (`(close - low) / (high - low) >= 0.65`), blocking upper-wick fakeouts.
-3. **Volume & Flow Spike**: Latest candle volume `>= 2.0x` rolling 5-bar average, 5m `buy_ratio >= 62%`, and `m5_buys >= 1.5x` the 1h 5-minute average (`buys_1h / 12`).
-4. **MA / VWAP Alignment**: `EMA9 > EMA21` (sloping up) and `price > VWAP`.
-5. **HTF Context**: 15m trend is bullish (`price > 15m EMA21` or higher-low structure on 15m aggregated bars).
+## 2. DuckDB, CSV Export & Telemetry API (`action_export.py`, `db.py`, `alpha_node.py`, `executor_node.py`, `telemetry_api.py`)
+- Add 6 columns to `ACTION_LOG_COLUMNS` and automatic `ALTER TABLE` migrations:
+  `breakout_score`, `breakout_state`, `breakout_timeframe`, `breakout_vol_ratio`, `breakout_ema_ext_pct`, `breakout_failed_gates`.
+- Populate these 6 columns on `DECISION_1`, `BUY`, and `EVICT` rows in DuckDB and `/api/export/csv`.
+- Include `breakout_telemetry` inside each mint object in `active_watchlist[]` returned by `GET /api/telemetry`.
 
-## 2. Breakout-Aware Entry Gates (`scalper_entry_engine.py` & `ohlcv_client.py`)
-Only when `BREAKOUT_IGNITION` is evaluated:
-- **Bypass** `near 1h high (< 5%)` block; enforce anti-chase extension cap: reject if price is `> 12%` above `EMA9` or `VWAP`.
-- **RSI ceiling**: Allow RSI up to `78.0` (instead of `70.0`) when `BREAKOUT_IGNITION` + volume spike are confirmed.
-- **1m OHLCV Fallback**: Add `fetch_ohlcv_1m` / `fetch_ohlcv_1m_batch` to `ohlcv_client.py` (90s cache + 429 backoff) and invoke it in `alpha_node.py` when `< 12` 5m candles exist.
+## 3. Frontend: 5-Slot Watchlist Breakout Meter (`dashboard/`)
+- Add `BreakoutTelemetry` interface to `dashboard/src/lib/types.ts`.
+- Render a compact **Breakout Meter** in each row of `dashboard/src/components/WatchlistTable.tsx`:
+  - Color-coded 0–100 progress bar (`FORMING` slate, `COILING` amber, `IGNITION` emerald, `EXTENDED` rose) with `score/100 • STATE • tf`.
+  - Compact single-line pillar pill strip (`COIL`, `RES`, `VOL 2.3x`, `EMA`, `EXT +4.1%`) color-coded green (passed) vs rose/muted (failed).
 
-## 3. Coiling Base Retention (`alpha_node.py` & `scanner_node.py`)
-For watchlist tokens with `liquidity_usd >= $40,000`, `vamp_score < 0.65`, and `dist_from_1h_high_pct <= 5%`:
-- Require **2 consecutive** `LOW_SCORE` ticks before evicting (tracked via `low_score_strikes` in `latest_scores`).
-- Extend `STALE_WATCH` timeout from `15m` to `25m`.
-
-## 4. Telemetry & Unit Tests
-- Log `strategy=BREAKOUT_IGNITION` and breakout/extension metrics (`vol_x`, `ext_ema9`, `ext_vwap`, `tf`) in DuckDB `action_log` and `solana_actions.csv`.
-- Add `tests/test_breakout_ignition.py` covering valid breakout ignition, over-extended chase rejection (`> 12%` above EMA9/VWAP), upper-wick fakeout rejection, 1m candle fallback, coiling base retention, and CSV logging.
-- Run `./venv/bin/pytest -v`.
+## 4. Verification
+- Add unit tests in `tests/test_breakout_ignition.py` covering `breakout_score` calculation, `failed_gates` formatting, DuckDB/CSV serialization of the 6 new columns, and `/api/telemetry` `active_watchlist[].breakout_telemetry`.
+- Run `./venv/bin/pytest -v` and `cd dashboard && npm run build`.

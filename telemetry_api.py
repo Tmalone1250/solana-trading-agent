@@ -154,6 +154,7 @@ def create_telemetry_app(
                     "time_in_slot_minutes": round(in_slot_sec / 60.0, 2),
                     "last_evaluated_at": entry["last_evaluated_at"],
                     "scores": entry["latest_scores"],
+                    "breakout_telemetry": scores.get("breakout_telemetry"),
                 }
             )
 

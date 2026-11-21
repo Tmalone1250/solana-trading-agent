@@ -18,6 +18,16 @@ export interface LiveJupiterPnl {
   last_liquidity_usd: number | null;
 }
 
+export interface BreakoutTelemetry {
+  score: number;
+  state: "FORMING" | "COILING" | "IGNITION" | "EXTENDED" | string;
+  timeframe: "5m" | "1m_fallback" | string;
+  vol_ratio: number;
+  ema_ext_pct: number;
+  passed_gates: string[];
+  failed_gates: string[];
+}
+
 export interface WatchlistScores {
   narrative_strength?: number;
   momentum_quality?: number;
@@ -26,6 +36,7 @@ export interface WatchlistScores {
   action_confidence?: number;
   leg2_score?: number;
   leg2_fast_track?: boolean;
+  breakout_telemetry?: BreakoutTelemetry | null;
   approved?: boolean;
 }
 
@@ -50,6 +61,7 @@ export interface WatchlistSlot {
   time_in_slot_minutes: number;
   last_evaluated_at: string | null;
   scores: WatchlistScores | null;
+  breakout_telemetry?: BreakoutTelemetry | null;
 }
 
 export interface ClosedTrade {

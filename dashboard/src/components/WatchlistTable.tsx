@@ -1,10 +1,90 @@
 "use client";
 
 import { ExternalLink, ShieldCheck } from "lucide-react";
-import { WatchlistSlot, formatUsdCompact } from "@/lib/types";
+import { BreakoutTelemetry, WatchlistSlot, formatUsdCompact } from "@/lib/types";
 
 interface Props {
   slots: WatchlistSlot[];
+}
+
+function getBreakoutBarStyle(state: string): { bar: string; text: string; badge: string } {
+  if (state === "IGNITION") {
+    return {
+      bar: "bg-emerald-400",
+      text: "text-emerald-300",
+      badge: "border-emerald-500/40 bg-emerald-500/15 text-emerald-300",
+    };
+  }
+  if (state === "COILING") {
+    return {
+      bar: "bg-amber-400",
+      text: "text-amber-300",
+      badge: "border-amber-500/40 bg-amber-500/15 text-amber-300",
+    };
+  }
+  if (state === "EXTENDED") {
+    return {
+      bar: "bg-rose-500",
+      text: "text-rose-300",
+      badge: "border-rose-500/40 bg-rose-500/15 text-rose-300",
+    };
+  }
+  return {
+    bar: "bg-slate-500",
+    text: "text-slate-300",
+    badge: "border-slate-700 bg-slate-800/70 text-slate-400",
+  };
+}
+
+function BreakoutMeter({ bt }: { bt?: BreakoutTelemetry | null }) {
+  if (!bt) {
+    return <span className="font-mono text-[10px] text-slate-500">Awaiting OHLCV...</span>;
+  }
+  const st = getBreakoutBarStyle(bt.state);
+  const tfShort = bt.timeframe === "1m_fallback" ? "1m" : bt.timeframe;
+  const passed = new Set(bt.passed_gates ?? []);
+  const extSign = bt.ema_ext_pct >= 0 ? "+" : "";
+  const pills = [
+    { key: "COIL", label: "COIL", ok: passed.has("COIL") },
+    { key: "RES", label: "RES", ok: passed.has("RES") },
+    { key: "VOL", label: `VOL ${bt.vol_ratio.toFixed(1)}x`, ok: passed.has("VOL") },
+    { key: "EMA", label: "EMA", ok: passed.has("EMA") && passed.has("VWAP") },
+    { key: "EXT", label: `EXT ${extSign}${bt.ema_ext_pct.toFixed(1)}%`, ok: passed.has("EXT") },
+  ];
+  const tooltip = bt.failed_gates?.length ? `Failed: ${bt.failed_gates.join(" • ")}` : "All breakout gates passed";
+
+  return (
+    <div className="w-56" title={tooltip}>
+      <div className="flex items-center justify-between gap-1 font-mono text-[10px]">
+        <span className={`font-semibold ${st.text}`}>
+          {bt.score}/100
+        </span>
+        <span className={`rounded border px-1.5 py-0.25 text-[9px] font-semibold ${st.badge}`}>
+          {bt.state} • {tfShort}
+        </span>
+      </div>
+      <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+        <div
+          className={`h-full rounded-full transition-all ${st.bar}`}
+          style={{ width: `${Math.min(100, Math.max(0, bt.score))}%` }}
+        />
+      </div>
+      <div className="mt-1.5 flex flex-nowrap items-center gap-1 overflow-x-auto font-mono text-[9px]">
+        {pills.map((p) => (
+          <span
+            key={p.key}
+            className={`whitespace-nowrap rounded border px-1 py-0.25 ${
+              p.ok
+                ? "border-emerald-500/35 bg-emerald-500/15 text-emerald-300"
+                : "border-rose-500/25 bg-rose-500/10 text-rose-300/80"
+            }`}
+          >
+            {p.label}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function getLeg2Color(score: number): string {
@@ -15,7 +95,7 @@ function getLeg2Color(score: number): string {
 }
 
 function getSetupBadge(setup: string): string {
-  if (setup === "SWEEP_RECLAIM") {
+  if (setup === "SWEEP_RECLAIM" || setup === "BREAKOUT_IGNITION") {
     return "border-emerald-500/40 bg-emerald-500/15 text-emerald-300";
   }
   if (setup === "DISPLACEMENT_RETEST") {
@@ -62,6 +142,7 @@ export function WatchlistTable({ slots }: Props) {
               <th className="px-4 py-3">Token (MC / Liq)</th>
               <th className="px-4 py-3">Soak (3m min)</th>
               <th className="px-4 py-3">Scalper Engine</th>
+              <th className="px-4 py-3">Breakout Meter</th>
               <th className="px-4 py-3">Leg 2 Score</th>
               <th className="px-4 py-3">Decision 1</th>
               <th className="px-4 py-3 text-right">Status</th>
@@ -70,7 +151,7 @@ export function WatchlistTable({ slots }: Props) {
           <tbody className="divide-y divide-slate-800/60">
             {slots.length === 0 ? (
               <tr>
-                <td colSpan={6} className="px-4 py-8 text-center font-mono text-xs text-slate-500">
+                <td colSpan={7} className="px-4 py-8 text-center font-mono text-xs text-slate-500">
                   No tokens currently in active_watchlist — awaiting next DexScreener / GeckoTerminal scan...
                 </td>
               </tr>
@@ -165,6 +246,11 @@ export function WatchlistTable({ slots }: Props) {
                           {distPct !== null ? `-${distPct.toFixed(1)}%` : "—"}
                         </span>
                       </div>
+                    </td>
+
+                    {/* Breakout Meter */}
+                    <td className="px-4 py-3">
+                      <BreakoutMeter bt={slot.breakout_telemetry ?? slot.scores?.breakout_telemetry} />
                     </td>
 
                     {/* Leg 2 Score Bar */}
