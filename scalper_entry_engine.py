@@ -208,7 +208,7 @@ def evaluate_scalper_entry(
         if len(norm_1m) >= 15:
             closes_1m = [c["close"] for c in norm_1m]
             rsi_1m = compute_rsi(closes_1m, period=14)
-            bi_1m = detect_breakout_ignition(norm_1m, pair_data, bar_minutes=1, rsi_val=rsi_1m)
+            bi_1m = detect_breakout_ignition(norm_1m, pair_data, bar_minutes=1, rsi_val=rsi_1m, config=config)
             high_1m = max(c["high"] for c in norm_1m)
             curr_p = float(pair_data.get("price_usd") or pair_data.get("priceUsd") or closes_1m[-1])
             dist_1m = max(0.0, (high_1m - curr_p) / high_1m) if high_1m > 0 else 0.0
@@ -231,7 +231,7 @@ def evaluate_scalper_entry(
                 breakout_telemetry=bi_1m.telemetry.model_dump(),
             )
 
-        bi_short = detect_breakout_ignition(candles, pair_data, bar_minutes=5)
+        bi_short = detect_breakout_ignition(candles, pair_data, bar_minutes=5, config=config)
         reasons_short: list[str] = []
         if time_in_slot_min < min_soak:
             reasons_short.append(f"soak {time_in_slot_min:.1f}m < {min_soak:.0f}m")
@@ -259,7 +259,7 @@ def evaluate_scalper_entry(
     )
 
     # Always compute breakout telemetry for live watchlist Breakout Meter
-    breakout_res = detect_breakout_ignition(candles, pair_data, bar_minutes=5, rsi_val=rsi_5m)
+    breakout_res = detect_breakout_ignition(candles, pair_data, bar_minutes=5, rsi_val=rsi_5m, config=config)
 
     # Gate 3: Core Market-Physics Setup (SWEEP_RECLAIM / DISPLACEMENT_RETEST unchanged; BREAKOUT_IGNITION added)
     setup_type = "NONE"

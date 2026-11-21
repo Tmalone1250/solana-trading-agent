@@ -247,22 +247,26 @@ async def test_coiling_base_retention_and_breakout_ignition_csv_logging(tmp_path
 
 
 def test_breakout_telemetry_score_states_and_failed_gates_formatting():
-    # Low-volume, non-breakout coil -> COILING/FORMING with formatted VOL_SPIKE(1.7x<2.0x)
+    # Low-volume (1.2x < 1.5x) breakout -> score >= 75 (95), but VOL_SPIKE failed so state is capped at COILING!
     candles_low_vol = _make_breakout_candles(
-        count=18, breakout_close=1.12, breakout_high=1.13, breakout_low=1.06, breakout_vol=1700.0
+        count=18, breakout_close=1.12, breakout_high=1.13, breakout_low=1.06, breakout_vol=1200.0
     )
     res_lv = evaluate_scalper_entry(candles_low_vol, _strong_flow_pair(1.12), time_in_slot_min=5.0)
     bt_lv = res_lv.breakout_telemetry
     assert bt_lv is not None
-    assert bt_lv["score"] == 95  # 100 - 5 (partial vol credit for 1.7x >= 1.5x)
-    assert "VOL_SPIKE(1.7x<2.0x)" in bt_lv["failed_gates"]
+    assert bt_lv["score"] == 95  # 100 - 5 (partial vol credit for 1.2x >= 1.2x)
+    assert bt_lv["state"] == "COILING"  # Capped at COILING because VOL_SPIKE failed
+    assert res_lv.eligible is False
+    assert "VOL_SPIKE(1.2x<1.5x)" in bt_lv["failed_gates"]
 
-    # Over-extended breakout -> state == EXTENDED
+    # Over-extended breakout -> state == EXTENDED and hard-blocked even though score >= 75
     candles_ext = _make_breakout_candles(
         count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.07, breakout_vol=3500.0
     )
     res_ext = evaluate_scalper_entry(candles_ext, _strong_flow_pair(1.34), time_in_slot_min=5.0)
+    assert res_ext.eligible is False
     assert res_ext.breakout_telemetry is not None
+    assert res_ext.breakout_telemetry["score"] >= 75
     assert res_ext.breakout_telemetry["state"] == "EXTENDED"
     assert any(g.startswith("EXT(") for g in res_ext.breakout_telemetry["failed_gates"])
 
@@ -275,3 +279,55 @@ def test_breakout_telemetry_score_states_and_failed_gates_formatting():
     )
     assert res_1m.breakout_telemetry is not None
     assert res_1m.breakout_telemetry["timeframe"] == "1m_fallback"
+
+
+def test_breakout_ignition_allows_1_6x_vol_9_5_pct_coil_and_1_0x_buy_accel_and_caps_state_without_res_or_vol():
+    # 1. Valid BREAKOUT_IGNITION fill with vol_ratio=1.6x, coil_range=~9.5% (<= 10.0%), and BUY_ACCEL=1.0x (no longer vetoed)
+    candles = _make_breakout_candles(
+        count=18, breakout_close=1.12, breakout_high=1.13, breakout_low=1.06, breakout_vol=1600.0
+    )
+    # Widen the 4-bar coil range to ~9.5% (low=0.985 to high=1.0786 -> 9.50% range, without monotonic higher lows)
+    candles[-5]["low"] = 1.010
+    candles[-4]["low"] = 0.985
+    candles[-3]["low"] = 1.005
+    candles[-2]["low"] = 1.000
+    candles[-2]["high"] = 1.0786
+
+    # Set 5m buys=20, 1h buys=240 -> 1h 5m-avg = 20 -> BUY_ACCEL = 1.0x (< 1.5x)
+    pair_1x_accel = {
+        "price_usd": 1.12,
+        "liquidity_usd": 85_000.0,
+        "market_cap_usd": 650_000.0,
+        "txns": {"m5": {"buys": 20, "sells": 8}, "h1": {"buys": 240, "sells": 120}},
+    }
+    res = evaluate_scalper_entry(candles, pair_1x_accel, time_in_slot_min=5.0)
+    assert res.eligible is True
+    assert res.setup_type == "BREAKOUT_IGNITION"
+    assert res.breakout_telemetry is not None
+    assert res.breakout_telemetry["state"] == "IGNITION"
+    assert res.breakout_telemetry["score"] >= 75
+    assert res.breakout_telemetry["vol_ratio"] == pytest.approx(1.6, rel=1e-2)
+    assert "COIL" in res.breakout_telemetry["passed_gates"]
+    assert "RES" in res.breakout_telemetry["passed_gates"]
+    assert "VOL" in res.breakout_telemetry["passed_gates"]
+    assert any(g.startswith("BUY_ACCEL(1.0x<1.5x)") for g in res.breakout_telemetry["failed_gates"])
+
+    # 2. Like $greg: score >= 75 (77/100) with 0.12x volume -> state MUST be capped at COILING (never IGNITION)
+    candles_greg = _make_breakout_candles(
+        count=18, breakout_close=1.12, breakout_high=1.13, breakout_low=1.06, breakout_vol=120.0
+    )
+    res_greg = evaluate_scalper_entry(candles_greg, _strong_flow_pair(1.12), time_in_slot_min=5.0)
+    assert res_greg.eligible is False
+    assert res_greg.breakout_telemetry is not None
+    assert res_greg.breakout_telemetry["score"] >= 75
+    assert res_greg.breakout_telemetry["state"] == "COILING"
+
+    # 3. Score >= 75 (75/100) when RES fails (close=1.077 <= swing_high=1.078) -> state capped at COILING
+    candles_no_res = _make_breakout_candles(
+        count=18, breakout_close=1.077, breakout_high=1.078, breakout_low=1.06, breakout_vol=3000.0
+    )
+    res_no_res = evaluate_scalper_entry(candles_no_res, _strong_flow_pair(1.077), time_in_slot_min=5.0)
+    assert res_no_res.eligible is False
+    assert res_no_res.breakout_telemetry is not None
+    assert res_no_res.breakout_telemetry["score"] == 75
+    assert res_no_res.breakout_telemetry["state"] == "COILING"

@@ -96,13 +96,16 @@ class AgentConfig(BaseSettings):
     REENTRY_MAX_DEAD_CAT: float = Field(default=0.25, ge=0.0, le=1.0)
     WATCH_MAX_BLEED_PCT: float = Field(default=0.25, gt=0.0, lt=1.0)
 
-    # Scalper Expert Entry Engine & OHLCV Cache
+    # Scalper Expert Entry Engine, BREAKOUT_IGNITION & OHLCV Cache
     OHLCV_CACHE_SECONDS: float = Field(default=90.0, gt=0.0)
     OHLCV_PACING_DELAY_SECONDS: float = Field(default=0.35, ge=0.0)
     ANTI_CHASE_HIGH_BUFFER_PCT: float = Field(default=0.05, ge=0.0, lt=1.0)
     SCALPER_MAX_RSI_5M: float = Field(default=70.0, gt=0.0, le=100.0)
     SCALPER_MIN_BUY_RATIO_5M: float = Field(default=0.58, ge=0.0, le=1.0)
     SCALPER_MIN_TXNS_5M: int = Field(default=15, ge=1)
+    BREAKOUT_MIN_VOL_RATIO: float = Field(default=1.5, gt=0.0)
+    BREAKOUT_MAX_COIL_RANGE_PCT: float = Field(default=10.0, gt=0.0)
+    BREAKOUT_MIN_SCORE: int = Field(default=75, ge=0, le=100)
 
     # Jupiter Token API v2 Discovery & Organic Enrichment
     ENABLE_JUPITER_DISCOVERY: bool = True

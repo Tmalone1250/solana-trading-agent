@@ -1,22 +1,27 @@
-# Live Batched Position Monitor Fix Plan (Jupiter Price V3 + DexScreener `priceNative` Fallback)
+# `BREAKOUT_IGNITION` Threshold Tuning & `IGNITION` State Badge Hardening Plan
 
-## 1. Fix Jupiter `/price/v3` Flat Schema Parsing & SOL Conversion (`batched_price_monitor.py`)
-- Always include `SOL_MINT` (`So11111111111111111111111111111111111111112`) in `GET https://api.jup.ag/price/v3?ids=...`.
-- Parse the flat V3 response schema (`resp[mint]["usdPrice"]` and `resp[mint]["decimals"]`) and compute:
-  `current_sol_value = (token_amount / (10 ** decimals)) * (token_usd / sol_usd)`.
+## 1. Configurable `BREAKOUT_IGNITION` Thresholds (`config.py`, `.env.example`)
+- Add `.env`-configurable thresholds:
+  - `BREAKOUT_MIN_VOL_RATIO=1.5` (lowered from `2.0x` to `1.5x` rolling 5-bar average volume).
+  - `BREAKOUT_MAX_COIL_RANGE_PCT=10.0` (raised from `8.0%` to `10.0%` max base range).
+  - `BREAKOUT_MIN_SCORE=75` (`0–100` minimum breakout score).
 
-## 2. Mandatory DexScreener `priceNative` Fallback & Live Flow Enrichment (`batched_price_monitor.py`, `state.py`)
-- Whenever a mint is omitted from Jupiter `/price/v3` (or `/price/v3` fails), immediately compute `current_sol_value` from the batched DexScreener response using `priceNative` (in SOL) and `token_amount / (10 ** decimals)`.
-- Add `decimals`, `pnl_sol`, and `pnl_pct` to `ActivePosition` in `state.py`.
-- Always write `last_liquidity_usd`, `last_5m_buy_ratio`, `last_5m_sell_ratio`, `current_sol_value`, `peak_sol_value`, `pnl_sol`, and `pnl_pct` directly onto each position object in `chart_positions` and `whale_positions`.
+## 2. Weighted-Score Entry Trigger & Non-Veto `BUY_ACCEL` (`breakout_ignition.py`, `scalper_entry_engine.py`)
+- Trigger `BREAKOUT_IGNITION` entry (`detected = True`) when all 5 core conditions hold:
+  1. `breakout_score >= BREAKOUT_MIN_SCORE` (`75`)
+  2. `RES` passed (close above prior 15m–30m swing high in top 35% of candle range)
+  3. `VOL_SPIKE` passed (`vol_ratio >= BREAKOUT_MIN_VOL_RATIO`, default `1.5x`)
+  4. `breakout_state != "EXTENDED"` (price `<= 12%` above both EMA9 and VWAP)
+  5. `RSI <= 78`
+- Keep `BUY_ACCEL` (`m5_buys` acceleration) as a weighted score contributor (`+7` pts at `>= 1.5x`, `+3` pts at `>= 1.2x`) and telemetry diagnostic rather than a hard entry veto.
 
-## 3. In-Place Persistence & 1-Line `[Monitor]` Logging (`position_monitor_node.py`, `whale_lane.py`, `db.py`)
-- Upgrade `position_monitor_node.py` (keeping it under 500 lines) and `whale_lane.py` to use `fetch_batched_sol_prices()` + `update_position_from_batch()`, persisting updated `chart_positions` and `whale_positions` in-place to DuckDB (`save_lane_positions` and synced `save_state`) so `/api/telemetry` reflects live PnL and order flow on every tick.
-- Log a compact 1-line `[Monitor]` status per position on every monitor tick for `journalctl` visibility.
+## 3. Tighten `IGNITION` State Badge Logic (`breakout_ignition.py`)
+- Only assign `state = "IGNITION"` when `score >= 75` **AND** `RES` passed **AND** `VOL_SPIKE` passed (and not `EXTENDED`).
+- If `score >= 75` but either `RES` or `VOL_SPIKE` failed (e.g. `0.12x` volume), cap `state` at `"COILING"`.
 
-## 4. Verification (`tests/test_dual_lane_3x3_and_whale_breakout.py`)
-- Add unit tests covering:
-  1. Flat Jupiter `/price/v3` (`usdPrice` + `decimals`) parsing and SOL value calculation.
-  2. DexScreener `priceNative` fallback when Jupiter `/price/v3` omits a meme coin.
-  3. `/api/telemetry` returning updated `current_sol_value`, `pnl_sol`, `pnl_pct`, `last_liquidity_usd`, and `last_5m_buy_ratio` inside `chart_positions`.
+## 4. Verification (`tests/test_breakout_ignition.py`)
+- Add/update unit tests covering:
+  1. Valid `BREAKOUT_IGNITION` fill with `vol_ratio=1.6x`, `coil_range=9.5%`, `score >= 75`, `RES` pass, and `BUY_ACCEL=1.0x`.
+  2. `IGNITION` state capped to `COILING` when `score >= 75` but `VOL_SPIKE` or `RES` fails.
+  3. `EXTENDED` (`> 12%` above EMA9/VWAP) still hard-blocking entry even when `score >= 75`.
 - Run `./venv/bin/pytest -v`.
