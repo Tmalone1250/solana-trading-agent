@@ -64,6 +64,9 @@ class AgentDatabase:
                     daily_pnl_sol DOUBLE NOT NULL,
                     daily_reset_date VARCHAR NOT NULL,
                     active_position_json VARCHAR,
+                    strategy VARCHAR DEFAULT 'SCALPER',
+                    triggering_wallets_json VARCHAR DEFAULT '[]',
+                    whale_shadow_exit_requested BOOLEAN DEFAULT FALSE,
                     last_decision_rationale VARCHAR,
                     updated_at VARCHAR NOT NULL
                 )
@@ -90,7 +93,9 @@ class AgentDatabase:
                     pnl_pct DOUBLE,
                     reason VARCHAR NOT NULL,
                     tx_signature VARCHAR,
-                    rationale VARCHAR
+                    rationale VARCHAR,
+                    strategy VARCHAR DEFAULT 'SCALPER',
+                    triggering_wallets_json VARCHAR DEFAULT '[]'
                 )
                 """
             )
@@ -263,6 +268,31 @@ class AgentDatabase:
             if col not in existing:
                 self._conn.execute(f"ALTER TABLE active_watchlist ADD COLUMN {col} {col_type}")
 
+        # Migrate agent_state columns
+        state_cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info('agent_state')").fetchall()
+        }
+        for col, col_type in [
+            ("strategy", "VARCHAR DEFAULT 'SCALPER'"),
+            ("triggering_wallets_json", "VARCHAR DEFAULT '[]'"),
+            ("whale_shadow_exit_requested", "BOOLEAN DEFAULT FALSE"),
+        ]:
+            if col not in state_cols:
+                self._conn.execute(f"ALTER TABLE agent_state ADD COLUMN {col} {col_type}")
+
+        # Migrate trades columns
+        trade_cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info('trades')").fetchall()
+        }
+        for col, col_type in [
+            ("strategy", "VARCHAR DEFAULT 'SCALPER'"),
+            ("triggering_wallets_json", "VARCHAR DEFAULT '[]'"),
+        ]:
+            if col not in trade_cols:
+                self._conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type}")
+
     def _ensure_initial_state(self) -> None:
         with self._lock:
             row = self._conn.execute(
@@ -293,13 +323,25 @@ class AgentDatabase:
                 """
                 SELECT focus_state, sol_balance, daily_start_sol, daily_pnl_sol,
                        daily_reset_date, active_position_json, last_decision_rationale,
-                       updated_at
+                       updated_at, strategy, triggering_wallets_json, whale_shadow_exit_requested
                 FROM agent_state WHERE id = 1
                 """
             ).fetchone()
             assert row is not None
             today = utc_now().date().isoformat()
-            focus_state, sol_bal, daily_start, daily_pnl, reset_date, pos_json, rationale, updated_at = row
+            (
+                focus_state,
+                sol_bal,
+                daily_start,
+                daily_pnl,
+                reset_date,
+                pos_json,
+                rationale,
+                updated_at,
+                strategy,
+                trig_json,
+                shadow_flag,
+            ) = row
 
             # Roll over daily PnL counter on new UTC day
             if reset_date != today:
@@ -315,13 +357,26 @@ class AgentDatabase:
                     [daily_start, reset_date, utc_now_iso()],
                 )
 
+            active_pos = json.loads(pos_json) if pos_json else None
+            trig_wallets = json.loads(trig_json) if trig_json else []
+            if isinstance(active_pos, dict):
+                if strategy and not active_pos.get("strategy"):
+                    active_pos["strategy"] = strategy
+                if trig_wallets and not active_pos.get("triggering_wallets"):
+                    active_pos["triggering_wallets"] = trig_wallets
+                if shadow_flag:
+                    active_pos["whale_shadow_exit_flag"] = True
+
             return {
                 "focus_state": focus_state,
                 "sol_balance": float(sol_bal),
                 "daily_start_sol": float(daily_start),
                 "daily_pnl_sol": float(daily_pnl),
                 "daily_reset_date": reset_date,
-                "active_position": json.loads(pos_json) if pos_json else None,
+                "active_position": active_pos,
+                "strategy": strategy or "SCALPER",
+                "triggering_wallets": trig_wallets,
+                "whale_shadow_exit_requested": bool(shadow_flag),
                 "last_decision_rationale": rationale or "",
                 "updated_at": updated_at,
             }
@@ -337,22 +392,29 @@ class AgentDatabase:
     ) -> None:
         with self._lock:
             pos_json = json.dumps(active_position) if active_position is not None else None
+            strategy = (
+                str(active_position.get("strategy") or "SCALPER")
+                if isinstance(active_position, dict)
+                else "SCALPER"
+            )
+            trig_wallets = (
+                list(active_position.get("triggering_wallets") or [])
+                if isinstance(active_position, dict)
+                else []
+            )
+            shadow_flag = (
+                bool(active_position.get("whale_shadow_exit_flag", False))
+                if isinstance(active_position, dict)
+                else False
+            )
+            trig_json = json.dumps(trig_wallets)
             if last_decision_rationale is None:
                 self._conn.execute(
                     """
                     UPDATE agent_state
                     SET focus_state = ?, sol_balance = ?, daily_pnl_sol = ?,
-                        active_position_json = ?, updated_at = ?
-                    WHERE id = 1
-                    """,
-                    [focus_state, sol_balance, daily_pnl_sol, pos_json, utc_now_iso()],
-                )
-            else:
-                self._conn.execute(
-                    """
-                    UPDATE agent_state
-                    SET focus_state = ?, sol_balance = ?, daily_pnl_sol = ?,
-                        active_position_json = ?, last_decision_rationale = ?, updated_at = ?
+                        active_position_json = ?, strategy = ?, triggering_wallets_json = ?,
+                        whale_shadow_exit_requested = ?, updated_at = ?
                     WHERE id = 1
                     """,
                     [
@@ -360,10 +422,82 @@ class AgentDatabase:
                         sol_balance,
                         daily_pnl_sol,
                         pos_json,
+                        strategy,
+                        trig_json,
+                        shadow_flag,
+                        utc_now_iso(),
+                    ],
+                )
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE agent_state
+                    SET focus_state = ?, sol_balance = ?, daily_pnl_sol = ?,
+                        active_position_json = ?, strategy = ?, triggering_wallets_json = ?,
+                        whale_shadow_exit_requested = ?, last_decision_rationale = ?, updated_at = ?
+                    WHERE id = 1
+                    """,
+                    [
+                        focus_state,
+                        sol_balance,
+                        daily_pnl_sol,
+                        pos_json,
+                        strategy,
+                        trig_json,
+                        shadow_flag,
                         last_decision_rationale,
                         utc_now_iso(),
                     ],
                 )
+
+    def topup_paper_sol(self, amount: float) -> tuple[float, float]:
+        """Safely add SOL to the paper wallet balance and return (before, after)."""
+        if amount <= 0:
+            raise ValueError("Top-up amount must be positive.")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT sol_balance, daily_start_sol FROM agent_state WHERE id = 1"
+            ).fetchone()
+            assert row is not None
+            before = float(row[0])
+            daily_start = float(row[1])
+            after = round(before + float(amount), 6)
+            new_daily_start = round(daily_start + float(amount), 6)
+            self._conn.execute(
+                """
+                UPDATE agent_state
+                SET sol_balance = ?, daily_start_sol = ?, updated_at = ?
+                WHERE id = 1
+                """,
+                [after, new_daily_start, utc_now_iso()],
+            )
+            return before, after
+
+    def flag_whale_shadow_exit(self, mint: str, seller_wallet: str) -> bool:
+        """If an open WHALE_SCALP position on `mint` was triggered by `seller_wallet`, flag immediate exit."""
+        with self._lock:
+            st = self.get_state()
+            pos = st.get("active_position")
+            if (
+                st["focus_state"] != FocusState.IN_POSITION.value
+                or not isinstance(pos, dict)
+                or pos.get("mint") != mint
+                or str(pos.get("strategy") or "").upper() != "WHALE_SCALP"
+            ):
+                return False
+            trig = set(pos.get("triggering_wallets") or st.get("triggering_wallets") or [])
+            if seller_wallet not in trig:
+                return False
+            pos["whale_shadow_exit_flag"] = True
+            self._conn.execute(
+                """
+                UPDATE agent_state
+                SET active_position_json = ?, whale_shadow_exit_requested = TRUE, updated_at = ?
+                WHERE id = 1
+                """,
+                [json.dumps(pos), utc_now_iso()],
+            )
+            return True
 
     def set_cooldown(
         self,
@@ -631,14 +765,17 @@ class AgentDatabase:
         pnl_pct: Optional[float] = None,
         tx_signature: Optional[str] = None,
         rationale: str = "",
+        strategy: str = "SCALPER",
+        triggering_wallets: Optional[list[str]] = None,
     ) -> None:
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO trades (
                     timestamp, mode, side, mint, symbol, in_amount, out_amount,
-                    sol_value, pnl_sol, pnl_pct, reason, tx_signature, rationale
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    sol_value, pnl_sol, pnl_pct, reason, tx_signature, rationale,
+                    strategy, triggering_wallets_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     utc_now_iso(),
@@ -654,6 +791,8 @@ class AgentDatabase:
                     reason,
                     tx_signature,
                     rationale,
+                    strategy or "SCALPER",
+                    json.dumps(triggering_wallets or []),
                 ],
             )
 
@@ -686,11 +825,12 @@ class AgentDatabase:
         return [dict(zip(keys, r)) for r in rows]
 
     def get_recent_closed_trades(self, limit: int = 15) -> list[dict[str, Any]]:
-        """Return the last N closed trades (SELL fills) with entry/exit SOL and PnL."""
+        """Return the last N closed trades (SELL fills) with entry/exit SOL, PnL, and strategy."""
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT symbol, mint, sol_value, pnl_sol, pnl_pct, reason, timestamp
+                SELECT symbol, mint, sol_value, pnl_sol, pnl_pct, reason, timestamp,
+                       strategy, triggering_wallets_json
                 FROM trades
                 WHERE UPPER(side) = 'SELL'
                 ORDER BY id DESC
@@ -699,7 +839,7 @@ class AgentDatabase:
                 [limit],
             ).fetchall()
         closed: list[dict[str, Any]] = []
-        for symbol, mint, exit_sol, pnl_sol, pnl_pct, reason, ts in rows:
+        for symbol, mint, exit_sol, pnl_sol, pnl_pct, reason, ts, strategy, trig_json in rows:
             exit_val = float(exit_sol or 0.0)
             pnl_val = float(pnl_sol or 0.0)
             entry_val = max(0.0, exit_val - pnl_val)
@@ -713,6 +853,8 @@ class AgentDatabase:
                     "pnl_sol": round(pnl_val, 6),
                     "pnl_pct": round(pct_val, 2),
                     "exit_reason": reason,
+                    "strategy": strategy or "SCALPER",
+                    "triggering_wallets": json.loads(trig_json) if trig_json else [],
                     "closed_at": ts,
                 }
             )
@@ -1121,6 +1263,89 @@ class AgentDatabase:
                     "last_seen_utc": last_seen,
                 }
         return active
+
+    def get_whale_fast_track_triggers(
+        self,
+        *,
+        confluence_window_minutes: int = 5,
+        max_age_seconds: int = 90,
+        min_confluence_wallets: int = 2,
+        min_solo_sol: float = 2.0,
+        now: Optional[datetime] = None,
+    ) -> list[dict[str, Any]]:
+        """Return mints qualifying for WHALE_SCALP fast-track entry.
+
+        Qualifies when either:
+          - >= min_confluence_wallets unique wallets bought within confluence_window_minutes
+            (with the most recent buy within max_age_seconds), OR
+          - A single whale buy >= min_solo_sol occurred within max_age_seconds.
+        """
+        now_dt = now or utc_now()
+        conf_cutoff = now_dt - timedelta(minutes=confluence_window_minutes)
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT mint, wallet, sol_amount, timestamp_utc
+                FROM whale_events
+                WHERE UPPER(side) = 'BUY'
+                ORDER BY timestamp_utc DESC
+                """
+            ).fetchall()
+
+        by_mint: dict[str, list[tuple[str, float, datetime]]] = {}
+        for mint, wallet, sol_amt, ts_str in rows:
+            ev_dt = datetime.fromisoformat(ts_str)
+            if ev_dt.tzinfo is None:
+                ev_dt = ev_dt.replace(tzinfo=timezone.utc)
+            if ev_dt < conf_cutoff:
+                continue
+            by_mint.setdefault(str(mint), []).append((str(wallet), float(sol_amt or 0.0), ev_dt))
+
+        triggers: list[dict[str, Any]] = []
+        for mint, events in by_mint.items():
+            latest_dt = max(ev[2] for ev in events)
+            age_sec = max(0.0, (now_dt - latest_dt).total_seconds())
+            if age_sec > max_age_seconds:
+                continue
+
+            unique_wallets: list[str] = []
+            seen_w: set[str] = set()
+            total_sol = 0.0
+            solo_wallets: list[str] = []
+
+            for wallet, sol_amt, ev_dt in events:
+                total_sol += sol_amt
+                if wallet not in seen_w:
+                    seen_w.add(wallet)
+                    unique_wallets.append(wallet)
+                ev_age = max(0.0, (now_dt - ev_dt).total_seconds())
+                if sol_amt >= min_solo_sol and ev_age <= max_age_seconds:
+                    if wallet not in solo_wallets:
+                        solo_wallets.append(wallet)
+
+            if len(unique_wallets) >= min_confluence_wallets:
+                triggers.append(
+                    {
+                        "mint": mint,
+                        "trigger_type": "CONFLUENCE",
+                        "triggering_wallets": unique_wallets,
+                        "total_sol": round(total_sol, 4),
+                        "age_seconds": round(age_sec, 1),
+                    }
+                )
+            elif solo_wallets:
+                triggers.append(
+                    {
+                        "mint": mint,
+                        "trigger_type": "SOLO",
+                        "triggering_wallets": solo_wallets,
+                        "total_sol": round(total_sol, 4),
+                        "age_seconds": round(age_sec, 1),
+                    }
+                )
+
+        triggers.sort(key=lambda t: (t["trigger_type"] == "CONFLUENCE", t["total_sol"]), reverse=True)
+        return triggers
 
     def count_whale_events_today(self, now: Optional[datetime] = None) -> int:
         today = (now or utc_now()).date().isoformat()

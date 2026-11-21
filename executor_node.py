@@ -138,11 +138,15 @@ async def executor_node(
     if is_buy:
         spent_sol = order.amount_atomic / LAMPORTS_PER_SOL
         sol_balance = max(0.0, sol_balance - spent_sol)
+        pos_strategy = order.strategy or "SCALPER"
         pos = ActivePosition(
             mint=order.mint,
             symbol=order.symbol,
             entry_sol=spent_sol,
             token_amount=out_amount,
+            strategy=pos_strategy,
+            triggering_wallets=list(order.triggering_wallets),
+            whale_shadow_exit_flag=False,
             entry_liquidity_usd=order.entry_liquidity_usd,
             current_sol_value=spent_sol,
             peak_sol_value=spent_sol,
@@ -168,6 +172,8 @@ async def executor_node(
             reason=order.reason,
             tx_signature=tx_signature,
             rationale=order.rationale,
+            strategy=pos_strategy,
+            triggering_wallets=list(order.triggering_wallets),
         )
         action_type = "REENTRY_BUY" if order.reason == "LEG_2_REENTRY" else "BUY"
         db.log_action(
@@ -178,7 +184,7 @@ async def executor_node(
             qty=float(out_amount),
             notional=round(spent_sol, 6),
             price_or_value=round(spent_sol, 6),
-            strategy=order.strategy or order.reason,
+            strategy=pos_strategy,
             reason=order.reason,
         )
         logger.info(
@@ -201,6 +207,21 @@ async def executor_node(
         pnl_pct = (pnl_sol / entry_sol) if entry_sol > 0 else 0.0
         daily_pnl_sol += pnl_sol
 
+        existing_strat = (
+            str(existing_pos_dict.get("strategy") or "")
+            if isinstance(existing_pos_dict, dict)
+            else ""
+        )
+        pos_strategy = (
+            order.strategy
+            if order.strategy and order.strategy != "SCALPER"
+            else (existing_strat or "SCALPER")
+        )
+        pos_trig_wallets = (
+            list(existing_pos_dict.get("triggering_wallets") or order.triggering_wallets or [])
+            if isinstance(existing_pos_dict, dict)
+            else list(order.triggering_wallets or [])
+        )
         db.log_trade(
             mode=config.EXECUTION_MODE,
             side="SELL",
@@ -214,6 +235,8 @@ async def executor_node(
             reason=order.reason,
             tx_signature=tx_signature,
             rationale=order.rationale,
+            strategy=pos_strategy,
+            triggering_wallets=pos_trig_wallets,
         )
         db.log_action(
             mode=config.EXECUTION_MODE,
@@ -225,7 +248,7 @@ async def executor_node(
             price_or_value=round(received_sol, 6),
             pnl_amount=round(pnl_sol, 6),
             pnl_pct=round(pnl_pct * 100.0, 2),
-            strategy=order.strategy or "",
+            strategy=pos_strategy,
             reason=order.reason,
         )
 

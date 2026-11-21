@@ -44,25 +44,33 @@ export function ActivePositionHero({ telemetry }: Props) {
   }
 
   const isWatching = focus === "WATCHING_REENTRY";
+  const strategy = (pnl.strategy || "SCALPER").toUpperCase();
+  const isWhaleScalp = strategy === "WHALE_SCALP";
   const pnlPct = pnl.pnl_pct;
   const peakPct =
     pnl.entry_sol > 0 ? ((pnl.peak_sol_value - pnl.entry_sol) / pnl.entry_sol) * 100 : 0;
 
-  // Risk gauge scale: -15% to max(+25%, ceil(peakPct + 5))
-  const gaugeMin = -15;
-  const gaugeMax = Math.max(25, Math.ceil((Math.max(peakPct, pnlPct) + 5) / 5) * 5);
+  // Risk gauge scale: adapts for WHALE_SCALP (-20% to +55%) vs SCALPER (-15% to +25%)
+  const gaugeMin = isWhaleScalp ? -20 : -15;
+  const baseMax = isWhaleScalp ? 55 : 25;
+  const gaugeMax = Math.max(baseMax, Math.ceil((Math.max(peakPct, pnlPct) + 5) / 5) * 5);
 
-  const hardStopPos = clampPct(-10, gaugeMin, gaugeMax);
+  const hardStopLevel = isWhaleScalp ? -15 : -10;
+  const trailArmLevel = isWhaleScalp ? 15 : 12;
+  const trailDropFactor = isWhaleScalp ? 0.88 : 0.94;
+
+  const hardStopPos = clampPct(hardStopLevel, gaugeMin, gaugeMax);
   const zeroPos = clampPct(0, gaugeMin, gaugeMax);
   const beFloorPos = clampPct(2, gaugeMin, gaugeMax);
   const beArmPos = clampPct(8, gaugeMin, gaugeMax);
-  const trailArmPos = clampPct(12, gaugeMin, gaugeMax);
+  const trailArmPos = clampPct(trailArmLevel, gaugeMin, gaugeMax);
+  const whaleTpPos = clampPct(50, gaugeMin, gaugeMax);
   const currentPos = clampPct(pnlPct, gaugeMin, gaugeMax);
   const peakPos = clampPct(peakPct, gaugeMin, gaugeMax);
 
-  // Live trailing TP trigger level (-6% pullback from peak) when armed
+  // Live trailing TP trigger level (-12% for WHALE_SCALP, -6% for SCALPER) when armed
   const trailStopPct = pnl.trail_armed
-    ? ((pnl.peak_sol_value * 0.94 - pnl.entry_sol) / Math.max(pnl.entry_sol, 1e-9)) * 100
+    ? ((pnl.peak_sol_value * trailDropFactor - pnl.entry_sol) / Math.max(pnl.entry_sol, 1e-9)) * 100
     : null;
   const trailStopPos =
     trailStopPct !== null ? clampPct(trailStopPct, gaugeMin, gaugeMax) : null;
@@ -85,6 +93,15 @@ export function ActivePositionHero({ telemetry }: Props) {
             />
             <span className="font-mono text-xs uppercase tracking-wider text-slate-400">
               {isWatching ? "Watching Leg 2 Re-Entry" : "Active Focused Position"}
+            </span>
+            <span
+              className={`rounded-full border px-2 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider ${
+                isWhaleScalp
+                  ? "border-fuchsia-500/50 bg-fuchsia-500/20 text-fuchsia-300"
+                  : "border-slate-700 bg-slate-800/80 text-slate-300"
+              }`}
+            >
+              {strategy}
             </span>
           </div>
           <div className="mt-1 flex flex-wrap items-center gap-3">
@@ -153,31 +170,48 @@ export function ActivePositionHero({ telemetry }: Props) {
             RISK GAUGE ({gaugeMin}% to +{gaugeMax}%)
           </span>
           <div className="flex flex-wrap items-center gap-3">
-            <span className="text-rose-400">Hard Stop: -10%</span>
-            <span className={pnl.breakeven_armed ? "font-semibold text-cyan-300" : "text-slate-400"}>
-              BE Shield: +8% / +2% {pnl.breakeven_armed ? "(ARMED)" : ""}
-            </span>
-            <span className={pnl.trail_armed ? "font-semibold text-amber-300" : "text-slate-400"}>
-              Trailing TP: +12% / -6%{" "}
-              {pnl.trail_armed && trailStopPct !== null
-                ? `(ARMED @ ${trailStopPct >= 0 ? "+" : ""}${trailStopPct.toFixed(1)}%)`
-                : ""}
-            </span>
+            {isWhaleScalp ? (
+              <>
+                <span className="text-rose-400">Hard Stop: -15%</span>
+                <span className={pnl.trail_armed ? "font-semibold text-amber-300" : "text-slate-400"}>
+                  Peak Trail: +15% / -12%{" "}
+                  {pnl.trail_armed && trailStopPct !== null
+                    ? `(ARMED @ ${trailStopPct >= 0 ? "+" : ""}${trailStopPct.toFixed(1)}%)`
+                    : ""}
+                </span>
+                <span className="text-emerald-400">Front-Run TP: +50%</span>
+                <span className="text-fuchsia-300">Shadow Exit: Active</span>
+              </>
+            ) : (
+              <>
+                <span className="text-rose-400">Hard Stop: -10%</span>
+                <span className={pnl.breakeven_armed ? "font-semibold text-cyan-300" : "text-slate-400"}>
+                  BE Shield: +8% / +2% {pnl.breakeven_armed ? "(ARMED)" : ""}
+                </span>
+                <span className={pnl.trail_armed ? "font-semibold text-amber-300" : "text-slate-400"}>
+                  Trailing TP: +12% / -6%{" "}
+                  {pnl.trail_armed && trailStopPct !== null
+                    ? `(ARMED @ ${trailStopPct >= 0 ? "+" : ""}${trailStopPct.toFixed(1)}%)`
+                    : ""}
+                </span>
+              </>
+            )}
           </div>
         </div>
 
         <div className="relative h-4 w-full overflow-hidden rounded-full bg-slate-900">
-          {/* Danger zone left of -10% */}
+          {/* Danger zone left of hard stop */}
           <div
             className="absolute inset-y-0 left-0 bg-rose-500/25"
             style={{ width: `${hardStopPos}%` }}
           />
-          {/* Breakeven +2% to +12% zone */}
-          <div
-            className="absolute inset-y-0 bg-cyan-500/15"
-            style={{ left: `${beFloorPos}%`, width: `${Math.max(0, trailArmPos - beFloorPos)}%` }}
-          />
-          {/* Trailing TP zone >= +12% */}
+          {!isWhaleScalp && (
+            <div
+              className="absolute inset-y-0 bg-cyan-500/15"
+              style={{ left: `${beFloorPos}%`, width: `${Math.max(0, trailArmPos - beFloorPos)}%` }}
+            />
+          )}
+          {/* Trailing TP zone */}
           <div
             className="absolute inset-y-0 right-0 bg-emerald-500/15"
             style={{ left: `${trailArmPos}%` }}
@@ -187,28 +221,39 @@ export function ActivePositionHero({ telemetry }: Props) {
           <div
             className="absolute inset-y-0 w-0.5 bg-rose-500"
             style={{ left: `${hardStopPos}%` }}
-            title="Hard Stop (-10%)"
+            title={`Hard Stop (${hardStopLevel}%)`}
           />
           <div
             className="absolute inset-y-0 w-px bg-slate-600"
             style={{ left: `${zeroPos}%` }}
             title="Entry (0%)"
           />
-          <div
-            className="absolute inset-y-0 w-0.5 bg-cyan-400"
-            style={{ left: `${beFloorPos}%` }}
-            title="Breakeven Floor (+2%)"
-          />
-          <div
-            className="absolute inset-y-0 w-0.5 bg-teal-400/70"
-            style={{ left: `${beArmPos}%` }}
-            title="Breakeven Arm (+8%)"
-          />
+          {!isWhaleScalp && (
+            <>
+              <div
+                className="absolute inset-y-0 w-0.5 bg-cyan-400"
+                style={{ left: `${beFloorPos}%` }}
+                title="Breakeven Floor (+2%)"
+              />
+              <div
+                className="absolute inset-y-0 w-0.5 bg-teal-400/70"
+                style={{ left: `${beArmPos}%` }}
+                title="Breakeven Arm (+8%)"
+              />
+            </>
+          )}
           <div
             className="absolute inset-y-0 w-0.5 bg-amber-400"
             style={{ left: `${trailArmPos}%` }}
-            title="Trailing TP Arm (+12%)"
+            title={`Trailing Arm (+${trailArmLevel}%)`}
           />
+          {isWhaleScalp && (
+            <div
+              className="absolute inset-y-0 w-0.5 bg-emerald-400"
+              style={{ left: `${whaleTpPos}%` }}
+              title="Front-Run TP (+50%)"
+            />
+          )}
 
           {/* Dynamic Trailing Stop line when armed */}
           {trailStopPos !== null && (

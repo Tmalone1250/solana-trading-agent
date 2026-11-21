@@ -1,6 +1,8 @@
 export type FocusState = "SCANNING" | "IN_POSITION" | "WATCHING_REENTRY";
 
 export interface LiveJupiterPnl {
+  strategy?: string;
+  triggering_wallets?: string[];
   entry_sol: number;
   current_sol_value: number;
   peak_sol_value: number;
@@ -58,6 +60,7 @@ export interface ClosedTrade {
   pnl_sol: number;
   pnl_pct: number;
   exit_reason: string;
+  strategy?: string;
   closed_at: string;
 }
 

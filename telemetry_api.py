@@ -64,6 +64,8 @@ def create_telemetry_app(
             pnl_sol = current_sol - entry_sol if entry_sol > 0 else 0.0
             pnl_pct = (pnl_sol / entry_sol) * 100.0 if entry_sol > 0 else 0.0
             live_pnl = {
+                "strategy": str(pos.get("strategy") or st.get("strategy") or "SCALPER"),
+                "triggering_wallets": list(pos.get("triggering_wallets") or st.get("triggering_wallets") or []),
                 "entry_sol": round(entry_sol, 6),
                 "current_sol_value": round(current_sol, 6),
                 "peak_sol_value": round(peak_sol, 6),

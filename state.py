@@ -90,7 +90,8 @@ class PendingOrder(BaseModel):
     apply_cooldown: bool = False
     entry_liquidity_usd: float = 0.0
     run_peak_sol: Optional[float] = None
-    strategy: str = ""
+    strategy: str = "SCALPER"
+    triggering_wallets: list[str] = Field(default_factory=list)
     rationale: str = ""
 
 
@@ -101,6 +102,9 @@ class ActivePosition(BaseModel):
     symbol: str
     entry_sol: float
     token_amount: int
+    strategy: str = "SCALPER"
+    triggering_wallets: list[str] = Field(default_factory=list)
+    whale_shadow_exit_flag: bool = False
     entry_liquidity_usd: float = 0.0
     current_sol_value: float = 0.0
     peak_sol_value: float = 0.0
@@ -148,6 +152,7 @@ class AgentGraphState(TypedDict, total=False):
 
     active_position: Optional[dict[str, Any]]
     active_watchlist: list[dict[str, Any]]
+    whale_fast_track_candidates: list[dict[str, Any]]
     raw_candidates: list[dict[str, Any]]
     safe_candidates: list[dict[str, Any]]
     rejected_candidates: list[dict[str, Any]]

@@ -321,6 +321,14 @@ def process_helius_webhook_payload(
 
         recorded += 1
         touched_mints.add(ev["mint"])
+        if ev["side"] == "SELL":
+            shadow_triggered = db.flag_whale_shadow_exit(ev["mint"], ev["wallet"])
+            if shadow_triggered:
+                logger.warning(
+                    "[WhaleShadow] Triggering wallet %s.. SOLD %s.. -> flagging WHALE_SHADOW_EXIT!",
+                    ev["wallet"][:6],
+                    ev["mint"][:6],
+                )
         logger.info(
             "[WhaleWebhook] %s | wallet=%s.. | mint=%s.. | %.3f SOL",
             ev["side"],

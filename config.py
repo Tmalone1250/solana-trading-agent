@@ -131,6 +131,18 @@ class AgentConfig(BaseSettings):
     WHALE_SIGNAL_TTL_MINUTES: int = Field(default=30, gt=0)
     WHALE_MIN_SOL_SPENT: float = Field(default=0.5, ge=0.0)
 
+    # WHALE_SCALP Fast-Track Strategy
+    WHALE_STRATEGY_ENABLED: bool = True
+    WHALE_POSITION_SOL: float = Field(default=0.25, gt=0.0)
+    WHALE_MIN_SOLO_BUY_SOL: float = Field(default=2.0, gt=0.0)
+    WHALE_MIN_CONFLUENCE_WALLETS: int = Field(default=2, ge=1)
+    WHALE_ENTRY_MAX_AGE_SECONDS: int = Field(default=90, gt=0)
+    WHALE_MIN_LIQUIDITY_USD: float = Field(default=15_000.0, ge=0.0)
+    WHALE_TP_PCT: float = Field(default=50.0, gt=0.0)
+    WHALE_TRAIL_ARM_PCT: float = Field(default=15.0, gt=0.0)
+    WHALE_TRAIL_DROP_PCT: float = Field(default=12.0, gt=0.0, lt=100.0)
+    WHALE_HARD_STOP_PCT: float = Field(default=-15.0, lt=0.0, gt=-100.0)
+
     # Endpoints
     DEXSCREENER_BASE_URL: str = "https://api.dexscreener.com"
     GECKOTERMINAL_BASE_URL: str = "https://api.geckoterminal.com/api/v2"

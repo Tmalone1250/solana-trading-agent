@@ -155,6 +155,118 @@ async def position_monitor_node(
         pnl_pct = (current_sol_value - pos.entry_sol) / pos.entry_sol if pos.entry_sol > 0 else 0.0
         peak_pnl_pct = (pos.peak_sol_value - pos.entry_sol) / pos.entry_sol if pos.entry_sol > 0 else 0.0
 
+        # ---------------------------------------------------------------------
+        # Dedicated WHALE_SCALP 4-Layer Exit Engine (strict priority order)
+        # ---------------------------------------------------------------------
+        if str(pos.strategy or "").upper() == "WHALE_SCALP":
+            pnl_pct_100 = pnl_pct * 100.0
+            peak_pnl_pct_100 = peak_pnl_pct * 100.0
+            if peak_pnl_pct_100 + EPS >= config.WHALE_TRAIL_ARM_PCT:
+                pos.trail_armed = True
+
+            # Exit A (Whale Shadow): triggering whale sold this mint
+            db_shadow_flag = bool(db.get_state().get("whale_shadow_exit_requested", False))
+            if pos.whale_shadow_exit_flag or db_shadow_flag:
+                reason = "WHALE_SHADOW_EXIT"
+                order = PendingOrder(
+                    side="SELL",
+                    mint=pos.mint,
+                    symbol=pos.symbol,
+                    amount_atomic=pos.token_amount,
+                    reason=reason,
+                    target_state_after_fill=FocusState.SCANNING,
+                    apply_cooldown=True,
+                    strategy="WHALE_SCALP",
+                    triggering_wallets=list(pos.triggering_wallets),
+                    rationale=f"[WHALE_SCALP EXIT] {pos.symbol}: {reason} (triggering whale sold)",
+                )
+                return {
+                    "active_position": pos.model_dump(),
+                    "pending_order": order.model_dump(),
+                    "monitor_event": reason,
+                }
+
+            # Exit B (Front-Run TP): hard take-profit at +50%
+            if pnl_pct_100 + EPS >= config.WHALE_TP_PCT:
+                reason = "WHALE_FRONT_RUN_TP"
+                order = PendingOrder(
+                    side="SELL",
+                    mint=pos.mint,
+                    symbol=pos.symbol,
+                    amount_atomic=pos.token_amount,
+                    reason=reason,
+                    target_state_after_fill=FocusState.SCANNING,
+                    apply_cooldown=True,
+                    strategy="WHALE_SCALP",
+                    triggering_wallets=list(pos.triggering_wallets),
+                    rationale=f"[WHALE_SCALP TP] {pos.symbol}: {reason} ({pnl_pct_100:+.2f}% >= +{config.WHALE_TP_PCT:.0f}%)",
+                )
+                return {
+                    "active_position": pos.model_dump(),
+                    "pending_order": order.model_dump(),
+                    "monitor_event": reason,
+                }
+
+            # Exit C (Peak Drawdown): once +15% reached, exit on 12% drop from peak
+            if pos.trail_armed and pos.peak_sol_value > 0:
+                drop_from_peak_100 = ((pos.peak_sol_value - current_sol_value) / pos.peak_sol_value) * 100.0
+                if drop_from_peak_100 + EPS >= config.WHALE_TRAIL_DROP_PCT:
+                    reason = "WHALE_PEAK_TRAIL"
+                    order = PendingOrder(
+                        side="SELL",
+                        mint=pos.mint,
+                        symbol=pos.symbol,
+                        amount_atomic=pos.token_amount,
+                        reason=reason,
+                        target_state_after_fill=FocusState.SCANNING,
+                        apply_cooldown=True,
+                        strategy="WHALE_SCALP",
+                        triggering_wallets=list(pos.triggering_wallets),
+                        rationale=(
+                            f"[WHALE_SCALP TRAIL] {pos.symbol}: {reason} "
+                            f"(peak {peak_pnl_pct_100:+.2f}%, drop -{drop_from_peak_100:.2f}% >= -{config.WHALE_TRAIL_DROP_PCT:.0f}%)"
+                        ),
+                    )
+                    return {
+                        "active_position": pos.model_dump(),
+                        "pending_order": order.model_dump(),
+                        "monitor_event": reason,
+                    }
+
+            # Exit D (Hard Stop): hard stop-loss at -15%
+            if pnl_pct_100 <= config.WHALE_HARD_STOP_PCT + EPS:
+                reason = "WHALE_HARD_STOP"
+                order = PendingOrder(
+                    side="SELL",
+                    mint=pos.mint,
+                    symbol=pos.symbol,
+                    amount_atomic=pos.token_amount,
+                    reason=reason,
+                    target_state_after_fill=FocusState.SCANNING,
+                    apply_cooldown=True,
+                    strategy="WHALE_SCALP",
+                    triggering_wallets=list(pos.triggering_wallets),
+                    rationale=f"[WHALE_SCALP STOP] {pos.symbol}: {reason} ({pnl_pct_100:+.2f}% <= {config.WHALE_HARD_STOP_PCT:.0f}%)",
+                )
+                return {
+                    "active_position": pos.model_dump(),
+                    "pending_order": order.model_dump(),
+                    "monitor_event": reason,
+                }
+
+            pos_dict = pos.model_dump()
+            db.save_state(
+                focus_state=FocusState.IN_POSITION.value,
+                sol_balance=sol_balance,
+                daily_pnl_sol=daily_pnl_sol,
+                active_position=pos_dict,
+            )
+            return {
+                "active_position": pos_dict,
+                "pending_order": None,
+                "monitor_event": "HOLD_WHALE_SCALP",
+            }
+
         if peak_pnl_pct + EPS >= config.BREAKEVEN_ARM_PCT:
             pos.breakeven_armed = True
         if peak_pnl_pct + EPS >= config.TRAIL_ARM_PCT:

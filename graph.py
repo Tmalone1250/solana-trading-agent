@@ -26,12 +26,14 @@ def _route_entry(state: AgentGraphState) -> str:
 
 
 def _route_after_scanner(state: AgentGraphState) -> str:
-    if state.get("raw_candidates"):
+    if state.get("raw_candidates") or state.get("whale_fast_track_candidates"):
         return "safety_gate"
     return END
 
 
 def _route_after_safety(state: AgentGraphState) -> str:
+    if state.get("pending_order"):
+        return "executor"
     if state.get("safe_candidates"):
         return "alpha"
     return END
@@ -101,7 +103,7 @@ def build_agent_graph(
     graph.add_conditional_edges(
         "safety_gate",
         _route_after_safety,
-        {"alpha": "alpha", END: END},
+        {"executor": "executor", "alpha": "alpha", END: END},
     )
     graph.add_conditional_edges(
         "alpha",

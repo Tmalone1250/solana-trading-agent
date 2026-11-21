@@ -27,6 +27,7 @@ export function RecentTradesTable({ trades }: Props) {
           <thead>
             <tr className="border-b border-slate-800/80 bg-slate-950/50 font-mono text-[10px] uppercase tracking-wider text-slate-400">
               <th className="px-4 py-3">Token</th>
+              <th className="px-4 py-3">Strategy</th>
               <th className="px-4 py-3">Entry SOL</th>
               <th className="px-4 py-3">Exit SOL</th>
               <th className="px-4 py-3">PnL (SOL / %)</th>
@@ -37,7 +38,7 @@ export function RecentTradesTable({ trades }: Props) {
           <tbody className="divide-y divide-slate-800/60 font-mono">
             {trades.length === 0 ? (
               <tr>
-                <td colSpan={6} className="px-4 py-8 text-center text-xs text-slate-500">
+                <td colSpan={7} className="px-4 py-8 text-center text-xs text-slate-500">
                   No closed trades recorded yet.
                 </td>
               </tr>
@@ -50,6 +51,8 @@ export function RecentTradesTable({ trades }: Props) {
                   : loss
                     ? "text-rose-400"
                     : "text-slate-300";
+                const strat = (t.strategy || "SCALPER").toUpperCase();
+                const isWhale = strat === "WHALE_SCALP";
 
                 return (
                   <tr key={`${t.mint}-${t.closed_at}-${idx}`} className="hover:bg-slate-800/30">
@@ -63,6 +66,17 @@ export function RecentTradesTable({ trades }: Props) {
                         ${t.symbol}
                         <ExternalLink className="h-3 w-3 text-slate-500" />
                       </a>
+                    </td>
+                    <td className="px-4 py-3">
+                      <span
+                        className={`inline-flex rounded border px-1.5 py-0.5 text-[10px] font-semibold ${
+                          isWhale
+                            ? "border-fuchsia-500/50 bg-fuchsia-500/20 text-fuchsia-300"
+                            : "border-slate-700 bg-slate-800/70 text-slate-300"
+                        }`}
+                      >
+                        {strat}
+                      </span>
                     </td>
                     <td className="px-4 py-3 tabular-nums text-slate-300">
                       {formatSol(t.entry_sol)}

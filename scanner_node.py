@@ -415,13 +415,25 @@ async def scanner_node(
     kept_entries = _evict_stale_or_cooled_watchlist(config=config, db=db, now_dt=now_dt)
     kept_mints = [e["mint"] for e in kept_entries]
 
-    # 1b. Query active Helius whale signals (buy_count >= 1) and X social signals
+    # 1b. Query active Helius whale signals (buy_count >= 1), fast-track triggers, and X social signals
     active_whales = db.get_active_whale_signals(
         ttl_minutes=config.WHALE_SIGNAL_TTL_MINUTES,
         min_buys=1,
         now=now_dt,
     )
-    whale_mints = list(active_whales.keys())
+    whale_fast_triggers: dict[str, dict[str, Any]] = {}
+    if config.WHALE_STRATEGY_ENABLED:
+        for trig in db.get_whale_fast_track_triggers(
+            confluence_window_minutes=5,
+            max_age_seconds=config.WHALE_ENTRY_MAX_AGE_SECONDS,
+            min_confluence_wallets=config.WHALE_MIN_CONFLUENCE_WALLETS,
+            min_solo_sol=config.WHALE_MIN_SOLO_BUY_SOL,
+            now=now_dt,
+        ):
+            if not db.is_on_cooldown(trig["mint"], now=now_dt):
+                whale_fast_triggers[trig["mint"]] = trig
+
+    whale_mints = list(dict.fromkeys(list(whale_fast_triggers.keys()) + list(active_whales.keys())))
 
     active_social = db.get_active_social_signals(
         ttl_minutes=config.X_SIGNAL_TTL_MINUTES,
@@ -454,11 +466,11 @@ async def scanner_node(
         ]
         eligible = filter_candidates(parsed, config, db, now_dt=now_dt)
 
-        # Enrich any eligible or kept watchlist mints not already in jup_meta_by_mint
+        # Enrich any eligible, fast-track whale, or kept watchlist mints not already in jup_meta_by_mint
         if config.ENABLE_JUPITER_DISCOVERY:
             to_enrich = [
                 m
-                for m in ([c.mint for c in eligible] + kept_mints)
+                for m in ([c.mint for c in eligible] + list(whale_fast_triggers.keys()) + kept_mints)
                 if m not in jup_meta_by_mint
             ]
             if to_enrich:
@@ -469,6 +481,62 @@ async def scanner_node(
     finally:
         if owns_client:
             await client.aclose()
+
+    # Build WHALE_SCALP fast-track candidates (bypassing 3m soak & 5m OHLCV wait)
+    parsed_best_by_mint: dict[str, CandidateToken] = {}
+    for c in parsed:
+        ex = parsed_best_by_mint.get(c.mint)
+        if ex is None or c.liquidity_usd > ex.liquidity_usd:
+            parsed_best_by_mint[c.mint] = c
+
+    whale_fast_track_candidates: list[dict[str, Any]] = []
+    for w_mint, trig in whale_fast_triggers.items():
+        cand_obj = parsed_best_by_mint.get(w_mint)
+        if cand_obj is None:
+            continue
+        j_meta = jup_meta_by_mint.get(w_mint)
+        if j_meta and j_meta.get("is_sus") is True:
+            logger.info(
+                "[Scanner] WHALE_SCALP $%s | REJECTED (Jupiter audit.isSus=True)",
+                cand_obj.symbol,
+            )
+            continue
+        if cand_obj.liquidity_usd < config.WHALE_MIN_LIQUIDITY_USD:
+            logger.info(
+                "[Scanner] WHALE_SCALP $%s | REJECTED (liq $%.0f < $%.0f)",
+                cand_obj.symbol,
+                cand_obj.liquidity_usd,
+                config.WHALE_MIN_LIQUIDITY_USD,
+            )
+            continue
+        if cand_obj.market_cap_usd > config.MAX_MC_USD:
+            logger.info(
+                "[Scanner] WHALE_SCALP $%s | REJECTED (mc $%.0f > $%.0f)",
+                cand_obj.symbol,
+                cand_obj.market_cap_usd,
+                config.MAX_MC_USD,
+            )
+            continue
+        ft_dict = cand_obj.model_dump()
+        ft_dict["discovery_source"] = "WHALE"
+        ft_dict["whale_fast_track"] = True
+        ft_dict["whale_trigger_type"] = trig["trigger_type"]
+        ft_dict["triggering_wallets"] = trig["triggering_wallets"]
+        ft_dict["whale_total_sol"] = trig["total_sol"]
+        ft_dict["whale_age_seconds"] = trig["age_seconds"]
+        ft_dict["jup_meta"] = j_meta
+        if isinstance(j_meta, dict):
+            ft_dict["jup_organic_score"] = j_meta.get("organic_score")
+            ft_dict["jup_is_sus"] = bool(j_meta.get("is_sus", False))
+        whale_fast_track_candidates.append(ft_dict)
+        logger.info(
+            "[Scanner] WHALE_SCALP FAST-TRACK $%s (%s, %d wallets, %.2f SOL, age=%.0fs)",
+            cand_obj.symbol,
+            trig["trigger_type"],
+            len(trig["triggering_wallets"]),
+            trig["total_sol"],
+            trig["age_seconds"],
+        )
 
     # Hard Guardrail: reject tokens flagged audit.isSus == True by Jupiter Token v2
     clean_eligible: list[CandidateToken] = []
@@ -610,6 +678,7 @@ async def scanner_node(
     )
     return {
         "raw_candidates": batch_candidates,
+        "whale_fast_track_candidates": whale_fast_track_candidates,
         "active_watchlist": final_watchlist,
         "halted_daily_loss": False,
     }
