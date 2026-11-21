@@ -131,17 +131,24 @@ class AgentConfig(BaseSettings):
     WHALE_SIGNAL_TTL_MINUTES: int = Field(default=30, gt=0)
     WHALE_MIN_SOL_SPENT: float = Field(default=0.5, ge=0.0)
 
-    # WHALE_SCALP Fast-Track Strategy
+    # WHALE_SCALP Fast-Track Strategy (Ultra-Fresh Micro-Cap Launches)
     WHALE_STRATEGY_ENABLED: bool = True
     WHALE_POSITION_SOL: float = Field(default=0.25, gt=0.0)
     WHALE_MIN_SOLO_BUY_SOL: float = Field(default=2.0, gt=0.0)
     WHALE_MIN_CONFLUENCE_WALLETS: int = Field(default=2, ge=1)
-    WHALE_ENTRY_MAX_AGE_SECONDS: int = Field(default=90, gt=0)
-    WHALE_MIN_LIQUIDITY_USD: float = Field(default=15_000.0, ge=0.0)
-    WHALE_TP_PCT: float = Field(default=50.0, gt=0.0)
-    WHALE_TRAIL_ARM_PCT: float = Field(default=15.0, gt=0.0)
-    WHALE_TRAIL_DROP_PCT: float = Field(default=12.0, gt=0.0, lt=100.0)
-    WHALE_HARD_STOP_PCT: float = Field(default=-15.0, lt=0.0, gt=-100.0)
+    WHALE_ENTRY_MAX_AGE_SECONDS: int = Field(default=60, gt=0)
+    WHALE_MIN_MCAP_USD: float = Field(default=15_000.0, ge=0.0)
+    WHALE_MAX_MCAP_USD: float = Field(default=120_000.0, gt=0.0)
+    WHALE_MIN_LIQUIDITY_USD: float = Field(default=10_000.0, ge=0.0)
+    WHALE_TP_PCT: float = Field(default=25.0, gt=0.0)
+    WHALE_TRAIL_ARM_PCT: float = Field(default=10.0, gt=0.0)
+    WHALE_TRAIL_DROP_PCT: float = Field(default=6.0, gt=0.0, lt=100.0)
+    WHALE_TIGHT_TRAIL_ARM_PCT: float = Field(default=18.0, gt=0.0)
+    WHALE_TIGHT_TRAIL_DROP_PCT: float = Field(default=4.0, gt=0.0, lt=100.0)
+    WHALE_HARD_STOP_PCT: float = Field(default=-12.0, lt=0.0, gt=-100.0)
+    WHALE_TIME_STOP_SECONDS: int = Field(default=90, gt=0)
+    WHALE_TIME_STOP_MIN_PNL_PCT: float = Field(default=8.0)
+    WHALE_MONITOR_POLL_SECONDS: float = Field(default=2.0, gt=0.0)
 
     # Endpoints
     DEXSCREENER_BASE_URL: str = "https://api.dexscreener.com"

@@ -156,15 +156,16 @@ async def position_monitor_node(
         peak_pnl_pct = (pos.peak_sol_value - pos.entry_sol) / pos.entry_sol if pos.entry_sol > 0 else 0.0
 
         # ---------------------------------------------------------------------
-        # Dedicated WHALE_SCALP 4-Layer Exit Engine (strict priority order)
+        # Dedicated WHALE_SCALP 5-Layer Exit Engine (strict priority order)
         # ---------------------------------------------------------------------
         if str(pos.strategy or "").upper() == "WHALE_SCALP":
+            now_dt = now or utc_now()
             pnl_pct_100 = pnl_pct * 100.0
             peak_pnl_pct_100 = peak_pnl_pct * 100.0
             if peak_pnl_pct_100 + EPS >= config.WHALE_TRAIL_ARM_PCT:
                 pos.trail_armed = True
 
-            # Exit A (Whale Shadow): triggering whale sold this mint
+            # (a) Exit A (Whale Shadow): triggering whale sold this mint
             db_shadow_flag = bool(db.get_state().get("whale_shadow_exit_requested", False))
             if pos.whale_shadow_exit_flag or db_shadow_flag:
                 reason = "WHALE_SHADOW_EXIT"
@@ -186,7 +187,7 @@ async def position_monitor_node(
                     "monitor_event": reason,
                 }
 
-            # Exit B (Front-Run TP): hard take-profit at +50%
+            # (b) Exit B (Front-Run TP): hard take-profit at +25%
             if pnl_pct_100 + EPS >= config.WHALE_TP_PCT:
                 reason = "WHALE_FRONT_RUN_TP"
                 order = PendingOrder(
@@ -207,10 +208,16 @@ async def position_monitor_node(
                     "monitor_event": reason,
                 }
 
-            # Exit C (Peak Drawdown): once +15% reached, exit on 12% drop from peak
+            # (c) Exit C (2-Tier Peak Drawdown):
+            # 6% drop from peak once >= +10%, tightening to 4% once >= +18%
             if pos.trail_armed and pos.peak_sol_value > 0:
+                active_drop_limit = (
+                    config.WHALE_TIGHT_TRAIL_DROP_PCT
+                    if peak_pnl_pct_100 + EPS >= config.WHALE_TIGHT_TRAIL_ARM_PCT
+                    else config.WHALE_TRAIL_DROP_PCT
+                )
                 drop_from_peak_100 = ((pos.peak_sol_value - current_sol_value) / pos.peak_sol_value) * 100.0
-                if drop_from_peak_100 + EPS >= config.WHALE_TRAIL_DROP_PCT:
+                if drop_from_peak_100 + EPS >= active_drop_limit:
                     reason = "WHALE_PEAK_TRAIL"
                     order = PendingOrder(
                         side="SELL",
@@ -224,7 +231,7 @@ async def position_monitor_node(
                         triggering_wallets=list(pos.triggering_wallets),
                         rationale=(
                             f"[WHALE_SCALP TRAIL] {pos.symbol}: {reason} "
-                            f"(peak {peak_pnl_pct_100:+.2f}%, drop -{drop_from_peak_100:.2f}% >= -{config.WHALE_TRAIL_DROP_PCT:.0f}%)"
+                            f"(peak {peak_pnl_pct_100:+.2f}%, drop -{drop_from_peak_100:.2f}% >= -{active_drop_limit:.0f}%)"
                         ),
                     )
                     return {
@@ -233,7 +240,7 @@ async def position_monitor_node(
                         "monitor_event": reason,
                     }
 
-            # Exit D (Hard Stop): hard stop-loss at -15%
+            # (d) Exit D (Hard Stop): hard stop-loss at -12%
             if pnl_pct_100 <= config.WHALE_HARD_STOP_PCT + EPS:
                 reason = "WHALE_HARD_STOP"
                 order = PendingOrder(
@@ -253,6 +260,36 @@ async def position_monitor_node(
                     "pending_order": order.model_dump(),
                     "monitor_event": reason,
                 }
+
+            # (e) Exit E (Time Stop): held >= 90s with PnL < +8%
+            if pos.opened_at:
+                opened_dt = datetime.fromisoformat(pos.opened_at)
+                if opened_dt.tzinfo is None:
+                    opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+                held_sec = (now_dt - opened_dt).total_seconds()
+                if held_sec + EPS >= config.WHALE_TIME_STOP_SECONDS and pnl_pct_100 + EPS < config.WHALE_TIME_STOP_MIN_PNL_PCT:
+                    reason = "WHALE_TIME_STOP"
+                    order = PendingOrder(
+                        side="SELL",
+                        mint=pos.mint,
+                        symbol=pos.symbol,
+                        amount_atomic=pos.token_amount,
+                        reason=reason,
+                        target_state_after_fill=FocusState.SCANNING,
+                        apply_cooldown=True,
+                        strategy="WHALE_SCALP",
+                        triggering_wallets=list(pos.triggering_wallets),
+                        rationale=(
+                            f"[WHALE_SCALP TIME] {pos.symbol}: {reason} "
+                            f"(held {held_sec:.0f}s >= {config.WHALE_TIME_STOP_SECONDS}s, "
+                            f"PnL {pnl_pct_100:+.2f}% < +{config.WHALE_TIME_STOP_MIN_PNL_PCT:.0f}%)"
+                        ),
+                    )
+                    return {
+                        "active_position": pos.model_dump(),
+                        "pending_order": order.model_dump(),
+                        "monitor_event": reason,
+                    }
 
             pos_dict = pos.model_dump()
             db.save_state(

@@ -147,6 +147,7 @@ async def executor_node(
             strategy=pos_strategy,
             triggering_wallets=list(order.triggering_wallets),
             whale_shadow_exit_flag=False,
+            opened_at=utc_now_iso(),
             entry_liquidity_usd=order.entry_liquidity_usd,
             current_sol_value=spent_sol,
             peak_sol_value=spent_sol,

@@ -105,6 +105,7 @@ class ActivePosition(BaseModel):
     strategy: str = "SCALPER"
     triggering_wallets: list[str] = Field(default_factory=list)
     whale_shadow_exit_flag: bool = False
+    opened_at: Optional[str] = None
     entry_liquidity_usd: float = 0.0
     current_sol_value: float = 0.0
     peak_sol_value: float = 0.0

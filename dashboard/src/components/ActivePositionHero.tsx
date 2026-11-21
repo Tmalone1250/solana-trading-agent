@@ -50,21 +50,22 @@ export function ActivePositionHero({ telemetry }: Props) {
   const peakPct =
     pnl.entry_sol > 0 ? ((pnl.peak_sol_value - pnl.entry_sol) / pnl.entry_sol) * 100 : 0;
 
-  // Risk gauge scale: adapts for WHALE_SCALP (-20% to +55%) vs SCALPER (-15% to +25%)
-  const gaugeMin = isWhaleScalp ? -20 : -15;
-  const baseMax = isWhaleScalp ? 55 : 25;
+  // Risk gauge scale: adapts for WHALE_SCALP (-15% to +30%) vs SCALPER (-15% to +25%)
+  const gaugeMin = -15;
+  const baseMax = isWhaleScalp ? 30 : 25;
   const gaugeMax = Math.max(baseMax, Math.ceil((Math.max(peakPct, pnlPct) + 5) / 5) * 5);
 
-  const hardStopLevel = isWhaleScalp ? -15 : -10;
-  const trailArmLevel = isWhaleScalp ? 15 : 12;
-  const trailDropFactor = isWhaleScalp ? 0.88 : 0.94;
+  const hardStopLevel = isWhaleScalp ? -12 : -10;
+  const trailArmLevel = isWhaleScalp ? 10 : 12;
+  const tightTrailActive = isWhaleScalp && peakPct >= 18;
+  const trailDropFactor = isWhaleScalp ? (tightTrailActive ? 0.96 : 0.94) : 0.94;
 
   const hardStopPos = clampPct(hardStopLevel, gaugeMin, gaugeMax);
   const zeroPos = clampPct(0, gaugeMin, gaugeMax);
   const beFloorPos = clampPct(2, gaugeMin, gaugeMax);
   const beArmPos = clampPct(8, gaugeMin, gaugeMax);
   const trailArmPos = clampPct(trailArmLevel, gaugeMin, gaugeMax);
-  const whaleTpPos = clampPct(50, gaugeMin, gaugeMax);
+  const whaleTpPos = clampPct(25, gaugeMin, gaugeMax);
   const currentPos = clampPct(pnlPct, gaugeMin, gaugeMax);
   const peakPos = clampPct(peakPct, gaugeMin, gaugeMax);
 
@@ -172,15 +173,16 @@ export function ActivePositionHero({ telemetry }: Props) {
           <div className="flex flex-wrap items-center gap-3">
             {isWhaleScalp ? (
               <>
-                <span className="text-rose-400">Hard Stop: -15%</span>
+                <span className="text-rose-400">Hard Stop: -12%</span>
                 <span className={pnl.trail_armed ? "font-semibold text-amber-300" : "text-slate-400"}>
-                  Peak Trail: +15% / -12%{" "}
+                  Peak Trail: {tightTrailActive ? "+18% / -4%" : "+10% / -6%"}{" "}
                   {pnl.trail_armed && trailStopPct !== null
                     ? `(ARMED @ ${trailStopPct >= 0 ? "+" : ""}${trailStopPct.toFixed(1)}%)`
                     : ""}
                 </span>
-                <span className="text-emerald-400">Front-Run TP: +50%</span>
-                <span className="text-fuchsia-300">Shadow Exit: Active</span>
+                <span className="text-emerald-400">TP: +25%</span>
+                <span className="text-slate-400">Time Stop: 90s (&lt;+8%)</span>
+                <span className="text-fuchsia-300">Shadow Exit</span>
               </>
             ) : (
               <>
@@ -251,7 +253,7 @@ export function ActivePositionHero({ telemetry }: Props) {
             <div
               className="absolute inset-y-0 w-0.5 bg-emerald-400"
               style={{ left: `${whaleTpPos}%` }}
-              title="Front-Run TP (+50%)"
+              title="Front-Run TP (+25%)"
             />
           )}
 

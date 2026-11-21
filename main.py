@@ -55,15 +55,23 @@ async def run_autonomous_loop(config, db: AgentDatabase) -> None:
             try:
                 result = await compiled.ainvoke(initial_state)
                 focus_state = result.get("focus_state", st["focus_state"])
+                active_pos = result.get("active_position", st["active_position"])
             except Exception as exc:
                 logger.exception("Error during LangGraph tick: %s", exc)
                 focus_state = st["focus_state"]
+                active_pos = st["active_position"]
 
-            sleep_sec = (
-                config.SCAN_POLL_SECONDS
-                if focus_state == FocusState.SCANNING.value
-                else config.MONITOR_POLL_SECONDS
+            is_whale_scalp = (
+                focus_state == FocusState.IN_POSITION.value
+                and isinstance(active_pos, dict)
+                and str(active_pos.get("strategy") or "").upper() == "WHALE_SCALP"
             )
+            if focus_state == FocusState.SCANNING.value:
+                sleep_sec = config.SCAN_POLL_SECONDS
+            elif is_whale_scalp:
+                sleep_sec = config.WHALE_MONITOR_POLL_SECONDS
+            else:
+                sleep_sec = config.MONITOR_POLL_SECONDS
             await asyncio.sleep(sleep_sec)
 
 

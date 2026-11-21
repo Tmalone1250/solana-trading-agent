@@ -275,8 +275,16 @@ async def safety_gate_node(
                 if liq_usd < config.WHALE_MIN_LIQUIDITY_USD:
                     rejected.append({"mint": mint, "symbol": symbol, "reasons": [f"Liquidity ${liq_usd:,.0f} < ${config.WHALE_MIN_LIQUIDITY_USD:,.0f}"]})
                     continue
-                if mc_usd > config.MAX_MC_USD:
-                    rejected.append({"mint": mint, "symbol": symbol, "reasons": [f"MCAP ${mc_usd:,.0f} > ${config.MAX_MC_USD:,.0f}"]})
+                if not (config.WHALE_MIN_MCAP_USD <= mc_usd <= config.WHALE_MAX_MCAP_USD):
+                    rejected.append(
+                        {
+                            "mint": mint,
+                            "symbol": symbol,
+                            "reasons": [
+                                f"MCAP ${mc_usd:,.0f} outside [${config.WHALE_MIN_MCAP_USD:,.0f}, ${config.WHALE_MAX_MCAP_USD:,.0f}]"
+                            ],
+                        }
+                    )
                     continue
 
                 report = await check_token_safety(mint, config, client)

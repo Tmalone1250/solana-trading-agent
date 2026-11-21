@@ -509,12 +509,13 @@ async def scanner_node(
                 config.WHALE_MIN_LIQUIDITY_USD,
             )
             continue
-        if cand_obj.market_cap_usd > config.MAX_MC_USD:
+        if not (config.WHALE_MIN_MCAP_USD <= cand_obj.market_cap_usd <= config.WHALE_MAX_MCAP_USD):
             logger.info(
-                "[Scanner] WHALE_SCALP $%s | REJECTED (mc $%.0f > $%.0f)",
+                "[Scanner] WHALE_SCALP $%s | REJECTED (mc $%.0f outside [$%.0f, $%.0f])",
                 cand_obj.symbol,
                 cand_obj.market_cap_usd,
-                config.MAX_MC_USD,
+                config.WHALE_MIN_MCAP_USD,
+                config.WHALE_MAX_MCAP_USD,
             )
             continue
         ft_dict = cand_obj.model_dump()
