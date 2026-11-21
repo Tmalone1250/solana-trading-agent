@@ -1,0 +1,12 @@
+[Unit]
+Description=Solana Trading Agent - Daily Automated Whale Discovery & Helius Sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/tmalone1250/ToshibaDrive/Dev/Web3_Dev/solana-trading-agent
+ExecStart=/home/tmalone1250/ToshibaDrive/Dev/Web3_Dev/solana-trading-agent/venv/bin/python scripts/auto_discover_whales.py --apply
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=300
