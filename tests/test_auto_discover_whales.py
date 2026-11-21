@@ -160,17 +160,16 @@ def test_rejects_serial_deployer_dumper():
     assert not any("DEPLOYER_DUMPER" in r for r in ladder_res.reject_reasons)
 
 
-def test_rejects_one_hit_wonder_over_60_pct_pnl_from_single_mint():
+def test_rejects_one_hit_wonder_and_allows_power_law_runner_hunter():
     wallet = "LotteryWallet111111111111111111111111111111"
     day_start = (NOW_TS // 86400 - 2) * 86400
     txs: list[dict[str, Any]] = []
-    # Mint 0: +20 SOL profit (83.3% of total +24 SOL)
+    # 1. >85% PnL from 1 mint: Mint 0 = +20 SOL (90.9% of +22 SOL), Mint 1..2 = +1 SOL each
     for i in range(10):
         ts = day_start + 10 * 3600 + i * 120
         txs.append(_make_swap(sig=f"lot-b0-{i}", wallet=wallet, mint="MintLottery0111111111111111111111111111111", side="BUY", sol_amount=1.0, token_amount=100.0, ts=ts))
         txs.append(_make_swap(sig=f"lot-s0-{i}", wallet=wallet, mint="MintLottery0111111111111111111111111111111", side="SELL", sol_amount=3.0, token_amount=100.0, ts=ts + 60))
-    # Mints 1..4: +1 SOL each (+4 SOL combined)
-    for m in range(1, 5):
+    for m in (1, 2):
         mint = f"MintSmall{m}11111111111111111111111111111111"
         for i in range(5):
             ts = day_start + 14 * 3600 + m * 600 + i * 60
@@ -179,8 +178,36 @@ def test_rejects_one_hit_wonder_over_60_pct_pnl_from_single_mint():
 
     res = score_wallet_history(wallet, txs, liquid_sol_balance=35.0, now_ts=NOW_TS)
     assert res.passed is False
-    assert res.max_single_mint_share > 0.60
+    assert res.max_single_mint_share > 0.85
     assert any("ONE_HIT_WONDER" in r for r in res.reject_reasons)
+
+    # 2. True single-token insider (winning_mints == 1 < 2) -> rejected
+    solo_txs = [t for t in txs if "lot-b0" in t["signature"] or "lot-s0" in t["signature"]]
+    for i in range(10, 15):
+        ts = day_start + 11 * 3600 + i * 120
+        solo_txs.append(_make_swap(sig=f"lot-b0-{i}", wallet=wallet, mint="MintLottery0111111111111111111111111111111", side="BUY", sol_amount=1.0, token_amount=100.0, ts=ts))
+        solo_txs.append(_make_swap(sig=f"lot-s0-{i}", wallet=wallet, mint="MintLottery0111111111111111111111111111111", side="SELL", sol_amount=2.0, token_amount=100.0, ts=ts + 60))
+    solo_res = score_wallet_history(wallet, solo_txs, liquid_sol_balance=35.0, now_ts=NOW_TS)
+    assert solo_res.passed is False
+    assert solo_res.winning_mints == 1
+    assert any("ONE_HIT_WONDER" in r for r in solo_res.reject_reasons)
+
+    # 3. Legitimate runner-hunter: 75% from 1 runner + 25% across 2 other winners (winning_mints=3 >= 2) -> PASSES
+    hunter_txs: list[dict[str, Any]] = []
+    for i in range(6):
+        ts = day_start + 10 * 3600 + i * 120
+        hunter_txs.append(_make_swap(sig=f"h-b0-{i}", wallet=wallet, mint="MintRunner01111111111111111111111111111111", side="BUY", sol_amount=1.0, token_amount=100.0, ts=ts))
+        hunter_txs.append(_make_swap(sig=f"h-s0-{i}", wallet=wallet, mint="MintRunner01111111111111111111111111111111", side="SELL", sol_amount=2.5, token_amount=100.0, ts=ts + 60))  # +9 SOL (75%)
+    for m in (1, 2):
+        mint = f"MintHit{m}1111111111111111111111111111111111"
+        for i in range(5):
+            ts = day_start + 14 * 3600 + m * 600 + i * 60
+            hunter_txs.append(_make_swap(sig=f"h-b{m}-{i}", wallet=wallet, mint=mint, side="BUY", sol_amount=1.0, token_amount=100.0, ts=ts))
+            hunter_txs.append(_make_swap(sig=f"h-s{m}-{i}", wallet=wallet, mint=mint, side="SELL", sol_amount=1.3, token_amount=100.0, ts=ts + 30))  # +1.5 SOL each (+3 SOL = 25%)
+    hunter_res = score_wallet_history(wallet, hunter_txs, liquid_sol_balance=20.0, now_ts=NOW_TS)
+    assert hunter_res.passed is True
+    assert hunter_res.winning_mints == 3
+    assert 0.70 <= hunter_res.max_single_mint_share <= 0.80
 
 
 @pytest.mark.asyncio

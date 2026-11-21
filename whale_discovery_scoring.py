@@ -57,6 +57,7 @@ class WalletScore:
     mint_create_count: int = 0
     sleep_gap_hrs: int = 0
     closed_mints: int = 0
+    winning_mints: int = 0
     win_rate: float = 0.0
     realized_sol_pnl: float = 0.0
     max_single_mint_share: float = 0.0
@@ -173,7 +174,8 @@ def score_wallet_history(
     min_sol_balance: float = 5.0,
     min_win_rate: float = 0.45,
     min_realized_sol_pnl: float = 3.0,
-    max_single_mint_pnl_share: float = 0.60,
+    max_single_mint_pnl_share: float = 0.85,
+    min_winning_mints: int = 2,
     max_mint_creations: int = 10,
 ) -> WalletScore:
     """Apply Stage 2 human & edge filters to a candidate wallet's transaction history."""
@@ -256,7 +258,9 @@ def score_wallet_history(
         reasons.append(f"LOW_WIN_RATE ({win_rate:.2%} < {min_win_rate:.0%})")
     if realized_sol_pnl < min_realized_sol_pnl:
         reasons.append(f"LOW_REALIZED_PNL ({realized_sol_pnl:.2f} < {min_realized_sol_pnl:.1f} SOL)")
-    if realized_sol_pnl > 0 and max_single_share > max_single_mint_pnl_share:
+    if wins < min_winning_mints:
+        reasons.append(f"ONE_HIT_WONDER (winning_mints={wins} < {min_winning_mints})")
+    elif realized_sol_pnl > 0 and max_single_share > max_single_mint_pnl_share:
         reasons.append(f"ONE_HIT_WONDER (top_mint={max_single_share:.1%} > {max_single_mint_pnl_share:.0%})")
 
     passed = len(reasons) == 0
@@ -273,6 +277,7 @@ def score_wallet_history(
         mint_create_count=mint_create_count,
         sleep_gap_hrs=sleep_gap_hrs,
         closed_mints=closed_mints,
+        winning_mints=wins,
         win_rate=round(win_rate, 4),
         realized_sol_pnl=round(realized_sol_pnl, 4),
         max_single_mint_share=round(max_single_share, 4),
@@ -286,16 +291,17 @@ async def fetch_runner_pools(
     *,
     max_runners: int = 18,
     min_liquidity_usd: float = 25_000.0,
+    min_volume_24h_usd: float = 100_000.0,
     min_mcap_usd: float = 100_000.0,
     max_mcap_usd: float = 50_000_000.0,
 ) -> list[RunnerPool]:
-    """Stage 1a: Fetch Solana boosts, profiles, and SOL/pump search runners from DexScreener."""
+    """Stage 1a: Fetch Solana boosts, profiles, and SOL/pump search pools from DexScreener."""
     base = config.DEXSCREENER_BASE_URL.rstrip("/")
     mints: list[str] = []
     seen: set[str] = set()
     best_by_mint: dict[str, RunnerPool] = {}
 
-    def _consider_pair(pair: dict[str, Any], *, min_liq: float, min_vol_24h: float = 0.0) -> None:
+    def _consider_pair(pair: dict[str, Any], *, min_liq: float, min_vol_24h: float) -> None:
         if str(pair.get("chainId") or "").lower() != "solana":
             return
         base_tok = pair.get("baseToken") or {}
@@ -306,7 +312,7 @@ async def fetch_runner_pools(
         mcap = float(pair.get("marketCap") or pair.get("fdv") or 0.0)
         chg_24h = float((pair.get("priceChange") or {}).get("h24") or 0.0)
         vol_24h = float((pair.get("volume") or {}).get("h24") or 0.0)
-        if liq < min_liq or vol_24h < min_vol_24h or chg_24h <= 0.0:
+        if liq < min_liq or vol_24h < min_vol_24h:
             return
         if not (min_mcap_usd <= mcap <= max_mcap_usd):
             return
@@ -344,25 +350,25 @@ async def fetch_runner_pools(
             if isinstance(pairs, list):
                 for p in pairs:
                     if isinstance(p, dict):
-                        _consider_pair(p, min_liq=min_liquidity_usd)
+                        _consider_pair(p, min_liq=min_liquidity_usd, min_vol_24h=min_volume_24h_usd)
         except Exception as exc:
             logger.warning("[Discovery] DexScreener batch enrich failed: %s", exc)
 
-    # Supplement beyond paid boosts with high-volume organic Solana & pump runners
-    for query, min_liq, min_vol in (("SOL", 50_000.0, 250_000.0), ("pump", 25_000.0, 100_000.0)):
+    # Supplement beyond paid boosts with high-volume organic Solana & pump pools (green or red dips)
+    for query in ("SOL", "pump"):
         try:
             s_resp = await client.get(f"{base}/latest/dex/search", params={"q": query}, timeout=12.0)
             s_resp.raise_for_status()
             s_pairs = (s_resp.json() or {}).get("pairs") if isinstance(s_resp.json(), dict) else []
             for p in s_pairs or []:
                 if isinstance(p, dict):
-                    _consider_pair(p, min_liq=min_liq, min_vol_24h=min_vol)
+                    _consider_pair(p, min_liq=min_liquidity_usd, min_vol_24h=min_volume_24h_usd)
         except Exception as exc:
             logger.warning("[Discovery] DexScreener search?q=%s failed: %s", query, exc)
 
     runners = sorted(
         best_by_mint.values(),
-        key=lambda r: (r.volume_24h, r.price_change_24h),
+        key=lambda r: (r.volume_24h, r.liquidity_usd),
         reverse=True,
     )
     return runners[:max_runners]

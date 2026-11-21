@@ -69,11 +69,10 @@ export function RecentTradesTable({ trades }: Props) {
                     </td>
                     <td className="px-4 py-3">
                       <span
-                        className={`inline-flex rounded border px-1.5 py-0.5 text-[10px] font-semibold ${
-                          isWhale
-                            ? "border-fuchsia-500/50 bg-fuchsia-500/20 text-fuchsia-300"
-                            : "border-slate-700 bg-slate-800/70 text-slate-300"
-                        }`}
+                        className={`inline-flex rounded border px-1.5 py-0.5 text-[10px] font-semibold ${isWhale
+                          ? "border-fuchsia-500/50 bg-fuchsia-500/20 text-fuchsia-300"
+                          : "border-slate-700 bg-slate-800/70 text-slate-300"
+                          }`}
                       >
                         {strat}
                       </span>
