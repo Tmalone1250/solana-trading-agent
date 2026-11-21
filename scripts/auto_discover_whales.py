@@ -216,7 +216,7 @@ async def run_discovery(
     apply_changes: bool = False,
     max_new: int = 10,
     max_total: int = 25,
-    max_runners: int = 15,
+    max_runners: int = 18,
     max_candidates: int = 40,
     min_sol_balance: float = DEFAULT_MIN_SOL_BALANCE,
     min_tx_7d: int = DEFAULT_MIN_TX_7D,

@@ -151,8 +151,13 @@ def test_rejects_serial_deployer_dumper():
 
     res = score_wallet_history(wallet, txs, liquid_sol_balance=40.0, now_ts=NOW_TS)
     assert res.passed is False
-    assert res.sell_count > 2 * res.buy_count
+    assert res.sell_count > 3 * res.buy_count
     assert any("DEPLOYER_DUMPER" in r for r in res.reject_reasons)
+
+    # Human ladder-exiter (2.5x sells per buy <= 3x) should NOT be flagged as DEPLOYER_DUMPER
+    ladder_txs = txs[:12] + txs[12:42]  # 12 buys, 30 sells (2.5x)
+    ladder_res = score_wallet_history(wallet, ladder_txs, liquid_sol_balance=40.0, now_ts=NOW_TS)
+    assert not any("DEPLOYER_DUMPER" in r for r in ladder_res.reject_reasons)
 
 
 def test_rejects_one_hit_wonder_over_60_pct_pnl_from_single_mint():

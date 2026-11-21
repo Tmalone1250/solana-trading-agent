@@ -246,8 +246,8 @@ def score_wallet_history(
         reasons.append(f"GHOST_WALLET ({tx_count_7d} < {min_tx_7d} txs/7d)")
     elif tx_count_7d > max_tx_7d:
         reasons.append(f"SPAM_BOT ({tx_count_7d} > {max_tx_7d} txs/7d)")
-    if sell_count > 2 * buy_count:
-        reasons.append(f"DEPLOYER_DUMPER (sells={sell_count} > 2*buys={2 * buy_count})")
+    if sell_count > 3 * buy_count:
+        reasons.append(f"DEPLOYER_DUMPER (sells={sell_count} > 3*buys={3 * buy_count})")
     if mint_create_count > max_mint_creations:
         reasons.append(f"SERIAL_MINTER ({mint_create_count} > {max_mint_creations} creations)")
     if liquid_sol_balance < min_sol_balance:
@@ -284,12 +284,12 @@ async def fetch_runner_pools(
     client: httpx.AsyncClient,
     config: AgentConfig,
     *,
-    max_runners: int = 15,
+    max_runners: int = 18,
     min_liquidity_usd: float = 25_000.0,
     min_mcap_usd: float = 100_000.0,
     max_mcap_usd: float = 50_000_000.0,
 ) -> list[RunnerPool]:
-    """Stage 1a: Fetch Solana boosts + high-volume SOL search runners from DexScreener."""
+    """Stage 1a: Fetch Solana boosts, profiles, and SOL/pump search runners from DexScreener."""
     base = config.DEXSCREENER_BASE_URL.rstrip("/")
     mints: list[str] = []
     seen: set[str] = set()
@@ -322,7 +322,7 @@ async def fetch_runner_pools(
                 volume_24h=vol_24h,
             )
 
-    for path in ("/token-boosts/top/v1", "/token-boosts/latest/v1"):
+    for path in ("/token-boosts/top/v1", "/token-boosts/latest/v1", "/token-profiles/latest/v1"):
         try:
             resp = await client.get(f"{base}{path}", timeout=12.0)
             resp.raise_for_status()
@@ -348,16 +348,17 @@ async def fetch_runner_pools(
         except Exception as exc:
             logger.warning("[Discovery] DexScreener batch enrich failed: %s", exc)
 
-    # Supplement beyond paid boosts with high-volume organic Solana runners
-    try:
-        s_resp = await client.get(f"{base}/latest/dex/search", params={"q": "SOL"}, timeout=12.0)
-        s_resp.raise_for_status()
-        s_pairs = (s_resp.json() or {}).get("pairs") if isinstance(s_resp.json(), dict) else []
-        for p in s_pairs or []:
-            if isinstance(p, dict):
-                _consider_pair(p, min_liq=50_000.0, min_vol_24h=250_000.0)
-    except Exception as exc:
-        logger.warning("[Discovery] DexScreener search?q=SOL failed: %s", exc)
+    # Supplement beyond paid boosts with high-volume organic Solana & pump runners
+    for query, min_liq, min_vol in (("SOL", 50_000.0, 250_000.0), ("pump", 25_000.0, 100_000.0)):
+        try:
+            s_resp = await client.get(f"{base}/latest/dex/search", params={"q": query}, timeout=12.0)
+            s_resp.raise_for_status()
+            s_pairs = (s_resp.json() or {}).get("pairs") if isinstance(s_resp.json(), dict) else []
+            for p in s_pairs or []:
+                if isinstance(p, dict):
+                    _consider_pair(p, min_liq=min_liq, min_vol_24h=min_vol)
+        except Exception as exc:
+            logger.warning("[Discovery] DexScreener search?q=%s failed: %s", query, exc)
 
     runners = sorted(
         best_by_mint.values(),
