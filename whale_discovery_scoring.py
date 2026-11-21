@@ -10,29 +10,23 @@ from typing import Any, Optional
 import httpx
 
 from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
+from helius_pacer import HeliusEnhancedPacer
 from helius_webhook import IGNORED_BASE_MINTS
 
 logger = logging.getLogger(__name__)
 
+
 # Known Solana DEX, AMM, router, and system program addresses excluded from buyer candidates
 KNOWN_PROGRAM_ADDRESSES: set[str] = {
-    "11111111111111111111111111111111",  # System Program
-    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # SPL Token Program
-    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",  # Token-2022 Program
-    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",  # Associated Token Program
-    "ComputeBudget111111111111111111111111111111",  # Compute Budget
-    "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",  # Jupiter v6 Aggregator
-    "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB",  # Jupiter v4
-    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium AMM v4
-    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",  # Raydium CLMM
-    "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",  # Raydium CPMM
-    "routeUGWgWzqBWFcrCfv8tritsqukccJPu3q5GPP3xS",  # Raydium Route
-    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # Pump.fun Program
-    "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",  # PumpSwap AMM
-    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",  # Orca Whirlpool
-    "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",  # Meteora DLMM
-    "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB",  # Meteora Pools
-    "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",  # Raydium Authority v4
+    "11111111111111111111111111111111", "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb", "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+    "ComputeBudget111111111111111111111111111111", "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+    "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB", "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK", "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
+    "routeUGWgWzqBWFcrCfv8tritsqukccJPu3q5GPP3xS", "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+    "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA", "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
+    "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo", "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB",
+    "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1",
 }
 
 TOKEN_CREATION_TX_TYPES: set[str] = {
@@ -90,7 +84,7 @@ def max_consecutive_zero_hours(timestamps: list[int]) -> int:
 
 
 def _extract_sol_delta_for_wallet(tx: dict[str, Any], wallet: str) -> float:
-    """Return signed net SOL flow for wallet (+ received, - spent) across native + WSOL."""
+    """Return signed net SOL flow (+ received, - spent) via nativeTransfers, WSOL, and events.swap."""
     native_out = 0.0
     native_in = 0.0
     for nf in tx.get("nativeTransfers") or []:
@@ -117,8 +111,19 @@ def _extract_sol_delta_for_wallet(tx: dict[str, Any], wallet: str) -> float:
         if tf.get("toUserAccount") == wallet:
             wsol_in += amt
 
-    sol_out = max(native_out, wsol_out)
-    sol_in = max(native_in, wsol_in)
+    event_out = 0.0
+    event_in = 0.0
+    swap_ev = (tx.get("events") or {}).get("swap") if isinstance(tx.get("events"), dict) else None
+    if isinstance(swap_ev, dict):
+        nat_in = swap_ev.get("nativeInput")
+        if isinstance(nat_in, dict) and (not nat_in.get("account") or nat_in.get("account") == wallet):
+            event_out = max(event_out, float(nat_in.get("amount") or 0.0) / LAMPORTS_PER_SOL)
+        nat_out = swap_ev.get("nativeOutput")
+        if isinstance(nat_out, dict) and (not nat_out.get("account") or nat_out.get("account") == wallet):
+            event_in = max(event_in, float(nat_out.get("amount") or 0.0) / LAMPORTS_PER_SOL)
+
+    sol_out = max(native_out, wsol_out, event_out)
+    sol_in = max(native_in, wsol_in, event_in)
     return sol_in - sol_out
 
 
@@ -163,11 +168,11 @@ def score_wallet_history(
     liquid_sol_balance: float,
     now_ts: int,
     min_sleep_gap_hrs: int = 3,
-    min_tx_7d: int = 50,
+    min_tx_7d: int = 25,
     max_tx_7d: int = 1500,
-    min_sol_balance: float = 15.0,
+    min_sol_balance: float = 5.0,
     min_win_rate: float = 0.45,
-    min_realized_sol_pnl: float = 10.0,
+    min_realized_sol_pnl: float = 3.0,
     max_single_mint_pnl_share: float = 0.60,
     max_mint_creations: int = 10,
 ) -> WalletScore:
@@ -284,22 +289,45 @@ async def fetch_runner_pools(
     min_mcap_usd: float = 100_000.0,
     max_mcap_usd: float = 50_000_000.0,
 ) -> list[RunnerPool]:
-    """Stage 1a: Fetch Solana token boosts from DexScreener and keep top active runners."""
+    """Stage 1a: Fetch Solana boosts + high-volume SOL search runners from DexScreener."""
     base = config.DEXSCREENER_BASE_URL.rstrip("/")
     mints: list[str] = []
     seen: set[str] = set()
+    best_by_mint: dict[str, RunnerPool] = {}
+
+    def _consider_pair(pair: dict[str, Any], *, min_liq: float, min_vol_24h: float = 0.0) -> None:
+        if str(pair.get("chainId") or "").lower() != "solana":
+            return
+        base_tok = pair.get("baseToken") or {}
+        mint = str(base_tok.get("address") or "").strip()
+        if not mint or mint in IGNORED_BASE_MINTS:
+            return
+        liq = float((pair.get("liquidity") or {}).get("usd") or 0.0)
+        mcap = float(pair.get("marketCap") or pair.get("fdv") or 0.0)
+        chg_24h = float((pair.get("priceChange") or {}).get("h24") or 0.0)
+        vol_24h = float((pair.get("volume") or {}).get("h24") or 0.0)
+        if liq < min_liq or vol_24h < min_vol_24h or chg_24h <= 0.0:
+            return
+        if not (min_mcap_usd <= mcap <= max_mcap_usd):
+            return
+        existing = best_by_mint.get(mint)
+        if existing is None or liq > existing.liquidity_usd:
+            best_by_mint[mint] = RunnerPool(
+                mint=mint,
+                symbol=str(base_tok.get("symbol") or "UNKNOWN").strip(),
+                pair_address=str(pair.get("pairAddress") or "").strip(),
+                liquidity_usd=liq,
+                market_cap_usd=mcap,
+                price_change_24h=chg_24h,
+                volume_24h=vol_24h,
+            )
 
     for path in ("/token-boosts/top/v1", "/token-boosts/latest/v1"):
         try:
             resp = await client.get(f"{base}{path}", timeout=12.0)
             resp.raise_for_status()
-            items = resp.json()
-            if isinstance(items, list):
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    if str(item.get("chainId") or "").lower() != "solana":
-                        continue
+            for item in resp.json() if isinstance(resp.json(), list) else []:
+                if isinstance(item, dict) and str(item.get("chainId") or "").lower() == "solana":
                     addr = str(item.get("tokenAddress") or "").strip()
                     if addr and addr not in seen and addr not in IGNORED_BASE_MINTS:
                         seen.add(addr)
@@ -307,54 +335,29 @@ async def fetch_runner_pools(
         except Exception as exc:
             logger.warning("[Discovery] DexScreener %s failed: %s", path, exc)
 
-    if not mints:
-        return []
-
-    best_by_mint: dict[str, RunnerPool] = {}
     for i in range(0, len(mints), 30):
         batch = mints[i : i + 30]
         try:
-            resp = await client.get(
-                f"{base}/tokens/v1/solana/{','.join(batch)}", timeout=15.0
-            )
+            resp = await client.get(f"{base}/tokens/v1/solana/{','.join(batch)}", timeout=15.0)
             resp.raise_for_status()
             pairs = resp.json()
-            if not isinstance(pairs, list):
-                continue
+            if isinstance(pairs, list):
+                for p in pairs:
+                    if isinstance(p, dict):
+                        _consider_pair(p, min_liq=min_liquidity_usd)
         except Exception as exc:
             logger.warning("[Discovery] DexScreener batch enrich failed: %s", exc)
-            continue
 
-        for pair in pairs:
-            if not isinstance(pair, dict) or str(pair.get("chainId") or "").lower() != "solana":
-                continue
-            base_tok = pair.get("baseToken") or {}
-            mint = str(base_tok.get("address") or "").strip()
-            symbol = str(base_tok.get("symbol") or "UNKNOWN").strip()
-            pair_addr = str(pair.get("pairAddress") or "").strip()
-            liq = float((pair.get("liquidity") or {}).get("usd") or 0.0)
-            mcap = float(pair.get("marketCap") or pair.get("fdv") or 0.0)
-            chg_24h = float((pair.get("priceChange") or {}).get("h24") or 0.0)
-            vol_24h = float((pair.get("volume") or {}).get("h24") or 0.0)
-
-            if not mint or liq < min_liquidity_usd:
-                continue
-            if not (min_mcap_usd <= mcap <= max_mcap_usd):
-                continue
-            if chg_24h <= 0.0:
-                continue
-
-            existing = best_by_mint.get(mint)
-            if existing is None or liq > existing.liquidity_usd:
-                best_by_mint[mint] = RunnerPool(
-                    mint=mint,
-                    symbol=symbol,
-                    pair_address=pair_addr,
-                    liquidity_usd=liq,
-                    market_cap_usd=mcap,
-                    price_change_24h=chg_24h,
-                    volume_24h=vol_24h,
-                )
+    # Supplement beyond paid boosts with high-volume organic Solana runners
+    try:
+        s_resp = await client.get(f"{base}/latest/dex/search", params={"q": "SOL"}, timeout=12.0)
+        s_resp.raise_for_status()
+        s_pairs = (s_resp.json() or {}).get("pairs") if isinstance(s_resp.json(), dict) else []
+        for p in s_pairs or []:
+            if isinstance(p, dict):
+                _consider_pair(p, min_liq=50_000.0, min_vol_24h=250_000.0)
+    except Exception as exc:
+        logger.warning("[Discovery] DexScreener search?q=SOL failed: %s", exc)
 
     runners = sorted(
         best_by_mint.values(),
@@ -371,39 +374,56 @@ async def extract_buyer_candidates(
     api_key: str,
     helius_base_url: str,
     exclude_wallets: set[str],
-    min_buy_sol: float = 1.5,
-    tx_limit_per_runner: int = 100,
+    pacer: Optional[HeliusEnhancedPacer] = None,
+    min_buy_sol: float = 1.0,
+    pages_per_pool: int = 2,
+    tx_limit_per_page: int = 100,
+    max_candidates: int = 40,
 ) -> list[str]:
-    """Stage 1b: Query Helius Enhanced Transactions for runner pools/mints and extract >=1.5 SOL buyers."""
+    """Stage 1b: Query Helius SWAPs (up to 2 pages/pool) and extract >=1.0 SOL buyers (native+WSOL)."""
     candidates: list[str] = []
     seen = set(exclude_wallets) | KNOWN_PROGRAM_ADDRESSES
     base = helius_base_url.rstrip("/")
+    req_pacer = pacer or HeliusEnhancedPacer()
 
     for runner in runners:
+        if len(candidates) >= max_candidates:
+            break
         target_addr = runner.pair_address or runner.mint
         url = f"{base}/addresses/{target_addr}/transactions"
-        try:
-            resp = await client.get(
-                url, params={"api-key": api_key, "type": "SWAP", "limit": tx_limit_per_runner}, timeout=15.0
-            )
-            resp.raise_for_status()
-            txs = resp.json()
-            if not isinstance(txs, list):
-                continue
-        except Exception as exc:
-            logger.warning("[Discovery] Helius tx lookup failed for %s: %s", target_addr[:8], exc)
-            continue
+        before_sig: Optional[str] = None
+        for _ in range(pages_per_pool):
+            if len(candidates) >= max_candidates:
+                break
+            params: dict[str, Any] = {"api-key": api_key, "type": "SWAP", "limit": tx_limit_per_page}
+            if before_sig:
+                params["before"] = before_sig
+            try:
+                resp = await req_pacer.request(client, "GET", url, params=params, timeout=15.0)
+                txs = resp.json()
+                if not isinstance(txs, list) or not txs:
+                    break
+            except Exception as exc:
+                logger.warning("[Discovery] Helius tx lookup failed for %s: %s", target_addr[:8], exc)
+                break
 
-        for tx in txs:
-            if not isinstance(tx, dict):
-                continue
-            wallet = str(tx.get("feePayer") or "").strip()
-            if not wallet or wallet in seen:
-                continue
-            swap = _extract_primary_swap_for_wallet(tx, wallet)
-            if swap is not None and swap[0] == "BUY" and swap[2] >= min_buy_sol:
-                seen.add(wallet)
-                candidates.append(wallet)
+            for tx in txs:
+                if not isinstance(tx, dict):
+                    continue
+                wallet = str(tx.get("feePayer") or "").strip()
+                if not wallet or wallet in seen:
+                    continue
+                swap = _extract_primary_swap_for_wallet(tx, wallet)
+                if swap is not None and swap[0] == "BUY" and swap[2] >= min_buy_sol:
+                    seen.add(wallet)
+                    candidates.append(wallet)
+                    if len(candidates) >= max_candidates:
+                        break
+
+            last_sig = str(txs[-1].get("signature") or "").strip() if isinstance(txs[-1], dict) else ""
+            if len(txs) < tx_limit_per_page or not last_sig:
+                break
+            before_sig = last_sig
 
     return candidates
 
@@ -415,22 +435,23 @@ async def fetch_wallet_transactions_7d(
     api_key: str,
     helius_base_url: str,
     now_ts: int,
-    max_pages: int = 16,
+    pacer: Optional[HeliusEnhancedPacer] = None,
+    max_pages: int = 5,
     page_limit: int = 100,
 ) -> list[dict[str, Any]]:
-    """Fetch a wallet's recent 7-day transaction history from Helius Enhanced Transactions API."""
+    """Fetch a wallet's recent 7-day SWAP history from Helius Enhanced Transactions API (capped at 500)."""
     cutoff_7d = now_ts - (7 * 86400)
     base = helius_base_url.rstrip("/")
     url = f"{base}/addresses/{wallet}/transactions"
     all_txs: list[dict[str, Any]] = []
     before_sig: Optional[str] = None
+    req_pacer = pacer or HeliusEnhancedPacer()
 
     for _ in range(max_pages):
-        params: dict[str, Any] = {"api-key": api_key, "limit": page_limit}
+        params: dict[str, Any] = {"api-key": api_key, "type": "SWAP", "limit": page_limit}
         if before_sig:
             params["before"] = before_sig
-        resp = await client.get(url, params=params, timeout=15.0)
-        resp.raise_for_status()
+        resp = await req_pacer.request(client, "GET", url, params=params, timeout=15.0)
         batch = resp.json()
         if not isinstance(batch, list) or not batch:
             break
@@ -441,9 +462,7 @@ async def fetch_wallet_transactions_7d(
             default=0,
         )
         last_sig = str(batch[-1].get("signature") or "").strip() if isinstance(batch[-1], dict) else ""
-        if oldest_ts and oldest_ts < cutoff_7d:
-            break
-        if len(batch) < page_limit or not last_sig:
+        if (oldest_ts and oldest_ts < cutoff_7d) or len(batch) < page_limit or not last_sig:
             break
         before_sig = last_sig
 
@@ -457,7 +476,7 @@ async def fetch_wallet_sol_balance(
     api_key: str,
     rpc_url: str = "https://mainnet.helius-rpc.com",
 ) -> float:
-    """Fetch liquid SOL balance via Helius JSON-RPC getBalance."""
+    """Fetch liquid SOL balance via Helius JSON-RPC getBalance (10 req/sec RPC tier)."""
     resp = await client.post(
         rpc_url,
         params={"api-key": api_key},
@@ -477,12 +496,15 @@ async def is_wallet_stale(
     api_key: str,
     helius_base_url: str,
     now_ts: int,
+    pacer: Optional[HeliusEnhancedPacer] = None,
     stale_hours: float = 72.0,
 ) -> bool:
     """Return True if wallet has had no transactions in the last `stale_hours` hours."""
     url = f"{helius_base_url.rstrip('/')}/addresses/{wallet}/transactions"
-    resp = await client.get(url, params={"api-key": api_key, "limit": 1}, timeout=10.0)
-    resp.raise_for_status()
+    req_pacer = pacer or HeliusEnhancedPacer()
+    resp = await req_pacer.request(
+        client, "GET", url, params={"api-key": api_key, "limit": 1}, timeout=10.0
+    )
     batch = resp.json()
     if not isinstance(batch, list) or not batch:
         return True

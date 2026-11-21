@@ -8,9 +8,14 @@ from typing import Any
 import httpx
 import pytest
 
-from config import LAMPORTS_PER_SOL, AgentConfig
+from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
 from scripts.auto_discover_whales import run_discovery
-from whale_discovery_scoring import score_wallet_history
+from whale_discovery_scoring import (
+    HeliusEnhancedPacer,
+    RunnerPool,
+    extract_buyer_candidates,
+    score_wallet_history,
+)
 
 NOW_TS = 1_760_000_000  # Fixed UTC timestamp for deterministic tests
 
@@ -311,12 +316,18 @@ async def test_end_to_end_apply_preserves_pinned_and_calls_put_once(tmp_path):
 
         return httpx.Response(404)
 
+    async def _noop_sleep(_seconds: float) -> None:
+        return None
+
+    fast_pacer = HeliusEnhancedPacer(min_interval=0.0, sleep_fn=_noop_sleep)
+
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         # 1. Dry-run must NOT call PUT
         dry_res = await run_discovery(
             cfg,
             pinned_path=pinned_file,
             apply_changes=False,
+            pacer=fast_pacer,
             http_client=client,
             now_ts=NOW_TS,
         )
@@ -325,18 +336,19 @@ async def test_end_to_end_apply_preserves_pinned_and_calls_put_once(tmp_path):
         assert stale_non_pinned in dry_res["stale_pruned"]
         assert [c.wallet for c in dry_res["passing_candidates"]] == [good_candidate]
 
-        # 2. --apply calls PUT exactly once, preserves pinned & webhook fields verbatim, and POSTs sync
+        # 2. --apply calls PUT exactly once, preserves pinned & webhook fields verbatim, and POSTs sync to :8002
         apply_res = await run_discovery(
             cfg,
             pinned_path=pinned_file,
             apply_changes=True,
+            pacer=fast_pacer,
             http_client=client,
             now_ts=NOW_TS,
         )
         assert apply_res["put_called"] is True
         assert apply_res["sync_ok"] is True
         assert len(put_calls) == 1
-        assert len(sync_calls) == 1
+        assert sync_calls == ["http://127.0.0.1:8002/api/webhooks/helius/sync"]
 
         put_body = put_calls[0]
         assert put_body["webhookURL"] == "https://solana-api.projectkami.net/api/webhooks/helius"
@@ -346,3 +358,180 @@ async def test_end_to_end_apply_preserves_pinned_and_calls_put_once(tmp_path):
         assert put_body["accountAddresses"] == [pinned_wallet_1, pinned_wallet_2, good_candidate]
         assert stale_non_pinned not in put_body["accountAddresses"]
         assert bot_candidate not in put_body["accountAddresses"]
+
+
+@pytest.mark.asyncio
+async def test_helius_pacer_429_exponential_backoff_retry_succeeds():
+    sleeps: list[float] = []
+    attempts = {"n": 0}
+
+    async def fake_sleep(sec: float) -> None:
+        sleeps.append(sec)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] <= 2:
+            return httpx.Response(429, json={"error": "rate limited"})
+        return httpx.Response(200, json={"ok": True})
+
+    pacer = HeliusEnhancedPacer(min_interval=0.0, base_backoff=1.0, max_retries=4, sleep_fn=fake_sleep)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        resp = await pacer.request(client, "GET", "https://api.helius.xyz/v0/webhooks")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+    assert attempts["n"] == 3
+    assert len(sleeps) == 2
+    assert 0.75 <= sleeps[0] <= 1.25
+    assert 1.50 <= sleeps[1] <= 2.50
+
+
+@pytest.mark.asyncio
+async def test_low_sol_prefilter_skips_enhanced_tx_and_unchanged_roster_skips_put(tmp_path):
+    pinned_file = tmp_path / "pinned_whales.json"
+    pinned_w = "PinnedWalletOnly111111111111111111111111111"
+    broke_cand = "BrokeWalletUnder15Sol1111111111111111111111"
+    pinned_file.write_text(json.dumps({"wallets": [pinned_w]}), encoding="utf-8")
+
+    cfg = AgentConfig(_env_file=None, HELIUS_API_KEY="test-key", HELIUS_WEBHOOK_ID="hook-1")
+    enhanced_tx_queried: list[str] = []
+    put_count = {"n": 0}
+    sync_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        path = request.url.path
+        if "token-boosts/top/v1" in url:
+            return httpx.Response(200, json=[{"chainId": "solana", "tokenAddress": "RunMint11111111111111111111111111111111111"}])
+        if "token-boosts/latest/v1" in url:
+            return httpx.Response(200, json=[])
+        if "/tokens/v1/solana/" in url:
+            return httpx.Response(
+                200,
+                json=[{
+                    "chainId": "solana",
+                    "pairAddress": "RunPool11111111111111111111111111111111111",
+                    "baseToken": {"address": "RunMint11111111111111111111111111111111111", "symbol": "RUN"},
+                    "liquidity": {"usd": 80_000},
+                    "marketCap": 1_000_000,
+                    "priceChange": {"h24": 25.0},
+                    "volume": {"h24": 300_000},
+                }],
+            )
+        if path == "/v0/webhooks/hook-1" and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "webhookID": "hook-1",
+                    "webhookURL": "https://solana-api.projectkami.net/api/webhooks/helius",
+                    "transactionTypes": ["SWAP"],
+                    "webhookType": "enhanced",
+                    "accountAddresses": [pinned_w],
+                },
+            )
+        if path == "/v0/webhooks/hook-1" and request.method == "PUT":
+            put_count["n"] += 1
+            return httpx.Response(200, json={"webhookID": "hook-1"})
+        if path == "/v0/addresses/RunPool11111111111111111111111111111111111/transactions":
+            return httpx.Response(
+                200,
+                json=[_make_swap(sig="b1", wallet=broke_cand, mint="RunMint11111111111111111111111111111111111", side="BUY", sol_amount=2.0, token_amount=1000.0, ts=NOW_TS - 60)],
+            )
+        if path == f"/v0/addresses/{broke_cand}/transactions":
+            enhanced_tx_queried.append(broke_cand)
+            return httpx.Response(200, json=[])
+        if "mainnet.helius-rpc.com" in url and request.method == "POST":
+            # Only 2.5 SOL (< 5.0 SOL default pre-filter)
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"value": int(2.5 * LAMPORTS_PER_SOL)}})
+        if path == "/api/webhooks/helius/sync":
+            sync_count["n"] += 1
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(404)
+
+    async def _noop_sleep(_sec: float) -> None:
+        return None
+
+    pacer = HeliusEnhancedPacer(min_interval=0.0, sleep_fn=_noop_sleep)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        res = await run_discovery(cfg, pinned_path=pinned_file, apply_changes=True, verbose=True, pacer=pacer, http_client=client, now_ts=NOW_TS)
+
+    # Low-SOL wallet rejected BEFORE Helius Enhanced Transactions is queried
+    assert enhanced_tx_queried == []
+    assert any(r.wallet == broke_cand and any("LOW_AMMO" in x for x in r.reject_reasons) for r in res["rejected_candidates"])
+    # Roster unchanged -> skip both PUT and local sync POST
+    assert res["roster_unchanged"] is True
+    assert res["put_called"] is False
+    assert put_count["n"] == 0
+    assert sync_count["n"] == 0
+    assert res["sync_url"] == "http://127.0.0.1:8002/api/webhooks/helius/sync"
+    # Rejection funnel summary counts & report formatting
+    assert res["funnel"]["candidates_found"] == 1
+    assert res["funnel"]["rejected_low_sol"] == 1
+    assert res["funnel"]["passed"] == 0
+    assert "Rejection Funnel Summary:" in res["report"]
+    assert "- Candidates Found: 1" in res["report"]
+    assert "- Rejected (Low SOL): 1" in res["report"]
+
+
+@pytest.mark.asyncio
+async def test_wsol_and_native_input_swap_extraction():
+    wsol_buyer = "WsolBuyerWallet1111111111111111111111111111"
+    native_ev_buyer = "NativeEvBuyer111111111111111111111111111111"
+    dust_buyer = "DustBuyerWallet1111111111111111111111111111"
+    pool = "PoolVault1111111111111111111111111111111111"
+    mint = "RunnerMint991111111111111111111111111111111"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                # Pure WSOL tokenTransfer swap (no nativeTransfers) >= 1.0 SOL
+                {
+                    "signature": "sig-wsol",
+                    "type": "SWAP",
+                    "timestamp": NOW_TS - 120,
+                    "feePayer": wsol_buyer,
+                    "nativeTransfers": [],
+                    "tokenTransfers": [
+                        {"mint": SOL_MINT, "fromUserAccount": wsol_buyer, "toUserAccount": pool, "tokenAmount": 1.25},
+                        {"mint": mint, "fromUserAccount": pool, "toUserAccount": wsol_buyer, "tokenAmount": 50_000.0},
+                    ],
+                },
+                # events.swap.nativeInput swap >= 1.0 SOL
+                {
+                    "signature": "sig-ev",
+                    "type": "SWAP",
+                    "timestamp": NOW_TS - 90,
+                    "feePayer": native_ev_buyer,
+                    "nativeTransfers": [],
+                    "tokenTransfers": [
+                        {"mint": mint, "fromUserAccount": pool, "toUserAccount": native_ev_buyer, "tokenAmount": 40_000.0},
+                    ],
+                    "events": {"swap": {"nativeInput": {"account": native_ev_buyer, "amount": str(int(1.1 * LAMPORTS_PER_SOL))}}},
+                },
+                # Sub-1.0 SOL dust swap -> excluded
+                {
+                    "signature": "sig-dust",
+                    "type": "SWAP",
+                    "timestamp": NOW_TS - 60,
+                    "feePayer": dust_buyer,
+                    "nativeTransfers": [],
+                    "tokenTransfers": [
+                        {"mint": SOL_MINT, "fromUserAccount": dust_buyer, "toUserAccount": pool, "tokenAmount": 0.4},
+                        {"mint": mint, "fromUserAccount": pool, "toUserAccount": dust_buyer, "tokenAmount": 10_000.0},
+                    ],
+                },
+            ],
+        )
+
+    async def _noop_sleep(_sec: float) -> None:
+        return None
+
+    runner = RunnerPool(mint=mint, symbol="RUN", pair_address=pool, liquidity_usd=100_000, market_cap_usd=1_000_000, price_change_24h=30.0, volume_24h=500_000)
+    pacer = HeliusEnhancedPacer(min_interval=0.0, sleep_fn=_noop_sleep)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        found = await extract_buyer_candidates(
+            client, [runner], api_key="k", helius_base_url="https://api.helius.xyz/v0", exclude_wallets=set(), pacer=pacer, min_buy_sol=1.0
+        )
+
+    assert found == [wsol_buyer, native_ev_buyer]

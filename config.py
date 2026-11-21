@@ -164,6 +164,7 @@ class AgentConfig(BaseSettings):
     DUCKDB_PATH: str = "solana_meme_agent.duckdb"
     TELEMETRY_HOST: str = "0.0.0.0"
     TELEMETRY_PORT: int = 8001
+    AGENT_LOCAL_URL: str = "http://127.0.0.1:8002"
 
     @model_validator(mode="after")
     def validate_live_keys(self) -> "AgentConfig":
