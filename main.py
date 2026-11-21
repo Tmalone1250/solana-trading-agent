@@ -52,6 +52,8 @@ async def run_autonomous_loop(config, db: AgentDatabase) -> None:
                 "daily_pnl_sol": st["daily_pnl_sol"],
                 "active_position": st["active_position"],
                 "whale_position": st["whale_position"],
+                "chart_positions": st["chart_positions"],
+                "whale_positions": st["whale_positions"],
                 "last_decision_rationale": st["last_decision_rationale"],
             }
             try:
@@ -78,12 +80,12 @@ async def run_autonomous_loop(config, db: AgentDatabase) -> None:
 
 
 async def run_whale_lane_loop(config, db: AgentDatabase) -> None:
-    """Slot 2 independent loop: monitors/enters WHALE_SCALP concurrently with Slot 1 Chart lane."""
+    """Whale lane independent loop (up to MAX_WHALE_POSITIONS=3): batched monitor + breakout-gated entry."""
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         while True:
             try:
                 res = await run_whale_lane_tick(config=config, db=db, http_client=http_client)
-                has_open = res.get("whale_position") is not None
+                has_open = bool(res.get("whale_positions") or res.get("whale_position"))
             except Exception as exc:
                 logger.exception("Error during Whale Lane tick: %s", exc)
                 has_open = False

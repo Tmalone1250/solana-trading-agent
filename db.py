@@ -49,6 +49,8 @@ class AgentDatabase:
                     daily_reset_date VARCHAR NOT NULL,
                     active_position_json VARCHAR,
                     whale_position_json VARCHAR,
+                    chart_positions_json VARCHAR DEFAULT '[]',
+                    whale_positions_json VARCHAR DEFAULT '[]',
                     strategy VARCHAR DEFAULT 'SCALPER',
                     triggering_wallets_json VARCHAR DEFAULT '[]',
                     whale_shadow_exit_requested BOOLEAN DEFAULT FALSE,
@@ -304,8 +306,19 @@ class AgentDatabase:
             row[1]
             for row in self._conn.execute("PRAGMA table_info('agent_state')").fetchall()
         }
-        if "whale_position_json" not in state_cols:
-            self._conn.execute("ALTER TABLE agent_state ADD COLUMN whale_position_json VARCHAR")
+        for col, col_type in [
+            ("whale_position_json", "VARCHAR"),
+            ("chart_positions_json", "VARCHAR DEFAULT '[]'"),
+            ("whale_positions_json", "VARCHAR DEFAULT '[]'"),
+        ]:
+            if col not in state_cols:
+                self._conn.execute(f"ALTER TABLE agent_state ADD COLUMN {col} {col_type}")
+        wd_cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info('whale_decisions')").fetchall()
+        }
+        if "breakout_telemetry_json" not in wd_cols:
+            self._conn.execute("ALTER TABLE whale_decisions ADD COLUMN breakout_telemetry_json VARCHAR")
 
     def _ensure_initial_state(self) -> None:
         with self._lock:
@@ -337,6 +350,7 @@ class AgentDatabase:
                 """
                 SELECT focus_state, sol_balance, daily_start_sol, daily_pnl_sol,
                        daily_reset_date, active_position_json, whale_position_json,
+                       chart_positions_json, whale_positions_json,
                        last_decision_rationale, updated_at, strategy,
                        triggering_wallets_json, whale_shadow_exit_requested
                 FROM agent_state WHERE id = 1
@@ -352,6 +366,8 @@ class AgentDatabase:
                 reset_date,
                 pos_json,
                 whale_pos_json,
+                chart_list_json,
+                whale_list_json,
                 rationale,
                 updated_at,
                 strategy,
@@ -375,6 +391,8 @@ class AgentDatabase:
 
             active_pos = json.loads(pos_json) if pos_json else None
             whale_pos = json.loads(whale_pos_json) if whale_pos_json else None
+            chart_positions: list[dict[str, Any]] = json.loads(chart_list_json) if chart_list_json else []
+            whale_positions: list[dict[str, Any]] = json.loads(whale_list_json) if whale_list_json else []
             trig_wallets = json.loads(trig_json) if trig_json else []
             if isinstance(active_pos, dict):
                 if strategy and not active_pos.get("strategy"):
@@ -383,8 +401,13 @@ class AgentDatabase:
                     active_pos["triggering_wallets"] = trig_wallets
                 if shadow_flag and str(active_pos.get("strategy") or "").upper() == "WHALE_SCALP":
                     active_pos["whale_shadow_exit_flag"] = True
-            if isinstance(whale_pos, dict) and shadow_flag:
-                whale_pos["whale_shadow_exit_flag"] = True
+                if not chart_positions and focus_state == FocusState.IN_POSITION.value and str(active_pos.get("strategy") or "").upper() != "WHALE_SCALP":
+                    chart_positions = [active_pos]
+            if isinstance(whale_pos, dict):
+                if shadow_flag:
+                    whale_pos["whale_shadow_exit_flag"] = True
+                if not whale_positions:
+                    whale_positions = [whale_pos]
 
             return {
                 "focus_state": focus_state,
@@ -393,7 +416,9 @@ class AgentDatabase:
                 "daily_pnl_sol": float(daily_pnl),
                 "daily_reset_date": reset_date,
                 "active_position": active_pos,
-                "whale_position": whale_pos,
+                "whale_position": whale_pos if whale_pos is not None else (whale_positions[0] if whale_positions else None),
+                "chart_positions": chart_positions,
+                "whale_positions": whale_positions,
                 "strategy": strategy or "SCALPER",
                 "triggering_wallets": trig_wallets,
                 "whale_shadow_exit_requested": bool(shadow_flag),
@@ -493,6 +518,59 @@ class AgentDatabase:
             )
             return before, after
 
+    def get_all_open_mints(self) -> set[str]:
+        """Return all mints currently open across chart_positions, whale_positions, and WATCHING_REENTRY."""
+        st = self.get_state()
+        mints: set[str] = set()
+        for p in st.get("chart_positions") or []:
+            if isinstance(p, dict) and p.get("mint"):
+                mints.add(str(p["mint"]))
+        for p in st.get("whale_positions") or []:
+            if isinstance(p, dict) and p.get("mint"):
+                mints.add(str(p["mint"]))
+        for key in ("active_position", "whale_position"):
+            p = st.get(key)
+            if isinstance(p, dict) and p.get("mint"):
+                mints.add(str(p["mint"]))
+        return mints
+
+    def save_lane_positions(
+        self,
+        *,
+        lane: str,
+        positions: list[dict[str, Any]],
+        sol_balance: float,
+        daily_pnl_sol: float,
+        focus_state: Optional[str] = None,
+        active_position: Any = ...,
+        last_decision_rationale: Optional[str] = None,
+    ) -> None:
+        """Atomically persist a multi-slot lane list (chart_positions or whale_positions) + shared equity."""
+        with self._lock:
+            col = "whale_positions_json" if lane == "whale" else "chart_positions_json"
+            legacy_col = "whale_position_json" if lane == "whale" else "active_position_json"
+            first_pos = positions[0] if positions else None
+            legacy_val = first_pos if active_position is ... else active_position
+            sets = [f"{col} = ?", f"{legacy_col} = ?", "sol_balance = ?", "daily_pnl_sol = ?", "updated_at = ?"]
+            params: list[Any] = [
+                json.dumps(positions),
+                json.dumps(legacy_val) if legacy_val is not None else None,
+                sol_balance,
+                daily_pnl_sol,
+                utc_now_iso(),
+            ]
+            if focus_state is not None:
+                sets.append("focus_state = ?")
+                params.append(focus_state)
+            if lane == "whale":
+                any_shadow = any(bool(p.get("whale_shadow_exit_flag", False)) for p in positions if isinstance(p, dict))
+                sets.append("whale_shadow_exit_requested = ?")
+                params.append(any_shadow)
+            if last_decision_rationale is not None:
+                sets.append("last_decision_rationale = ?")
+                params.append(last_decision_rationale)
+            self._conn.execute(f"UPDATE agent_state SET {', '.join(sets)} WHERE id = 1", params)
+
     def save_whale_state(
         self,
         *,
@@ -538,38 +616,50 @@ class AgentDatabase:
                 )
 
     def flag_whale_shadow_exit(self, mint: str, seller_wallet: str) -> bool:
-        """If an open WHALE_SCALP position on `mint` (Slot 2 or legacy Slot 1) was triggered by `seller_wallet`, flag exit."""
+        """If an open WHALE_SCALP position on `mint` (any Whale slot or legacy Slot 1) was triggered by `seller_wallet`, flag exit."""
         with self._lock:
             st = self.get_state()
-            whale_pos = st.get("whale_position")
+            whale_positions = list(st.get("whale_positions") or [])
+            matched_idx: Optional[int] = None
+            for idx, wp in enumerate(whale_positions):
+                if isinstance(wp, dict) and wp.get("mint") == mint:
+                    trig = set(wp.get("triggering_wallets") or st.get("triggering_wallets") or [])
+                    if seller_wallet in trig:
+                        matched_idx = idx
+                        break
+            if matched_idx is not None:
+                whale_positions[matched_idx]["whale_shadow_exit_flag"] = True
+                legacy_whale = whale_positions[0] if whale_positions else None
+                self._conn.execute(
+                    """
+                    UPDATE agent_state
+                    SET whale_shadow_exit_requested = TRUE, whale_positions_json = ?, whale_position_json = ?, updated_at = ?
+                    WHERE id = 1
+                    """,
+                    [json.dumps(whale_positions), json.dumps(legacy_whale) if legacy_whale else None, utc_now_iso()],
+                )
+                return True
+
             chart_pos = st.get("active_position")
-            target_pos: Optional[dict[str, Any]] = None
-            target_col = "whale_position_json"
-            if isinstance(whale_pos, dict) and whale_pos.get("mint") == mint:
-                target_pos = whale_pos
-            elif (
+            if (
                 st["focus_state"] == FocusState.IN_POSITION.value
                 and isinstance(chart_pos, dict)
                 and chart_pos.get("mint") == mint
                 and str(chart_pos.get("strategy") or "").upper() == "WHALE_SCALP"
             ):
-                target_pos = chart_pos
-                target_col = "active_position_json"
-            if target_pos is None:
-                return False
-            trig = set(target_pos.get("triggering_wallets") or st.get("triggering_wallets") or [])
-            if seller_wallet not in trig:
-                return False
-            target_pos["whale_shadow_exit_flag"] = True
-            self._conn.execute(
-                f"""
-                UPDATE agent_state
-                SET whale_shadow_exit_requested = TRUE, {target_col} = ?, updated_at = ?
-                WHERE id = 1
-                """,
-                [json.dumps(target_pos), utc_now_iso()],
-            )
-            return True
+                trig = set(chart_pos.get("triggering_wallets") or st.get("triggering_wallets") or [])
+                if seller_wallet in trig:
+                    chart_pos["whale_shadow_exit_flag"] = True
+                    self._conn.execute(
+                        """
+                        UPDATE agent_state
+                        SET whale_shadow_exit_requested = TRUE, active_position_json = ?, updated_at = ?
+                        WHERE id = 1
+                        """,
+                        [json.dumps(chart_pos), utc_now_iso()],
+                    )
+                    return True
+            return False
 
     def set_cooldown(
         self,
@@ -1018,35 +1108,39 @@ class AgentDatabase:
         status: str,
         reason: str,
         updated_at: Optional[str] = None,
+        breakout_telemetry: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Persist latest WHALE_SCALP evaluation decision (ENTERED or SKIPPED + reason) for a mint."""
+        """Persist latest WHALE_SCALP evaluation decision and optional breakout_telemetry for a mint."""
         ts = updated_at or utc_now_iso()
+        bt_json = json.dumps(breakout_telemetry) if breakout_telemetry is not None else None
         with self._lock:
             self._conn.execute(
                 """
-                INSERT INTO whale_decisions (mint, status, reason, updated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO whale_decisions (mint, status, reason, updated_at, breakout_telemetry_json)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT (mint) DO UPDATE SET
                     status = excluded.status,
                     reason = excluded.reason,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    breakout_telemetry_json = COALESCE(excluded.breakout_telemetry_json, whale_decisions.breakout_telemetry_json)
                 """,
-                [mint, status.upper(), reason, ts],
+                [mint, status.upper(), reason, ts, bt_json],
             )
 
-    def get_whale_decisions(self) -> dict[str, dict[str, str]]:
-        """Return all persisted whale_decisions keyed by mint."""
+    def get_whale_decisions(self) -> dict[str, dict[str, Any]]:
+        """Return all persisted whale_decisions (including breakout_telemetry) keyed by mint."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT mint, status, reason, updated_at FROM whale_decisions"
+                "SELECT mint, status, reason, updated_at, breakout_telemetry_json FROM whale_decisions"
             ).fetchall()
         return {
             str(mint): {
                 "status": str(status),
                 "reason": str(reason),
                 "updated_at": str(updated_at),
+                "breakout_telemetry": json.loads(bt_json) if bt_json else None,
             }
-            for mint, status, reason, updated_at in rows
+            for mint, status, reason, updated_at, bt_json in rows
         }
 
     def get_latest_buy_strategy(self, mint: str) -> Optional[str]:

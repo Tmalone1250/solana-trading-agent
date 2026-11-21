@@ -90,21 +90,38 @@ async def executor_node(
         or str(order.strategy or "").upper() == "WHALE_SCALP"
     )
 
-    # Shared Guard: No Duplicate Mint across Slot 1 (chart_slot) and Slot 2 (whale_slot)
+    # Shared Guards on BUY: No Duplicate Mint, 3+3 Lane Capacity, Global Cap (6), and Free SOL Check
+    st_live = db.get_state()
+    chart_positions: list[dict[str, Any]] = list(state.get("chart_positions") if "chart_positions" in state else (st_live.get("chart_positions") or []))
+    whale_positions: list[dict[str, Any]] = list(state.get("whale_positions") if "whale_positions" in state else (st_live.get("whale_positions") or []))
     if is_buy:
-        st_live = db.get_state()
-        other_pos = (
-            state.get("active_position") if is_whale_slot else state.get("whale_position")
+        active_pos_for_reentry = state.get("active_position") or st_live.get("active_position")
+        is_reentry_same_mint = (
+            not is_whale_slot
+            and order.reason == "LEG_2_REENTRY"
+            and isinstance(active_pos_for_reentry, dict)
+            and active_pos_for_reentry.get("mint") == order.mint
+            and state.get("focus_state") == FocusState.WATCHING_REENTRY.value
         )
-        if other_pos is None:
-            other_pos = st_live.get("active_position") if is_whale_slot else st_live.get("whale_position")
-        if isinstance(other_pos, dict) and other_pos.get("mint") == order.mint:
-            logger.warning(
-                "[Executor] Duplicate mint guard blocked %s BUY of %s (already open in %s)",
-                "whale_slot" if is_whale_slot else "chart_slot",
-                order.symbol,
-                "chart_slot" if is_whale_slot else "whale_slot",
-            )
+        open_mints = db.get_all_open_mints()
+        for p in chart_positions + whale_positions + [state.get("active_position"), state.get("whale_position")]:
+            if isinstance(p, dict) and p.get("mint"):
+                open_mints.add(str(p["mint"]))
+        if order.mint in open_mints and not is_reentry_same_mint:
+            logger.warning("[Executor] Duplicate mint guard blocked %s BUY of %s", "whale_slot" if is_whale_slot else "chart_slot", order.symbol)
+            return {"pending_order": None}
+
+        lane_count = len(whale_positions) if is_whale_slot else len(chart_positions)
+        lane_cap = config.MAX_WHALE_POSITIONS if is_whale_slot else config.MAX_CHART_POSITIONS
+        total_open = len(chart_positions) + len(whale_positions)
+        if lane_count >= lane_cap or total_open >= config.MAX_OPEN_POSITIONS:
+            logger.warning("[Executor] Lane capacity reached (chart=%d/%d, whale=%d/%d, total=%d/%d) — skipping %s", len(chart_positions), config.MAX_CHART_POSITIONS, len(whale_positions), config.MAX_WHALE_POSITIONS, total_open, config.MAX_OPEN_POSITIONS, order.symbol)
+            return {"pending_order": None}
+
+        req_sol = order.amount_atomic / LAMPORTS_PER_SOL
+        avail_sol = float(state.get("sol_balance") or 0.0)
+        if avail_sol + 1e-9 < req_sol:
+            logger.warning("[Executor] Insufficient free SOL (%.4f < %.4f) for %s BUY", avail_sol, req_sol, order.symbol)
             return {"pending_order": None}
 
     input_mint = SOL_MINT if is_buy else order.mint
@@ -183,6 +200,7 @@ async def executor_node(
             entry_liquidity_usd=order.entry_liquidity_usd,
             entry_mc_usd=order.entry_mc_usd,
             whale_sol_flow=order.whale_sol_flow,
+            breakout_telemetry=order.breakout_telemetry,
             current_sol_value=spent_sol,
             peak_sol_value=spent_sol,
             breakeven_armed=False,
@@ -340,6 +358,11 @@ async def executor_node(
                 else None
             )
         )
+        sell_bt = (
+            order.breakout_telemetry
+            or (existing_pos_dict.get("breakout_telemetry") if isinstance(existing_pos_dict, dict) else None)
+            or {}
+        )
         db.log_action(
             mode=config.EXECUTION_MODE,
             action="SELL",
@@ -360,6 +383,12 @@ async def executor_node(
             hold_seconds=hold_sec_val,
             triggering_whales=",".join(pos_trig_wallets) if pos_trig_wallets else None,
             whale_sol_flow=pos_whale_flow,
+            breakout_score=sell_bt.get("score"),
+            breakout_state=sell_bt.get("state"),
+            breakout_timeframe=sell_bt.get("timeframe"),
+            breakout_vol_ratio=sell_bt.get("vol_ratio"),
+            breakout_ema_ext_pct=sell_bt.get("ema_ext_pct"),
+            breakout_failed_gates="; ".join(sell_bt.get("failed_gates") or []) if sell_bt else None,
         )
 
         if order.target_state_after_fill == FocusState.WATCHING_REENTRY:
@@ -414,51 +443,36 @@ async def executor_node(
             next_state,
         )
 
+    last_exec = {
+        "side": order.side, "mint": order.mint, "symbol": order.symbol,
+        "in_amount": order.amount_atomic, "out_amount": out_amount,
+        "tx_signature": tx_signature, "reason": order.reason,
+    }
     if is_whale_slot:
-        db.save_whale_state(
-            whale_position=new_pos_dict,
-            sol_balance=sol_balance,
-            daily_pnl_sol=daily_pnl_sol,
-            last_decision_rationale=order.rationale or state.get("last_decision_rationale"),
+        updated_whales = [p for p in whale_positions if isinstance(p, dict) and p.get("mint") != order.mint]
+        if is_buy and new_pos_dict is not None:
+            updated_whales.append(new_pos_dict)
+        db.save_lane_positions(
+            lane="whale", positions=updated_whales, sol_balance=sol_balance,
+            daily_pnl_sol=daily_pnl_sol, last_decision_rationale=order.rationale or state.get("last_decision_rationale"),
         )
         return {
             "focus_state": state.get("focus_state", FocusState.SCANNING.value),
-            "sol_balance": sol_balance,
-            "daily_pnl_sol": daily_pnl_sol,
-            "whale_position": new_pos_dict,
-            "pending_order": None,
-            "last_execution": {
-                "side": order.side,
-                "mint": order.mint,
-                "symbol": order.symbol,
-                "in_amount": order.amount_atomic,
-                "out_amount": out_amount,
-                "tx_signature": tx_signature,
-                "reason": order.reason,
-            },
+            "sol_balance": sol_balance, "daily_pnl_sol": daily_pnl_sol,
+            "whale_position": new_pos_dict if is_buy else (updated_whales[0] if updated_whales else None),
+            "whale_positions": updated_whales, "pending_order": None, "last_execution": last_exec,
         }
 
-    db.save_state(
-        focus_state=next_state,
-        sol_balance=sol_balance,
-        daily_pnl_sol=daily_pnl_sol,
-        active_position=new_pos_dict,
+    updated_charts = [p for p in chart_positions if isinstance(p, dict) and p.get("mint") != order.mint]
+    if is_buy and new_pos_dict is not None:
+        updated_charts.append(new_pos_dict)
+    db.save_lane_positions(
+        lane="chart", positions=updated_charts, sol_balance=sol_balance, daily_pnl_sol=daily_pnl_sol,
+        focus_state=next_state, active_position=new_pos_dict,
         last_decision_rationale=order.rationale or state.get("last_decision_rationale"),
     )
-
     return {
-        "focus_state": next_state,
-        "sol_balance": sol_balance,
-        "daily_pnl_sol": daily_pnl_sol,
-        "active_position": new_pos_dict,
-        "pending_order": None,
-        "last_execution": {
-            "side": order.side,
-            "mint": order.mint,
-            "symbol": order.symbol,
-            "in_amount": order.amount_atomic,
-            "out_amount": out_amount,
-            "tx_signature": tx_signature,
-            "reason": order.reason,
-        },
+        "focus_state": next_state, "sol_balance": sol_balance, "daily_pnl_sol": daily_pnl_sol,
+        "active_position": new_pos_dict, "chart_positions": updated_charts,
+        "pending_order": None, "last_execution": last_exec,
     }

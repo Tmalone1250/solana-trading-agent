@@ -382,8 +382,13 @@ async def scanner_node(
     now_ms: Optional[int] = None,
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
-    """LangGraph node: runs ONLY in SCANNING state, maintaining a 2-slot rotating watchlist."""
-    if state.get("focus_state") != FocusState.SCANNING.value:
+    """LangGraph node: maintains the 5-slot rotating watchlist whenever Chart lane has capacity."""
+    if "chart_positions" in state:
+        chart_open = len(state.get("chart_positions") or [])
+        whale_open = len(state.get("whale_positions") or [])
+        if chart_open >= config.MAX_CHART_POSITIONS or (chart_open + whale_open) >= config.MAX_OPEN_POSITIONS:
+            return {"raw_candidates": [], "active_watchlist": db.get_watchlist()}
+    elif state.get("focus_state") != FocusState.SCANNING.value:
         return {"raw_candidates": [], "active_watchlist": db.get_watchlist()}
 
     # Daily max loss circuit breaker

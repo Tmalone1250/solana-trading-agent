@@ -112,6 +112,7 @@ class ActivePosition(BaseModel):
     entry_liquidity_usd: float = 0.0
     entry_mc_usd: Optional[float] = None
     whale_sol_flow: Optional[float] = None
+    breakout_telemetry: Optional[dict[str, Any]] = None
     current_sol_value: float = 0.0
     peak_sol_value: float = 0.0
     breakeven_armed: bool = False
@@ -159,6 +160,8 @@ class AgentGraphState(TypedDict, total=False):
 
     active_position: Optional[dict[str, Any]]
     whale_position: Optional[dict[str, Any]]
+    chart_positions: list[dict[str, Any]]
+    whale_positions: list[dict[str, Any]]
     slot: Optional[str]
     active_watchlist: list[dict[str, Any]]
     whale_fast_track_candidates: list[dict[str, Any]]

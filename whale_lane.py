@@ -8,11 +8,18 @@ from typing import Any, Optional
 
 import httpx
 
+from batched_price_monitor import (
+    estimate_position_sol_value,
+    fetch_batched_sol_prices,
+    resolve_position_sol_value,
+)
 from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
 from db import AgentDatabase, utc_now
-from executor_node import executor_node, fetch_jupiter_order
+from executor_node import executor_node
 from jupiter_token_client import enrich_mints
+from ohlcv_client import fetch_ohlcv_1m_batch, fetch_ohlcv_batch
 from safety_gate_node import check_token_safety
+from scalper_entry_engine import evaluate_scalper_entry
 from state import ActivePosition, FocusState, PendingOrder
 
 logger = logging.getLogger(__name__)
@@ -167,7 +174,7 @@ async def run_whale_lane_tick(
     http_client: Optional[httpx.AsyncClient] = None,
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
-    """Execute one independent tick of Slot 2 (whale_slot): monitor open position or fast-track enter."""
+    """Execute one tick of the Whale Lane (up to MAX_WHALE_POSITIONS=3): batched monitor + breakout-gated entry."""
     if not config.WHALE_STRATEGY_ENABLED:
         return {"slot": "whale_slot", "event": "DISABLED"}
 
@@ -176,69 +183,65 @@ async def run_whale_lane_tick(
     sol_balance = float(st["sol_balance"])
     daily_start = float(st["daily_start_sol"])
     daily_pnl = float(st["daily_pnl_sol"])
-    whale_pos_raw = st.get("whale_position")
+    whale_positions: list[dict[str, Any]] = list(st.get("whale_positions") or [])
+    chart_positions: list[dict[str, Any]] = list(st.get("chart_positions") or [])
     chart_pos_raw = st.get("active_position")
-    chart_mint = str(chart_pos_raw.get("mint") or "") if isinstance(chart_pos_raw, dict) else ""
 
     owns_client = http_client is None
     client = http_client or httpx.AsyncClient(follow_redirects=True)
     try:
-        # Case A: Slot 2 has an open WHALE_SCALP position -> monitor & exit independently of Slot 1
-        if isinstance(whale_pos_raw, dict):
-            pos = ActivePosition.model_validate(whale_pos_raw)
-            quote_resp = await fetch_jupiter_order(
-                input_mint=pos.mint,
-                output_mint=SOL_MINT,
-                amount_atomic=max(1, pos.token_amount),
-                config=config,
-                client=client,
-                taker=None,
-            )
-            current_sol_value = int(quote_resp["outAmount"]) / LAMPORTS_PER_SOL
-            pos.current_sol_value = current_sol_value
-
-            exit_order, event = evaluate_whale_exit_order(
-                pos,
-                current_sol_value=current_sol_value,
-                config=config,
-                db=db,
-                now_dt=now_dt,
-            )
-            if exit_order is None:
-                pos_dict = pos.model_dump()
-                db.save_whale_state(
-                    whale_position=pos_dict,
-                    sol_balance=sol_balance,
-                    daily_pnl_sol=daily_pnl,
+        # Step 1: Monitor ALL open whale positions via 1 batched price fetch + on-demand quote near thresholds
+        if whale_positions:
+            open_mints = [str(p["mint"]) for p in whale_positions if isinstance(p, dict) and p.get("mint")]
+            sol_prices, _ = await fetch_batched_sol_prices(open_mints, config, client, now_ts=now_dt.timestamp())
+            surviving: list[dict[str, Any]] = []
+            for raw_p in whale_positions:
+                pos = ActivePosition.model_validate(raw_p)
+                est_val = estimate_position_sol_value(pos, sol_prices.get(pos.mint))
+                curr_val, _used_q = await resolve_position_sol_value(
+                    pos, estimated_sol_value=est_val, config=config, client=client, now_dt=now_dt
                 )
-                return {"slot": "whale_slot", "event": event, "whale_position": pos_dict}
-
-            exec_out = await executor_node(
-                {
-                    "focus_state": st["focus_state"],
-                    "sol_balance": sol_balance,
-                    "daily_pnl_sol": daily_pnl,
-                    "active_position": chart_pos_raw,
-                    "whale_position": pos.model_dump(),
-                    "pending_order": exit_order.model_dump(),
-                    "slot": "whale_slot",
-                },
-                config=config,
-                db=db,
-                http_client=client,
+                pos.current_sol_value = curr_val
+                exit_order, _ev = evaluate_whale_exit_order(
+                    pos, current_sol_value=curr_val, config=config, db=db, now_dt=now_dt
+                )
+                if exit_order is None:
+                    surviving.append(pos.model_dump())
+                else:
+                    ex = await executor_node(
+                        {
+                            "focus_state": st["focus_state"],
+                            "sol_balance": sol_balance,
+                            "daily_pnl_sol": daily_pnl,
+                            "active_position": chart_pos_raw,
+                            "chart_positions": chart_positions,
+                            "whale_position": pos.model_dump(),
+                            "whale_positions": surviving + [pos.model_dump()],
+                            "pending_order": exit_order.model_dump(),
+                            "slot": "whale_slot",
+                        },
+                        config=config,
+                        db=db,
+                        http_client=client,
+                    )
+                    sol_balance = float(ex.get("sol_balance", sol_balance))
+                    daily_pnl = float(ex.get("daily_pnl_sol", daily_pnl))
+            whale_positions = surviving
+            db.save_lane_positions(
+                lane="whale",
+                positions=whale_positions,
+                sol_balance=sol_balance,
+                daily_pnl_sol=daily_pnl,
             )
-            return {
-                "slot": "whale_slot",
-                "event": event,
-                "whale_position": exec_out.get("whale_position"),
-                "last_execution": exec_out.get("last_execution"),
-            }
 
-        # Case B: Slot 2 is idle -> enforce global circuit breaker & SOL balance before scanning
+        # Step 2: Check capacity (MAX_WHALE_POSITIONS=3, MAX_OPEN_POSITIONS=6), circuit breaker & free SOL
+        total_open = len(chart_positions) + len(whale_positions)
+        if len(whale_positions) >= config.MAX_WHALE_POSITIONS or total_open >= config.MAX_OPEN_POSITIONS:
+            return {"slot": "whale_slot", "event": "WHALE_LANE_FULL", "whale_positions": whale_positions}
         if daily_start > 0 and (-daily_pnl / daily_start) >= config.DAILY_MAX_LOSS_PCT:
-            return {"slot": "whale_slot", "event": "CIRCUIT_BREAKER_HALTED"}
+            return {"slot": "whale_slot", "event": "CIRCUIT_BREAKER_HALTED", "whale_positions": whale_positions}
         if sol_balance < config.WHALE_POSITION_SOL:
-            return {"slot": "whale_slot", "event": "LOW_SOL_BALANCE"}
+            return {"slot": "whale_slot", "event": "LOW_SOL_BALANCE", "whale_positions": whale_positions}
 
         min_unique = config.whale_min_unique_wallets()
         min_liq = config.whale_min_liquidity_usd()
@@ -250,7 +253,7 @@ async def run_whale_lane_tick(
             now=now_dt,
         )
         if not triggers:
-            return {"slot": "whale_slot", "event": "NO_QUALIFYING_CONFLUENCE"}
+            return {"slot": "whale_slot", "event": "NO_QUALIFYING_CONFLUENCE", "whale_positions": whale_positions}
 
         mints = [t["mint"] for t in triggers]
         pairs_by_mint = await _fetch_best_pair_for_mints(mints, config, client)
@@ -259,13 +262,19 @@ async def run_whale_lane_tick(
             if config.ENABLE_JUPITER_DISCOVERY
             else {}
         )
+        # Fetch 5m OHLCV (+ 1m fallback when < 12 5m bars) for Breakout Meter & Whale Breakout Gate
+        pair_addrs = [str(p.get("pairAddress") or "") for p in pairs_by_mint.values() if p.get("pairAddress")]
+        ohlcv_5m = await fetch_ohlcv_batch(pair_addrs, config, client, now_ts=now_dt.timestamp()) if pair_addrs else {}
+        short_addrs = [a for a in pair_addrs if len(ohlcv_5m.get(a) or []) < 12]
+        ohlcv_1m = await fetch_ohlcv_1m_batch(short_addrs, config, client, now_ts=now_dt.timestamp()) if short_addrs else {}
 
+        open_mints = db.get_all_open_mints()
         for trig in triggers:
             mint = trig["mint"]
             if db.is_on_cooldown(mint, now=now_dt):
                 db.upsert_whale_decision(mint, "SKIPPED", "COOLDOWN", updated_at=now_dt.isoformat())
                 continue
-            if chart_mint and mint == chart_mint:
+            if mint in open_mints:
                 db.upsert_whale_decision(mint, "SKIPPED", "DUPLICATE_MINT_IN_CHART_SLOT", updated_at=now_dt.isoformat())
                 continue
 
@@ -275,34 +284,71 @@ async def run_whale_lane_tick(
             symbol = str((pair.get("baseToken") or {}).get("symbol") or f"{mint[:6]}..{mint[-4:]}")
             liq_usd = float((pair.get("liquidity") or {}).get("usd") or 0.0)
             mc_usd = float(pair.get("marketCap") or pair.get("fdv") or 0.0)
+            p_addr = str(pair.get("pairAddress") or "")
+
+            # Compute shared breakout_telemetry (5m or 1m_fallback) for every Whale Radar candidate
+            c5 = pair.get("candles_5m") if isinstance(pair.get("candles_5m"), list) else ohlcv_5m.get(p_addr, [])
+            c1 = pair.get("candles_1m") if isinstance(pair.get("candles_1m"), list) else ohlcv_1m.get(p_addr, [])
+            sc_res = evaluate_scalper_entry(c5, pair, time_in_slot_min=5.0, config=config, candles_1m=c1)
+            bt = sc_res.breakout_telemetry or {}
+            bt_score = int(bt.get("score") or 0)
+            bt_state = str(bt.get("state") or "FORMING")
+            bt_failed_str = "; ".join(bt.get("failed_gates") or []) if bt else ""
+            bt_log_kwargs: dict[str, Any] = {
+                "breakout_score": bt.get("score"),
+                "breakout_state": bt.get("state"),
+                "breakout_timeframe": bt.get("timeframe"),
+                "breakout_vol_ratio": bt.get("vol_ratio"),
+                "breakout_ema_ext_pct": bt.get("ema_ext_pct"),
+                "breakout_failed_gates": bt_failed_str or None,
+            }
+
             if (jup_meta.get(mint) or {}).get("is_sus") is True:
-                db.upsert_whale_decision(mint, "SKIPPED", "AUDIT_SUS", updated_at=now_dt.isoformat())
+                db.upsert_whale_decision(mint, "SKIPPED", "AUDIT_SUS", updated_at=now_dt.isoformat(), breakout_telemetry=bt)
                 continue
             if liq_usd < min_liq:
-                db.upsert_whale_decision(mint, "SKIPPED", f"LIQ < {_fmt_usd(min_liq)}", updated_at=now_dt.isoformat())
+                db.upsert_whale_decision(mint, "SKIPPED", f"LIQ < {_fmt_usd(min_liq)}", updated_at=now_dt.isoformat(), breakout_telemetry=bt)
                 continue
             if not (config.WHALE_MIN_MCAP_USD <= mc_usd <= config.WHALE_MAX_MCAP_USD):
-                mc_reason = (
-                    f"MCAP < {_fmt_usd(config.WHALE_MIN_MCAP_USD)}"
-                    if mc_usd < config.WHALE_MIN_MCAP_USD
-                    else f"MCAP > {_fmt_usd(config.WHALE_MAX_MCAP_USD)}"
+                mc_reason = f"MCAP < {_fmt_usd(config.WHALE_MIN_MCAP_USD)}" if mc_usd < config.WHALE_MIN_MCAP_USD else f"MCAP > {_fmt_usd(config.WHALE_MAX_MCAP_USD)}"
+                db.upsert_whale_decision(mint, "SKIPPED", mc_reason, updated_at=now_dt.isoformat(), breakout_telemetry=bt)
+                continue
+
+            # Whale Breakout Gate (applied when OHLCV bars were evaluated; rejects EXTENDED or low score)
+            has_ohlcv = bool(c5 or c1)
+            if has_ohlcv and config.WHALE_BLOCK_EXTENDED and bt_state == "EXTENDED":
+                rej = f"BREAKOUT_EXTENDED ({bt_failed_str})" if bt_failed_str else "BREAKOUT_EXTENDED"
+                db.upsert_whale_decision(mint, "SKIPPED", rej, updated_at=now_dt.isoformat(), breakout_telemetry=bt)
+                db.log_action(
+                    mode=config.EXECUTION_MODE, action="WHALE_CONFLUENCE", symbol=symbol, asset_id=mint,
+                    strategy="WHALE_SCALP", reason=f"SKIPPED: {rej}", timestamp_utc=now_dt.isoformat(),
+                    mc_usd=round(mc_usd, 2) if mc_usd else None, liq_usd=round(liq_usd, 2) if liq_usd else None,
+                    whale_sol_flow=round(float(trig["total_sol"]), 6), **bt_log_kwargs,
                 )
-                db.upsert_whale_decision(mint, "SKIPPED", mc_reason, updated_at=now_dt.isoformat())
+                continue
+            if has_ohlcv and bt_score < config.WHALE_MIN_BREAKOUT_SCORE:
+                rej = f"BREAKOUT_SCORE({bt_score}<{config.WHALE_MIN_BREAKOUT_SCORE}): {bt_failed_str}"
+                db.upsert_whale_decision(mint, "SKIPPED", rej, updated_at=now_dt.isoformat(), breakout_telemetry=bt)
+                db.log_action(
+                    mode=config.EXECUTION_MODE, action="WHALE_CONFLUENCE", symbol=symbol, asset_id=mint,
+                    strategy="WHALE_SCALP", reason=f"SKIPPED: {rej}", timestamp_utc=now_dt.isoformat(),
+                    mc_usd=round(mc_usd, 2) if mc_usd else None, liq_usd=round(liq_usd, 2) if liq_usd else None,
+                    whale_sol_flow=round(float(trig["total_sol"]), 6), **bt_log_kwargs,
+                )
                 continue
 
             report = await check_token_safety(mint, config, client)
             if not report.passed:
                 reason_str = "; ".join(report.reasons)
-                db.upsert_whale_decision(mint, "SKIPPED", "SAFETY_REJECT", updated_at=now_dt.isoformat())
-                db.set_cooldown_minutes(
-                    mint, minutes=config.SAFETY_REJECT_COOLDOWN_MINUTES, reason=f"WHALE_SAFETY_REJECT: {reason_str}", now=now_dt
-                )
+                db.upsert_whale_decision(mint, "SKIPPED", "SAFETY_REJECT", updated_at=now_dt.isoformat(), breakout_telemetry=bt)
+                db.set_cooldown_minutes(mint, minutes=config.SAFETY_REJECT_COOLDOWN_MINUTES, reason=f"WHALE_SAFETY_REJECT: {reason_str}", now=now_dt)
                 continue
 
             trig_wallets = list(trig["triggering_wallets"])
             trig_type = str(trig["trigger_type"])
             total_sol = float(trig["total_sol"])
-            db.upsert_whale_decision(mint, "ENTERED", f"WHALE_SCALP_{trig_type}", updated_at=now_dt.isoformat())
+            entry_reason = "WHALE_BREAKOUT_CONFLUENCE" if bt_state == "IGNITION" else f"WHALE_SCALP_{trig_type}"
+            db.upsert_whale_decision(mint, "ENTERED", entry_reason, updated_at=now_dt.isoformat(), breakout_telemetry=bt)
             db.log_action(
                 mode=config.EXECUTION_MODE,
                 action="WHALE_CONFLUENCE",
@@ -310,19 +356,20 @@ async def run_whale_lane_tick(
                 asset_id=mint,
                 notional=round(config.WHALE_POSITION_SOL, 6),
                 strategy="WHALE_SCALP",
-                reason=f"WHALE_SCALP_{trig_type}",
+                reason=entry_reason,
                 timestamp_utc=now_dt.isoformat(),
                 mc_usd=round(mc_usd, 2) if mc_usd else None,
                 liq_usd=round(liq_usd, 2) if liq_usd else None,
                 triggering_whales=",".join(config.resolve_wallet_label(w) for w in trig_wallets),
                 whale_sol_flow=round(total_sol, 6),
+                **bt_log_kwargs,
             )
             order = PendingOrder(
                 side="BUY",
                 mint=mint,
                 symbol=symbol,
                 amount_atomic=int(round(config.WHALE_POSITION_SOL * LAMPORTS_PER_SOL)),
-                reason=f"WHALE_SCALP_{trig_type}",
+                reason=entry_reason,
                 target_state_after_fill=FocusState.IN_POSITION,
                 apply_cooldown=False,
                 entry_liquidity_usd=liq_usd,
@@ -330,10 +377,8 @@ async def run_whale_lane_tick(
                 whale_sol_flow=round(total_sol, 6),
                 strategy="WHALE_SCALP",
                 triggering_wallets=trig_wallets,
-                rationale=(
-                    f"[WHALE_SCALP SLOT-2] {symbol} ({mint[:6]}..): "
-                    f"trigger={trig_type} ({len(trig_wallets)} whales, {total_sol:.2f} SOL)"
-                ),
+                breakout_telemetry=bt or None,
+                rationale=f"[{entry_reason}] {symbol} ({mint[:6]}..): {len(trig_wallets)} whales, {total_sol:.2f} SOL, breakout={bt_score}/100 ({bt_state})",
             )
             exec_out = await executor_node(
                 {
@@ -341,7 +386,9 @@ async def run_whale_lane_tick(
                     "sol_balance": sol_balance,
                     "daily_pnl_sol": daily_pnl,
                     "active_position": chart_pos_raw,
-                    "whale_position": None,
+                    "chart_positions": chart_positions,
+                    "whale_position": whale_positions[0] if whale_positions else None,
+                    "whale_positions": whale_positions,
                     "pending_order": order.model_dump(),
                     "slot": "whale_slot",
                 },
@@ -351,12 +398,13 @@ async def run_whale_lane_tick(
             )
             return {
                 "slot": "whale_slot",
-                "event": f"WHALE_SCALP_{trig_type}_ENTERED",
+                "event": f"{entry_reason}_ENTERED",
                 "whale_position": exec_out.get("whale_position"),
+                "whale_positions": exec_out.get("whale_positions", whale_positions),
                 "last_execution": exec_out.get("last_execution"),
             }
 
-        return {"slot": "whale_slot", "event": "ALL_CANDIDATES_FILTERED"}
+        return {"slot": "whale_slot", "event": "ALL_CANDIDATES_FILTERED", "whale_positions": whale_positions}
     finally:
         if owns_client:
             await client.aclose()

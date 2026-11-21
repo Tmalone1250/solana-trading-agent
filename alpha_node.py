@@ -283,7 +283,12 @@ async def alpha_node(
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
     """LangGraph node: single batched gemini-decision-1 call gated by Scalper Entry Engine."""
-    if state.get("focus_state") != FocusState.SCANNING.value:
+    if "chart_positions" in state:
+        chart_open = len(state.get("chart_positions") or [])
+        whale_open = len(state.get("whale_positions") or [])
+        if chart_open >= config.MAX_CHART_POSITIONS or (chart_open + whale_open) >= config.MAX_OPEN_POSITIONS:
+            return {"alpha_decisions": [], "pending_order": None}
+    elif state.get("focus_state") != FocusState.SCANNING.value:
         return {"alpha_decisions": [], "pending_order": None}
 
     safe_candidates = state.get("safe_candidates") or []
@@ -825,11 +830,16 @@ async def alpha_node(
             strike_note,
         )
 
-    # Shared Guard: exclude any mint already open in Slot 2 (whale_slot)
-    whale_pos = state.get("whale_position") or db.get_state().get("whale_position")
-    whale_mint = str(whale_pos.get("mint") or "") if isinstance(whale_pos, dict) else ""
-    if whale_mint:
-        approved_pairs = [item for item in approved_pairs if item[0].mint != whale_mint]
+    # Shared Guard: exclude any mint already open across all 6 Chart + Whale positions
+    open_mints = db.get_all_open_mints()
+    for p in (state.get("chart_positions") or []) + (state.get("whale_positions") or []):
+        if isinstance(p, dict) and p.get("mint"):
+            open_mints.add(str(p["mint"]))
+    whale_pos = state.get("whale_position")
+    if isinstance(whale_pos, dict) and whale_pos.get("mint"):
+        open_mints.add(str(whale_pos["mint"]))
+    if open_mints:
+        approved_pairs = [item for item in approved_pairs if item[0].mint not in open_mints]
 
     if not approved_pairs:
         latest_rationale = decisions[0].rationale if decisions else ""

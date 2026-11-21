@@ -52,6 +52,12 @@ def create_telemetry_app(
         st = database.get_state()
         pos = st.get("active_position")
         whale_pos = st.get("whale_position")
+        raw_chart_list = list(st.get("chart_positions") or [])
+        raw_whale_list = list(st.get("whale_positions") or [])
+        if not raw_chart_list and isinstance(pos, dict) and st["focus_state"] != "SCANNING":
+            raw_chart_list = [pos]
+        if not raw_whale_list and isinstance(whale_pos, dict):
+            raw_whale_list = [whale_pos]
 
         def _build_slot_pnl(p: dict[str, Any], slot_name: str) -> dict[str, Any]:
             e_sol = float(p.get("entry_sol") or 0.0)
@@ -80,12 +86,14 @@ def create_telemetry_app(
                 "last_liquidity_usd": p.get("last_liquidity_usd"),
             }
 
-        chart_live_pnl = _build_slot_pnl(pos, "chart_slot") if isinstance(pos, dict) else None
-        whale_live_pnl = _build_slot_pnl(whale_pos, "whale_slot") if isinstance(whale_pos, dict) else None
-        active_positions = [p for p in (chart_live_pnl, whale_live_pnl) if p is not None]
+        chart_live_positions = [_build_slot_pnl(p, "chart_slot") for p in raw_chart_list if isinstance(p, dict)]
+        whale_live_positions = [_build_slot_pnl(p, "whale_slot") for p in raw_whale_list if isinstance(p, dict)]
+        chart_live_pnl = chart_live_positions[0] if chart_live_positions else None
+        whale_live_pnl = whale_live_positions[0] if whale_live_positions else None
+        active_positions = chart_live_positions + whale_live_positions
 
         # Backward-compatible primary focus fields (Slot 1 primary; fallback to Slot 2 if Slot 1 idle)
-        primary_pos = pos if isinstance(pos, dict) else (whale_pos if isinstance(whale_pos, dict) else None)
+        primary_pos = raw_chart_list[0] if raw_chart_list else (raw_whale_list[0] if raw_whale_list else None)
         live_pnl = chart_live_pnl or whale_live_pnl
         active_mint = primary_pos.get("mint") if isinstance(primary_pos, dict) else None
         active_symbol = primary_pos.get("symbol") if isinstance(primary_pos, dict) else None
@@ -202,6 +210,7 @@ def create_telemetry_app(
                     **sig,
                     "agent_status": a_status,
                     "agent_reason": a_reason,
+                    "breakout_telemetry": dec_info.get("breakout_telemetry") if dec_info else None,
                 }
             )
 
@@ -265,7 +274,11 @@ def create_telemetry_app(
             "active_symbol": active_symbol,
             "active_position": pos,
             "whale_position": whale_live_pnl,
+            "chart_positions": chart_live_positions,
+            "whale_positions": whale_live_positions,
             "active_positions": active_positions,
+            "max_chart_positions": cfg.MAX_CHART_POSITIONS,
+            "max_whale_positions": cfg.MAX_WHALE_POSITIONS,
             "active_watchlist": active_watchlist_payload,
             "x_discovery": {
                 "enabled": cfg.ENABLE_X_DISCOVERY,

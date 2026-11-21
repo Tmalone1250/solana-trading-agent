@@ -39,9 +39,12 @@ class AgentConfig(BaseSettings):
     JUPITER_API_KEY: str = ""
     SOLANA_PRIVATE_KEY_BS58: str = ""
 
-    # Narrowed Risk Parameters
+    # Narrowed Risk Parameters & Dual-Lane 3+3 Concurrency
     PAPER_STARTING_SOL: float = Field(default=0.7, gt=0.0)
     TRADE_SIZE_SOL: float = Field(default=0.5, gt=0.0)
+    MAX_CHART_POSITIONS: int = Field(default=3, ge=1)
+    MAX_WHALE_POSITIONS: int = Field(default=3, ge=1)
+    MAX_OPEN_POSITIONS: int = Field(default=6, ge=1)
     HARD_STOP_LOSS_PCT: float = Field(default=0.10, gt=0.0, lt=1.0)
     BREAKEVEN_ARM_PCT: float = Field(default=0.08, gt=0.0)
     BREAKEVEN_FLOOR_PCT: float = Field(default=0.02, ge=0.0)
@@ -155,6 +158,8 @@ class AgentConfig(BaseSettings):
     WHALE_TIME_STOP_SECONDS: int = Field(default=300, gt=0)
     WHALE_TIME_STOP_MIN_PNL_PCT: float = Field(default=4.0)
     WHALE_MONITOR_POLL_SECONDS: float = Field(default=2.0, gt=0.0)
+    WHALE_MIN_BREAKOUT_SCORE: int = Field(default=50, ge=0, le=100)
+    WHALE_BLOCK_EXTENDED: bool = True
 
     # Endpoints
     DEXSCREENER_BASE_URL: str = "https://api.dexscreener.com"

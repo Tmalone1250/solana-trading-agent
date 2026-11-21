@@ -1,6 +1,9 @@
 export type FocusState = "SCANNING" | "IN_POSITION" | "WATCHING_REENTRY";
 
 export interface LiveJupiterPnl {
+  slot?: "chart_slot" | "whale_slot" | string;
+  mint?: string | null;
+  symbol?: string | null;
   strategy?: string;
   triggering_wallets?: string[];
   entry_sol: number;
@@ -103,6 +106,7 @@ export interface WhaleSignal {
   last_seen_utc: string;
   agent_status?: string | null;
   agent_reason?: string | null;
+  breakout_telemetry?: BreakoutTelemetry | null;
 }
 
 export interface WhaleTradeWallet {
@@ -177,6 +181,11 @@ export interface TelemetryPayload {
   hunting_lane: string;
   active_mint: string | null;
   active_symbol: string | null;
+  chart_positions?: LiveJupiterPnl[];
+  whale_positions?: LiveJupiterPnl[];
+  active_positions?: LiveJupiterPnl[];
+  max_chart_positions?: number;
+  max_whale_positions?: number;
   active_watchlist: WatchlistSlot[];
   whale_discovery?: WhaleDiscoveryPayload;
   live_jupiter_pnl: LiveJupiterPnl | null;

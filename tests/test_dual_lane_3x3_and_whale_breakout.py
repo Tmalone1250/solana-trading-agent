@@ -1,0 +1,231 @@
+"""Unit tests for 3+3 Dual-Lane concurrency, batched price polling & Whale Breakout Gate."""
+
+from __future__ import annotations
+
+import csv
+import io
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+from batched_price_monitor import (
+    clear_price_backoff,
+    fetch_batched_sol_prices,
+    needs_exact_jupiter_quote,
+    resolve_position_sol_value,
+)
+from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
+from db import AgentDatabase
+from executor_node import executor_node
+from ohlcv_client import clear_ohlcv_cache
+from state import ActivePosition, FocusState, PendingOrder
+from telemetry_api import create_telemetry_app
+from tests.test_breakout_ignition import _make_breakout_candles
+from whale_lane import run_whale_lane_tick
+
+
+@pytest.mark.asyncio
+async def test_3x3_dual_lane_caps_and_duplicate_mint_rejection(tmp_path):
+    db = AgentDatabase(db_path=str(tmp_path / "dual_3x3.duckdb"), starting_sol=5.0)
+    cfg = AgentConfig(
+        _env_file=None,
+        MAX_CHART_POSITIONS=3,
+        MAX_WHALE_POSITIONS=3,
+        MAX_OPEN_POSITIONS=6,
+    )
+
+    def jup_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"outAmount": "1000000", "transaction": None})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(jup_handler)) as client:
+        # Open 3 Chart positions -> all 3 succeed
+        for i in range(3):
+            st = db.get_state()
+            order = PendingOrder(
+                side="BUY", mint=f"MintChart{i}", symbol=f"CH{i}",
+                amount_atomic=int(0.5 * LAMPORTS_PER_SOL), reason="DECISION_1_ENTRY",
+                target_state_after_fill=FocusState.IN_POSITION, strategy="BREAKOUT_IGNITION",
+            )
+            out = await executor_node(
+                {**st, "pending_order": order.model_dump()},
+                config=cfg, db=db, http_client=client,
+            )
+            assert len(out["chart_positions"]) == i + 1
+
+        # 4th Chart position -> BLOCKED by MAX_CHART_POSITIONS=3
+        st = db.get_state()
+        order_c4 = PendingOrder(
+            side="BUY", mint="MintChart3", symbol="CH3",
+            amount_atomic=int(0.5 * LAMPORTS_PER_SOL), reason="DECISION_1_ENTRY",
+            target_state_after_fill=FocusState.IN_POSITION, strategy="SWEEP_RECLAIM",
+        )
+        out_c4 = await executor_node({**st, "pending_order": order_c4.model_dump()}, config=cfg, db=db, http_client=client)
+        assert out_c4 == {"pending_order": None}
+        assert len(db.get_state()["chart_positions"]) == 3
+
+        # Duplicate mint from Chart lane into Whale lane -> BLOCKED
+        order_dup = PendingOrder(
+            side="BUY", mint="MintChart0", symbol="CH0",
+            amount_atomic=int(0.25 * LAMPORTS_PER_SOL), reason="WHALE_SCALP_CONFLUENCE",
+            target_state_after_fill=FocusState.IN_POSITION, strategy="WHALE_SCALP",
+        )
+        out_dup = await executor_node({**db.get_state(), "pending_order": order_dup.model_dump(), "slot": "whale_slot"}, config=cfg, db=db, http_client=client)
+        assert out_dup == {"pending_order": None}
+
+        # Open 3 Whale positions -> all 3 succeed (total 6 open positions!)
+        for i in range(3):
+            st = db.get_state()
+            order = PendingOrder(
+                side="BUY", mint=f"MintWhale{i}", symbol=f"WH{i}",
+                amount_atomic=int(0.25 * LAMPORTS_PER_SOL), reason="WHALE_BREAKOUT_CONFLUENCE",
+                target_state_after_fill=FocusState.IN_POSITION, strategy="WHALE_SCALP",
+            )
+            out = await executor_node(
+                {**st, "pending_order": order.model_dump(), "slot": "whale_slot"},
+                config=cfg, db=db, http_client=client,
+            )
+            assert len(out["whale_positions"]) == i + 1
+
+        # 4th Whale position -> BLOCKED by MAX_WHALE_POSITIONS=3 / MAX_OPEN_POSITIONS=6
+        order_w4 = PendingOrder(
+            side="BUY", mint="MintWhale3", symbol="WH3",
+            amount_atomic=int(0.25 * LAMPORTS_PER_SOL), reason="WHALE_SCALP_CONFLUENCE",
+            target_state_after_fill=FocusState.IN_POSITION, strategy="WHALE_SCALP",
+        )
+        out_w4 = await executor_node({**db.get_state(), "pending_order": order_w4.model_dump(), "slot": "whale_slot"}, config=cfg, db=db, http_client=client)
+        assert out_w4 == {"pending_order": None}
+
+    tc = TestClient(create_telemetry_app(config=cfg, db=db))
+    tel = tc.get("/api/telemetry").json()
+    assert len(tel["chart_positions"]) == 3
+    assert len(tel["whale_positions"]) == 3
+    assert len(tel["active_positions"]) == 6
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_batched_price_polling_and_on_demand_quote_near_thresholds():
+    clear_price_backoff()
+    cfg = AgentConfig(_env_file=None)
+    calls = {"price_v3": 0, "dex": 0, "swap_quote": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/price/v3" in url:
+            calls["price_v3"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    SOL_MINT: {"usdPrice": 200.0},
+                    "MintA": {"usdPrice": 102.0},
+                    "MintB": {"usdPrice": 91.0},
+                },
+            )
+        if "/tokens/v1/solana/" in url:
+            calls["dex"] += 1
+            return httpx.Response(200, json=[])
+        if "/swap/v2/order" in url:
+            calls["swap_quote"] += 1
+            return httpx.Response(200, json={"outAmount": str(int(0.455 * LAMPORTS_PER_SOL))})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        prices, _ = await fetch_batched_sol_prices(["MintA", "MintB"], cfg, client, now_ts=1000.0)
+        assert calls["price_v3"] == 1
+        assert prices["MintA"] == pytest.approx(0.51, rel=1e-4)
+
+        # Safe mid-range position (+2% PnL, far from -10% SL and +12% TP) -> NO individual swap quote!
+        pos_safe = ActivePosition(mint="MintA", symbol="A", entry_sol=0.50, token_amount=1_000_000, current_sol_value=0.51, peak_sol_value=0.51)
+        assert needs_exact_jupiter_quote(pos_safe, 0.51, cfg) is False
+        val_safe, used_q1 = await resolve_position_sol_value(pos_safe, estimated_sol_value=0.51, config=cfg, client=client)
+        assert used_q1 is False
+        assert val_safe == pytest.approx(0.51)
+        assert calls["swap_quote"] == 0
+
+        # Position within 2% of -10% hard stop (-9% = 0.455 SOL) -> FIRES exact Jupiter swap quote!
+        pos_near_sl = ActivePosition(mint="MintB", symbol="B", entry_sol=0.50, token_amount=1_000_000, current_sol_value=0.455, peak_sol_value=0.50)
+        assert needs_exact_jupiter_quote(pos_near_sl, 0.455, cfg) is True
+        val_exact, used_q2 = await resolve_position_sol_value(pos_near_sl, estimated_sol_value=0.455, config=cfg, client=client)
+        assert used_q2 is True
+        assert val_exact == pytest.approx(0.455)
+        assert calls["swap_quote"] == 1
+
+
+@pytest.mark.asyncio
+async def test_whale_breakout_gate_blocks_extended_and_low_score_and_logs_csv(tmp_path):
+    clear_ohlcv_cache()
+    db = AgentDatabase(db_path=str(tmp_path / "whale_bo.duckdb"), starting_sol=2.0)
+    cfg = AgentConfig(
+        _env_file=None,
+        WHALE_STRATEGY_ENABLED=True,
+        WHALE_MIN_UNIQUE_WALLETS=2,
+        WHALE_MIN_LIQ_USD=40_000.0,
+        WHALE_MIN_BREAKOUT_SCORE=50,
+        WHALE_BLOCK_EXTENDED=True,
+        ENABLE_JUPITER_DISCOVERY=False,
+    )
+    now_dt = datetime.now(timezone.utc)
+    ext_mint = "MintWhaleExt1111111111111111111111111111111"
+    ign_mint = "MintWhaleIgn1111111111111111111111111111111"
+
+    for tag, m in (("ext", ext_mint), ("ign", ign_mint)):
+        db.record_whale_event(signature=f"{tag}-1", wallet=f"W{tag}1", mint=m, side="BUY", sol_amount=2.0, token_amount=100.0, timestamp_utc=(now_dt - timedelta(seconds=20)).isoformat())
+        db.record_whale_event(signature=f"{tag}-2", wallet=f"W{tag}2", mint=m, side="BUY", sol_amount=2.0, token_amount=100.0, timestamp_utc=(now_dt - timedelta(seconds=10)).isoformat())
+        db.recompute_whale_signal(m, ttl_minutes=30, now=now_dt)
+
+    ext_candles = _make_breakout_candles(count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.07, breakout_vol=3500.0)
+    ign_candles = _make_breakout_candles(count=18, breakout_close=1.12, breakout_high=1.13, breakout_low=1.06, breakout_vol=3000.0)
+
+    def _to_gecko(cs: list[dict[str, float]]) -> dict[str, Any]:
+        return {"data": {"attributes": {"ohlcv_list": [[c["timestamp"], c["open"], c["high"], c["low"], c["close"], c["volume"]] for c in cs]}}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/tokens/v1/solana/" in url:
+            return httpx.Response(
+                200,
+                json=[
+                    {"chainId": "solana", "pairAddress": "PoolExt", "baseToken": {"address": ext_mint, "symbol": "EXTW"}, "marketCap": 250_000, "liquidity": {"usd": 80_000}, "txns": {"m5": {"buys": 32, "sells": 14}, "h1": {"buys": 180, "sells": 120}}},
+                    {"chainId": "solana", "pairAddress": "PoolIgn", "baseToken": {"address": ign_mint, "symbol": "IGNW"}, "marketCap": 300_000, "liquidity": {"usd": 90_000}, "txns": {"m5": {"buys": 32, "sells": 14}, "h1": {"buys": 180, "sells": 120}}},
+                ],
+            )
+        if "pools/PoolExt/ohlcv" in url:
+            return httpx.Response(200, json=_to_gecko(ext_candles))
+        if "pools/PoolIgn/ohlcv" in url:
+            return httpx.Response(200, json=_to_gecko(ign_candles))
+        if "rugcheck.xyz" in url:
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/ultra/v1/shield" in url:
+            return httpx.Response(200, json={"warnings": {ign_mint: []}})
+        if "/swap/v2/order" in url:
+            return httpx.Response(200, json={"outAmount": "1500000", "transaction": None})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        res = await run_whale_lane_tick(config=cfg, db=db, http_client=client, now=now_dt)
+
+    # EXTENDED mint was rejected; IGNITION mint was entered with WHALE_BREAKOUT_CONFLUENCE!
+    decs = db.get_whale_decisions()
+    assert decs[ext_mint]["status"] == "SKIPPED"
+    assert "BREAKOUT_EXTENDED" in decs[ext_mint]["reason"]
+    assert decs[ext_mint]["breakout_telemetry"]["state"] == "EXTENDED"
+    assert res["whale_position"]["mint"] == ign_mint
+    assert res["event"] == "WHALE_BREAKOUT_CONFLUENCE_ENTERED"
+
+    # Verify /api/export/csv has breakout_* columns populated on WHALE_CONFLUENCE & BUY rows
+    tc = TestClient(create_telemetry_app(config=cfg, db=db))
+    rows = list(csv.DictReader(io.StringIO(tc.get("/api/export/csv?type=all").text)))
+    buy_row = next(r for r in rows if r["action"] == "BUY" and r["symbol"] == "IGNW")
+    assert buy_row["reason"] == "WHALE_BREAKOUT_CONFLUENCE"
+    assert int(buy_row["breakout_score"]) == 100
+    assert buy_row["breakout_state"] == "IGNITION"
+    assert buy_row["breakout_timeframe"] == "5m"
+
+    ext_log = next(r for r in rows if r["action"] == "WHALE_CONFLUENCE" and r["symbol"] == "EXTW")
+    assert ext_log["breakout_state"] == "EXTENDED"
+    assert "EXT(" in ext_log["breakout_failed_gates"]
+    db.close()
+    clear_ohlcv_cache()
