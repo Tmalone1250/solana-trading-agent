@@ -64,11 +64,11 @@ async def test_whale_scalp_fast_track_confluence_and_solo_buy_within_mcap_band(t
         _env_file=None,
         WHALE_STRATEGY_ENABLED=True,
         WHALE_POSITION_SOL=0.25,
-        WHALE_MIN_SOLO_BUY_SOL=2.0,
+        WHALE_MIN_SOLO_BUY_SOL=1.5,
         WHALE_MIN_CONFLUENCE_WALLETS=2,
         WHALE_ENTRY_MAX_AGE_SECONDS=60,
         WHALE_MIN_MCAP_USD=15_000.0,
-        WHALE_MAX_MCAP_USD=120_000.0,
+        WHALE_MAX_MCAP_USD=50_000_000.0,
         WHALE_MIN_LIQUIDITY_USD=10_000.0,
         ENABLE_JUPITER_DISCOVERY=True,
         JUPITER_REQUEST_DELAY_SECONDS=0.0,
@@ -162,18 +162,18 @@ async def test_whale_scalp_fast_track_confluence_and_solo_buy_within_mcap_band(t
     tel = tc.get("/api/telemetry").json()
     assert tel["live_jupiter_pnl"]["strategy"] == "WHALE_SCALP"
 
-    # Solo >= 2.0 SOL buy within 60s qualifies
+    # Solo >= 1.5 SOL buy within 60s qualifies
     db2 = AgentDatabase(db_path=str(tmp_path / "whale_solo.duckdb"), starting_sol=0.7)
     db2.record_whale_event(
         signature="sig-solo-1",
         wallet="WhaleBig",
         mint="MintSolo60",
         side="BUY",
-        sol_amount=2.5,
+        sol_amount=1.6,
         token_amount=500_000.0,
         timestamp_utc=(now_dt - timedelta(seconds=15)).isoformat(),
     )
-    trigs = db2.get_whale_fast_track_triggers(max_age_seconds=60, min_solo_sol=2.0, now=now_dt)
+    trigs = db2.get_whale_fast_track_triggers(max_age_seconds=60, min_solo_sol=1.5, now=now_dt)
     assert len(trigs) == 1
     assert trigs[0]["trigger_type"] == "SOLO"
 
@@ -193,7 +193,7 @@ async def test_whale_scalp_mcap_band_gating_stale_60s_and_is_sus(tmp_path):
         WHALE_STRATEGY_ENABLED=True,
         WHALE_ENTRY_MAX_AGE_SECONDS=60,
         WHALE_MIN_MCAP_USD=15_000.0,
-        WHALE_MAX_MCAP_USD=120_000.0,
+        WHALE_MAX_MCAP_USD=50_000_000.0,
         WHALE_MIN_LIQUIDITY_USD=10_000.0,
         ENABLE_JUPITER_DISCOVERY=True,
         JUPITER_REQUEST_DELAY_SECONDS=0.0,
@@ -207,7 +207,7 @@ async def test_whale_scalp_mcap_band_gating_stale_60s_and_is_sus(tmp_path):
         wallet="W1",
         mint="MintStale",
         side="BUY",
-        sol_amount=3.0,
+        sol_amount=2.0,
         token_amount=100_000.0,
         timestamp_utc=(now_dt - timedelta(seconds=75)).isoformat(),
     )
@@ -217,37 +217,37 @@ async def test_whale_scalp_mcap_band_gating_stale_60s_and_is_sus(tmp_path):
         wallet="W2",
         mint="MintTooSmall",
         side="BUY",
-        sol_amount=3.0,
+        sol_amount=2.0,
         token_amount=100_000.0,
         timestamp_utc=(now_dt - timedelta(seconds=10)).isoformat(),
     )
-    # 3. Too large MCAP ($150K > $120K) -> rejected
+    # 3. Too large MCAP ($60M > $50M) -> rejected
     db.record_whale_event(
         signature="sig-large",
         wallet="W3",
         mint="MintTooLarge",
         side="BUY",
-        sol_amount=3.0,
+        sol_amount=2.0,
         token_amount=100_000.0,
         timestamp_utc=(now_dt - timedelta(seconds=10)).isoformat(),
     )
-    # 4. Inside MCAP band ($50K) but Jupiter audit.isSus == True -> rejected
+    # 4. Inside MCAP band ($14M) but Jupiter audit.isSus == True -> rejected
     db.record_whale_event(
         signature="sig-sus",
         wallet="W4",
         mint="MintSus",
         side="BUY",
-        sol_amount=3.0,
+        sol_amount=2.0,
         token_amount=100_000.0,
         timestamp_utc=(now_dt - timedelta(seconds=10)).isoformat(),
     )
-    # 5. Inside MCAP band ($60K), liq $15K, clean -> ACCEPTED
+    # 5. Valid $14M mid/high-cap whale runner (inside [$15K, $50M]), liq $500K, clean -> ACCEPTED
     db.record_whale_event(
         signature="sig-ok",
         wallet="W5",
         mint="MintJustRight",
         side="BUY",
-        sol_amount=3.0,
+        sol_amount=2.0,
         token_amount=100_000.0,
         timestamp_utc=(now_dt - timedelta(seconds=10)).isoformat(),
     )
@@ -261,7 +261,7 @@ async def test_whale_scalp_mcap_band_gating_stale_60s_and_is_sus(tmp_path):
                 200,
                 json=[
                     {"id": "MintSus", "symbol": "SUS", "organicScore": 50.0, "audit": {"isSus": True}},
-                    {"id": "MintJustRight", "symbol": "RIGHT", "organicScore": 80.0, "audit": {"isSus": False}},
+                    {"id": "MintJustRight", "symbol": "RIGHT", "organicScore": 85.0, "audit": {"isSus": False}},
                 ],
             )
         if "geckoterminal.com" in url:
@@ -273,9 +273,9 @@ async def test_whale_scalp_mcap_band_gating_stale_60s_and_is_sus(tmp_path):
                 200,
                 json=[
                     {"chainId": "solana", "baseToken": {"address": "MintTooSmall", "symbol": "SM"}, "marketCap": 10_000, "liquidity": {"usd": 12_000}},
-                    {"chainId": "solana", "baseToken": {"address": "MintTooLarge", "symbol": "LG"}, "marketCap": 150_000, "liquidity": {"usd": 30_000}},
-                    {"chainId": "solana", "baseToken": {"address": "MintSus", "symbol": "SUS"}, "marketCap": 50_000, "liquidity": {"usd": 15_000}},
-                    {"chainId": "solana", "baseToken": {"address": "MintJustRight", "symbol": "RIGHT"}, "marketCap": 60_000, "liquidity": {"usd": 15_000}},
+                    {"chainId": "solana", "baseToken": {"address": "MintTooLarge", "symbol": "LG"}, "marketCap": 60_000_000, "liquidity": {"usd": 1_000_000}},
+                    {"chainId": "solana", "baseToken": {"address": "MintSus", "symbol": "SUS"}, "marketCap": 14_000_000, "liquidity": {"usd": 300_000}},
+                    {"chainId": "solana", "baseToken": {"address": "MintJustRight", "symbol": "RIGHT"}, "marketCap": 14_000_000, "liquidity": {"usd": 500_000}},
                 ],
             )
         return httpx.Response(404)
@@ -291,6 +291,8 @@ async def test_whale_scalp_mcap_band_gating_stale_60s_and_is_sus(tmp_path):
         )
 
     assert [c["mint"] for c in out["whale_fast_track_candidates"]] == ["MintJustRight"]
+    decisions = db.get_whale_decisions()
+    assert decisions["MintTooLarge"]["reason"] == "MCAP > $50M"
     db.close()
     clear_geckoterminal_cache()
     clear_jupiter_token_cache()
@@ -355,9 +357,9 @@ async def test_whale_scalp_five_layer_exit_engine(tmp_path):
     assert db_a.get_recent_closed_trades(limit=5)[0]["strategy"] == "WHALE_SCALP"
     db_a.close()
 
-    # (b) WHALE_FRONT_RUN_TP at +25% (0.25 -> 0.3125 SOL)
+    # (b) WHALE_FRONT_RUN_TP at +15% (0.25 -> 0.2875 SOL)
     db_b = AgentDatabase(db_path=str(tmp_path / "exit_b.duckdb"), starting_sol=0.7)
-    async with _make_monitor_client(sol_quote=0.3125) as client:
+    async with _make_monitor_client(sol_quote=0.2875) as client:
         mon_b = await position_monitor_node(
             {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.45, "daily_pnl_sol": 0.0, "active_position": _open_whale_pos(0.25)},
             config=cfg,
@@ -369,39 +371,39 @@ async def test_whale_scalp_five_layer_exit_engine(tmp_path):
     assert mon_b["pending_order"]["reason"] == "WHALE_FRONT_RUN_TP"
     db_b.close()
 
-    # (c1) WHALE_PEAK_TRAIL Tier 1: arms at +10% (0.28 SOL = +12%), exits on 6% drop (0.2632 SOL)
+    # (c1) WHALE_PEAK_TRAIL Tier 1: arms at +8% (0.2725 SOL = +9%), exits on 3.5% drop (0.2629 SOL)
     db_c1 = AgentDatabase(db_path=str(tmp_path / "exit_c1.duckdb"), starting_sol=0.7)
     st_c1 = {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.45, "daily_pnl_sol": 0.0, "active_position": _open_whale_pos(0.25)}
-    async with _make_monitor_client(sol_quote=0.28) as client:
+    async with _make_monitor_client(sol_quote=0.2725) as client:
         m1 = await position_monitor_node(st_c1, config=cfg, db=db_c1, decision_client=dec, http_client=client, now=now_dt)  # type: ignore[arg-type]
         assert m1["pending_order"] is None
         assert m1["active_position"]["trail_armed"] is True
     st_c1.update(m1)
-    # 5% drop from 0.28 -> 0.266 SOL (below 6% threshold -> still holds!)
-    async with _make_monitor_client(sol_quote=0.266) as client:
+    # 2.5% drop from 0.2725 -> 0.2657 SOL (below 3.5% threshold -> still holds!)
+    async with _make_monitor_client(sol_quote=0.2657) as client:
         m_hold = await position_monitor_node(st_c1, config=cfg, db=db_c1, decision_client=dec, http_client=client, now=now_dt)  # type: ignore[arg-type]
         assert m_hold["pending_order"] is None
-    # 6.1% drop from 0.28 -> 0.2629 SOL -> exits WHALE_PEAK_TRAIL!
-    async with _make_monitor_client(sol_quote=0.2629) as client:
+    # 3.6% drop from 0.2725 -> 0.2626 SOL -> exits WHALE_PEAK_TRAIL!
+    async with _make_monitor_client(sol_quote=0.2626) as client:
         m2 = await position_monitor_node(st_c1, config=cfg, db=db_c1, decision_client=dec, http_client=client, now=now_dt)  # type: ignore[arg-type]
         assert m2["pending_order"]["reason"] == "WHALE_PEAK_TRAIL"
     db_c1.close()
 
-    # (c2) WHALE_PEAK_TRAIL Tier 2 (Tight): hits +20% (0.30 SOL >= +18%), exits on 4% drop (0.288 SOL)
+    # (c2) WHALE_PEAK_TRAIL Tier 2 (Tight): hits +13% (0.2825 SOL >= +12%), exits on 2.5% drop (0.2754 SOL)
     db_c2 = AgentDatabase(db_path=str(tmp_path / "exit_c2.duckdb"), starting_sol=0.7)
     st_c2 = {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.45, "daily_pnl_sol": 0.0, "active_position": _open_whale_pos(0.25)}
-    async with _make_monitor_client(sol_quote=0.30) as client:
+    async with _make_monitor_client(sol_quote=0.2825) as client:
         mt1 = await position_monitor_node(st_c2, config=cfg, db=db_c2, decision_client=dec, http_client=client, now=now_dt)  # type: ignore[arg-type]
         assert mt1["pending_order"] is None
     st_c2.update(mt1)
-    async with _make_monitor_client(sol_quote=0.2875) as client:  # 4.17% drop from 0.30 peak
+    async with _make_monitor_client(sol_quote=0.2752) as client:  # 2.58% drop from 0.2825 peak
         mt2 = await position_monitor_node(st_c2, config=cfg, db=db_c2, decision_client=dec, http_client=client, now=now_dt)  # type: ignore[arg-type]
         assert mt2["pending_order"]["reason"] == "WHALE_PEAK_TRAIL"
     db_c2.close()
 
-    # (d) WHALE_HARD_STOP at -12% (0.25 -> 0.22 SOL)
+    # (d) WHALE_HARD_STOP at -10% (0.25 -> 0.225 SOL)
     db_d = AgentDatabase(db_path=str(tmp_path / "exit_d.duckdb"), starting_sol=0.7)
-    async with _make_monitor_client(sol_quote=0.22) as client:
+    async with _make_monitor_client(sol_quote=0.225) as client:
         mon_d = await position_monitor_node(
             {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.45, "daily_pnl_sol": 0.0, "active_position": _open_whale_pos(0.25)},
             config=cfg,
@@ -413,11 +415,11 @@ async def test_whale_scalp_five_layer_exit_engine(tmp_path):
     assert mon_d["pending_order"]["reason"] == "WHALE_HARD_STOP"
     db_d.close()
 
-    # (e) WHALE_TIME_STOP: held >= 90s with PnL < +8% -> exits; if PnL >= +8% -> holds
+    # (e) WHALE_TIME_STOP: held >= 90s with PnL < +4% -> exits; if PnL >= +4% -> holds
     db_e = AgentDatabase(db_path=str(tmp_path / "exit_e.duckdb"), starting_sol=0.7)
     opened_95s_ago = now_dt - timedelta(seconds=95)
-    # PnL = +9% (0.2725 SOL >= +8%) -> holds!
-    async with _make_monitor_client(sol_quote=0.2725) as client:
+    # PnL = +5% (0.2625 SOL >= +4%) -> holds!
+    async with _make_monitor_client(sol_quote=0.2625) as client:
         mon_e_hold = await position_monitor_node(
             {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.45, "daily_pnl_sol": 0.0, "active_position": _open_whale_pos(0.25, opened_at=opened_95s_ago)},
             config=cfg,
@@ -427,8 +429,8 @@ async def test_whale_scalp_five_layer_exit_engine(tmp_path):
             now=now_dt,
         )
     assert mon_e_hold["pending_order"] is None
-    # PnL = +4% (0.26 SOL < +8%) at 95s -> WHALE_TIME_STOP!
-    async with _make_monitor_client(sol_quote=0.26) as client:
+    # PnL = +2% (0.255 SOL < +4%) at 95s -> WHALE_TIME_STOP!
+    async with _make_monitor_client(sol_quote=0.255) as client:
         mon_e_stop = await position_monitor_node(
             {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.45, "daily_pnl_sol": 0.0, "active_position": _open_whale_pos(0.25, opened_at=opened_95s_ago)},
             config=cfg,

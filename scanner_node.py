@@ -548,10 +548,12 @@ async def scanner_node(
             )
             continue
         if not (config.WHALE_MIN_MCAP_USD <= cand_obj.market_cap_usd <= config.WHALE_MAX_MCAP_USD):
+            def _fmt_usd(v: float) -> str:
+                return f"${v / 1_000_000:.0f}M" if v >= 1_000_000 else f"${v / 1_000:.0f}K"
             mc_reason = (
-                f"MCAP < ${config.WHALE_MIN_MCAP_USD / 1000:.0f}K"
+                f"MCAP < {_fmt_usd(config.WHALE_MIN_MCAP_USD)}"
                 if cand_obj.market_cap_usd < config.WHALE_MIN_MCAP_USD
-                else f"MCAP > ${config.WHALE_MAX_MCAP_USD / 1000:.0f}K"
+                else f"MCAP > {_fmt_usd(config.WHALE_MAX_MCAP_USD)}"
             )
             db.upsert_whale_decision(w_mint, "SKIPPED", mc_reason, updated_at=now_dt.isoformat())
             logger.info(

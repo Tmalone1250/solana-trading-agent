@@ -299,10 +299,12 @@ async def safety_gate_node(
                         rejected.append({"mint": mint, "symbol": symbol, "reasons": [f"Liquidity ${liq_usd:,.0f} < ${config.WHALE_MIN_LIQUIDITY_USD:,.0f}"]})
                         continue
                     if not (config.WHALE_MIN_MCAP_USD <= mc_usd <= config.WHALE_MAX_MCAP_USD):
+                        def _fmt_usd(v: float) -> str:
+                            return f"${v / 1_000_000:.0f}M" if v >= 1_000_000 else f"${v / 1_000:.0f}K"
                         mc_reason = (
-                            f"MCAP < ${config.WHALE_MIN_MCAP_USD / 1000:.0f}K"
+                            f"MCAP < {_fmt_usd(config.WHALE_MIN_MCAP_USD)}"
                             if mc_usd < config.WHALE_MIN_MCAP_USD
-                            else f"MCAP > ${config.WHALE_MAX_MCAP_USD / 1000:.0f}K"
+                            else f"MCAP > {_fmt_usd(config.WHALE_MAX_MCAP_USD)}"
                         )
                         if db is not None:
                             db.upsert_whale_decision(mint, "SKIPPED", mc_reason, updated_at=now.isoformat() if now else None)
