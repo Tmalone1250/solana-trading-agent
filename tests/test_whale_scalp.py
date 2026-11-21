@@ -65,11 +65,12 @@ async def test_whale_scalp_fast_track_confluence_and_solo_buy_within_mcap_band(t
         WHALE_STRATEGY_ENABLED=True,
         WHALE_POSITION_SOL=0.25,
         WHALE_MIN_SOLO_BUY_SOL=1.5,
+        WHALE_MIN_UNIQUE_WALLETS=2,
         WHALE_MIN_CONFLUENCE_WALLETS=2,
         WHALE_ENTRY_MAX_AGE_SECONDS=60,
         WHALE_MIN_MCAP_USD=15_000.0,
         WHALE_MAX_MCAP_USD=50_000_000.0,
-        WHALE_MIN_LIQUIDITY_USD=10_000.0,
+        WHALE_MIN_LIQUIDITY_USD=40_000.0,
         ENABLE_JUPITER_DISCOVERY=True,
         JUPITER_REQUEST_DELAY_SECONDS=0.0,
     )
@@ -118,8 +119,8 @@ async def test_whale_scalp_fast_track_confluence_and_solo_buy_within_mcap_band(t
                         "chainId": "solana",
                         "pairAddress": "PoolMicro",
                         "baseToken": {"address": mint_conf, "symbol": "MICRO"},
-                        "marketCap": 55_000,  # cleanly inside [$15K, $120K]
-                        "liquidity": {"usd": 14_000},  # >= $10K
+                        "marketCap": 55_000,
+                        "liquidity": {"usd": 45_000},  # >= $40K
                         "volume": {"h1": 40_000, "m5": 8_000},
                         "txns": {"m5": {"buys": 12, "sells": 5}},
                     }
@@ -149,33 +150,36 @@ async def test_whale_scalp_fast_track_confluence_and_solo_buy_within_mcap_band(t
         )
 
     assert dec.called is False
-    assert result["focus_state"] == FocusState.IN_POSITION.value
-    pos = result["active_position"]
+    # Slot 2 (whale_slot) opens independently without mutating Slot 1 focus_state
+    pos = result["whale_position"]
     assert pos["mint"] == mint_conf
     assert pos["strategy"] == "WHALE_SCALP"
     assert pos["entry_sol"] == pytest.approx(0.25, rel=1e-4)
     assert pos["opened_at"] is not None
     assert set(pos["triggering_wallets"]) == {"Whale1", "Whale2"}
 
-    # Verify telemetry exposes strategy == WHALE_SCALP
+    # Verify telemetry exposes strategy == WHALE_SCALP on both live_jupiter_pnl & whale_position
     tc = TestClient(create_telemetry_app(config=cfg, db=db))
     tel = tc.get("/api/telemetry").json()
     assert tel["live_jupiter_pnl"]["strategy"] == "WHALE_SCALP"
+    assert tel["whale_position"]["strategy"] == "WHALE_SCALP"
+    assert len(tel["active_positions"]) == 1
 
-    # Solo >= 1.5 SOL buy within 60s qualifies
+    # Solo buy MUST NOT trigger when WHALE_MIN_UNIQUE_WALLETS=2
     db2 = AgentDatabase(db_path=str(tmp_path / "whale_solo.duckdb"), starting_sol=0.7)
     db2.record_whale_event(
         signature="sig-solo-1",
         wallet="WhaleBig",
         mint="MintSolo60",
         side="BUY",
-        sol_amount=1.6,
+        sol_amount=5.0,
         token_amount=500_000.0,
         timestamp_utc=(now_dt - timedelta(seconds=15)).isoformat(),
     )
-    trigs = db2.get_whale_fast_track_triggers(max_age_seconds=60, min_solo_sol=1.5, now=now_dt)
-    assert len(trigs) == 1
-    assert trigs[0]["trigger_type"] == "SOLO"
+    trigs = db2.get_whale_fast_track_triggers(
+        max_age_seconds=60, min_confluence_wallets=2, min_solo_sol=1.5, now=now_dt
+    )
+    assert trigs == []
 
     db.close()
     db2.close()
@@ -201,56 +205,36 @@ async def test_whale_scalp_mcap_band_gating_stale_60s_and_is_sus(tmp_path):
     now_dt = datetime.now(timezone.utc)
     now_ms = int(now_dt.timestamp() * 1000)
 
+    def _seed_confluence(m: str, age_sec: int, tag: str) -> None:
+        db.record_whale_event(
+            signature=f"sig-{tag}-1",
+            wallet=f"W{tag}A",
+            mint=m,
+            side="BUY",
+            sol_amount=2.0,
+            token_amount=100_000.0,
+            timestamp_utc=(now_dt - timedelta(seconds=age_sec + 5)).isoformat(),
+        )
+        db.record_whale_event(
+            signature=f"sig-{tag}-2",
+            wallet=f"W{tag}B",
+            mint=m,
+            side="BUY",
+            sol_amount=2.0,
+            token_amount=100_000.0,
+            timestamp_utc=(now_dt - timedelta(seconds=age_sec)).isoformat(),
+        )
+
     # 1. Stale (> 60s) -> ignored
-    db.record_whale_event(
-        signature="sig-stale",
-        wallet="W1",
-        mint="MintStale",
-        side="BUY",
-        sol_amount=2.0,
-        token_amount=100_000.0,
-        timestamp_utc=(now_dt - timedelta(seconds=75)).isoformat(),
-    )
+    _seed_confluence("MintStale", 75, "stale")
     # 2. Too small MCAP ($10K < $15K) -> rejected
-    db.record_whale_event(
-        signature="sig-small",
-        wallet="W2",
-        mint="MintTooSmall",
-        side="BUY",
-        sol_amount=2.0,
-        token_amount=100_000.0,
-        timestamp_utc=(now_dt - timedelta(seconds=10)).isoformat(),
-    )
+    _seed_confluence("MintTooSmall", 10, "small")
     # 3. Too large MCAP ($60M > $50M) -> rejected
-    db.record_whale_event(
-        signature="sig-large",
-        wallet="W3",
-        mint="MintTooLarge",
-        side="BUY",
-        sol_amount=2.0,
-        token_amount=100_000.0,
-        timestamp_utc=(now_dt - timedelta(seconds=10)).isoformat(),
-    )
+    _seed_confluence("MintTooLarge", 10, "large")
     # 4. Inside MCAP band ($14M) but Jupiter audit.isSus == True -> rejected
-    db.record_whale_event(
-        signature="sig-sus",
-        wallet="W4",
-        mint="MintSus",
-        side="BUY",
-        sol_amount=2.0,
-        token_amount=100_000.0,
-        timestamp_utc=(now_dt - timedelta(seconds=10)).isoformat(),
-    )
+    _seed_confluence("MintSus", 10, "sus")
     # 5. Valid $14M mid/high-cap whale runner (inside [$15K, $50M]), liq $500K, clean -> ACCEPTED
-    db.record_whale_event(
-        signature="sig-ok",
-        wallet="W5",
-        mint="MintJustRight",
-        side="BUY",
-        sol_amount=2.0,
-        token_amount=100_000.0,
-        timestamp_utc=(now_dt - timedelta(seconds=10)).isoformat(),
-    )
+    _seed_confluence("MintJustRight", 10, "ok")
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
@@ -415,12 +399,13 @@ async def test_whale_scalp_five_layer_exit_engine(tmp_path):
     assert mon_d["pending_order"]["reason"] == "WHALE_HARD_STOP"
     db_d.close()
 
-    # (e) WHALE_TIME_STOP: held >= 90s with PnL < +4% -> exits; if PnL >= +4% -> holds
+    # (e) WHALE_TIME_STOP: default 300s from config (holds at 95s, exits at 305s if PnL < +4%)
     db_e = AgentDatabase(db_path=str(tmp_path / "exit_e.duckdb"), starting_sol=0.7)
     opened_95s_ago = now_dt - timedelta(seconds=95)
-    # PnL = +5% (0.2625 SOL >= +4%) -> holds!
-    async with _make_monitor_client(sol_quote=0.2625) as client:
-        mon_e_hold = await position_monitor_node(
+    opened_305s_ago = now_dt - timedelta(seconds=305)
+    # At 95s (< 300s) with +2% PnL -> still holds!
+    async with _make_monitor_client(sol_quote=0.255) as client:
+        mon_e_early = await position_monitor_node(
             {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.45, "daily_pnl_sol": 0.0, "active_position": _open_whale_pos(0.25, opened_at=opened_95s_ago)},
             config=cfg,
             db=db_e,
@@ -428,11 +413,22 @@ async def test_whale_scalp_five_layer_exit_engine(tmp_path):
             http_client=client,
             now=now_dt,
         )
+    assert mon_e_early["pending_order"] is None
+    # At 305s (>= 300s) with +5% PnL (>= +4%) -> holds!
+    async with _make_monitor_client(sol_quote=0.2625) as client:
+        mon_e_hold = await position_monitor_node(
+            {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.45, "daily_pnl_sol": 0.0, "active_position": _open_whale_pos(0.25, opened_at=opened_305s_ago)},
+            config=cfg,
+            db=db_e,
+            decision_client=dec,  # type: ignore[arg-type]
+            http_client=client,
+            now=now_dt,
+        )
     assert mon_e_hold["pending_order"] is None
-    # PnL = +2% (0.255 SOL < +4%) at 95s -> WHALE_TIME_STOP!
+    # At 305s (>= 300s) with +2% PnL (< +4%) -> WHALE_TIME_STOP!
     async with _make_monitor_client(sol_quote=0.255) as client:
         mon_e_stop = await position_monitor_node(
-            {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.45, "daily_pnl_sol": 0.0, "active_position": _open_whale_pos(0.25, opened_at=opened_95s_ago)},
+            {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.45, "daily_pnl_sol": 0.0, "active_position": _open_whale_pos(0.25, opened_at=opened_305s_ago)},
             config=cfg,
             db=db_e,
             decision_client=dec,  # type: ignore[arg-type]

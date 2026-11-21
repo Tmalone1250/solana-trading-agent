@@ -85,6 +85,27 @@ async def executor_node(
 
     order = PendingOrder.model_validate(raw_order)
     is_buy = order.side.upper() == "BUY"
+    is_whale_slot = (
+        str(state.get("slot") or "").lower() == "whale_slot"
+        or str(order.strategy or "").upper() == "WHALE_SCALP"
+    )
+
+    # Shared Guard: No Duplicate Mint across Slot 1 (chart_slot) and Slot 2 (whale_slot)
+    if is_buy:
+        st_live = db.get_state()
+        other_pos = (
+            state.get("active_position") if is_whale_slot else state.get("whale_position")
+        )
+        if other_pos is None:
+            other_pos = st_live.get("active_position") if is_whale_slot else st_live.get("whale_position")
+        if isinstance(other_pos, dict) and other_pos.get("mint") == order.mint:
+            logger.warning(
+                "[Executor] Duplicate mint guard blocked %s BUY of %s (already open in %s)",
+                "whale_slot" if is_whale_slot else "chart_slot",
+                order.symbol,
+                "chart_slot" if is_whale_slot else "whale_slot",
+            )
+            return {"pending_order": None}
 
     input_mint = SOL_MINT if is_buy else order.mint
     output_mint = order.mint if is_buy else SOL_MINT
@@ -132,7 +153,11 @@ async def executor_node(
 
     sol_balance = float(state.get("sol_balance") or 0.0)
     daily_pnl_sol = float(state.get("daily_pnl_sol") or 0.0)
-    existing_pos_dict = state.get("active_position")
+    existing_pos_dict = (
+        state.get("whale_position") if is_whale_slot else state.get("active_position")
+    )
+    if existing_pos_dict is None and is_whale_slot:
+        existing_pos_dict = state.get("active_position")
     new_pos_dict: Optional[dict[str, Any]] = None
     next_state = order.target_state_after_fill.value
 
@@ -140,6 +165,12 @@ async def executor_node(
         spent_sol = order.amount_atomic / LAMPORTS_PER_SOL
         sol_balance = max(0.0, sol_balance - spent_sol)
         pos_strategy = order.strategy or "SCALPER"
+        prev_reentries = (
+            int(existing_pos_dict.get("reentry_count") or 0)
+            if isinstance(existing_pos_dict, dict) and existing_pos_dict.get("mint") == order.mint
+            else 0
+        )
+        next_reentry_count = (prev_reentries + 1) if order.reason == "LEG_2_REENTRY" else 0
         pos = ActivePosition(
             mint=order.mint,
             symbol=order.symbol,
@@ -150,6 +181,8 @@ async def executor_node(
             whale_shadow_exit_flag=False,
             opened_at=utc_now_iso(),
             entry_liquidity_usd=order.entry_liquidity_usd,
+            entry_mc_usd=order.entry_mc_usd,
+            whale_sol_flow=order.whale_sol_flow,
             current_sol_value=spent_sol,
             peak_sol_value=spent_sol,
             breakeven_armed=False,
@@ -158,6 +191,7 @@ async def executor_node(
             run_peak_sol=None,
             watch_started_at=None,
             reference_token_amount=out_amount,
+            reentry_count=next_reentry_count,
             last_liquidity_usd=order.entry_liquidity_usd,
         )
         new_pos_dict = pos.model_dump()
@@ -190,8 +224,10 @@ async def executor_node(
             reason=order.reason,
             sol_equity=round(sol_balance, 6),
             daily_realized_sol=round(daily_pnl_sol, 6),
+            mc_usd=order.entry_mc_usd,
             liq_usd=round(order.entry_liquidity_usd, 2) if order.entry_liquidity_usd else None,
             triggering_whales=",".join(order.triggering_wallets) if order.triggering_wallets else None,
+            whale_sol_flow=order.whale_sol_flow,
         )
         logger.info(
             "[%s] BUY %s: %.4f SOL -> %d tokens (reason=%s)",
@@ -279,6 +315,24 @@ async def executor_node(
             triggering_wallets=pos_trig_wallets,
             opened_at=pos_opened_at,
         )
+        pos_mc_usd = (
+            order.entry_mc_usd
+            if order.entry_mc_usd is not None
+            else (
+                existing_pos_dict.get("entry_mc_usd")
+                if isinstance(existing_pos_dict, dict)
+                else None
+            )
+        )
+        pos_whale_flow = (
+            order.whale_sol_flow
+            if order.whale_sol_flow is not None
+            else (
+                existing_pos_dict.get("whale_sol_flow")
+                if isinstance(existing_pos_dict, dict)
+                else None
+            )
+        )
         db.log_action(
             mode=config.EXECUTION_MODE,
             action="SELL",
@@ -293,10 +347,12 @@ async def executor_node(
             reason=order.reason,
             sol_equity=round(sol_balance, 6),
             daily_realized_sol=round(daily_pnl_sol, 6),
+            mc_usd=pos_mc_usd,
             liq_usd=round(pos_liq_usd, 2) if pos_liq_usd else None,
             peak_pnl_pct=peak_pnl_pct_val,
             hold_seconds=hold_sec_val,
             triggering_whales=",".join(pos_trig_wallets) if pos_trig_wallets else None,
+            whale_sol_flow=pos_whale_flow,
         )
 
         if order.target_state_after_fill == FocusState.WATCHING_REENTRY:
@@ -310,11 +366,17 @@ async def executor_node(
                 if isinstance(existing_pos_dict, dict)
                 else 0.0
             )
+            prev_reentry_count = (
+                int(existing_pos_dict.get("reentry_count") or 0)
+                if isinstance(existing_pos_dict, dict)
+                else 0
+            )
             watch_pos = ActivePosition(
                 mint=order.mint,
                 symbol=order.symbol,
                 entry_sol=entry_sol,
                 token_amount=0,
+                strategy=pos_strategy,
                 entry_liquidity_usd=prev_liq,
                 current_sol_value=received_sol,
                 peak_sol_value=prev_peak,
@@ -324,6 +386,7 @@ async def executor_node(
                 run_peak_sol=prev_peak,
                 watch_started_at=utc_now_iso(),
                 reference_token_amount=order.amount_atomic,
+                reentry_count=prev_reentry_count,
                 last_liquidity_usd=prev_liq,
             )
             new_pos_dict = watch_pos.model_dump()
@@ -343,6 +406,30 @@ async def executor_node(
             order.reason,
             next_state,
         )
+
+    if is_whale_slot:
+        db.save_whale_state(
+            whale_position=new_pos_dict,
+            sol_balance=sol_balance,
+            daily_pnl_sol=daily_pnl_sol,
+            last_decision_rationale=order.rationale or state.get("last_decision_rationale"),
+        )
+        return {
+            "focus_state": state.get("focus_state", FocusState.SCANNING.value),
+            "sol_balance": sol_balance,
+            "daily_pnl_sol": daily_pnl_sol,
+            "whale_position": new_pos_dict,
+            "pending_order": None,
+            "last_execution": {
+                "side": order.side,
+                "mint": order.mint,
+                "symbol": order.symbol,
+                "in_amount": order.amount_atomic,
+                "out_amount": out_amount,
+                "tx_signature": tx_signature,
+                "reason": order.reason,
+            },
+        }
 
     db.save_state(
         focus_state=next_state,

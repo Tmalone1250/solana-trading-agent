@@ -156,141 +156,25 @@ async def position_monitor_node(
         peak_pnl_pct = (pos.peak_sol_value - pos.entry_sol) / pos.entry_sol if pos.entry_sol > 0 else 0.0
 
         # ---------------------------------------------------------------------
-        # Dedicated WHALE_SCALP 5-Layer Exit Engine (strict priority order)
+        # Dedicated WHALE_SCALP 6-Layer Exit Engine (delegated to whale_lane.py)
         # ---------------------------------------------------------------------
         if str(pos.strategy or "").upper() == "WHALE_SCALP":
+            from whale_lane import evaluate_whale_exit_order
+
             now_dt = now or utc_now()
-            pnl_pct_100 = pnl_pct * 100.0
-            peak_pnl_pct_100 = peak_pnl_pct * 100.0
-            if peak_pnl_pct_100 + EPS >= config.WHALE_TRAIL_ARM_PCT:
-                pos.trail_armed = True
-
-            # (a) Exit A (Whale Shadow): triggering whale sold this mint
-            db_shadow_flag = bool(db.get_state().get("whale_shadow_exit_requested", False))
-            if pos.whale_shadow_exit_flag or db_shadow_flag:
-                reason = "WHALE_SHADOW_EXIT"
-                order = PendingOrder(
-                    side="SELL",
-                    mint=pos.mint,
-                    symbol=pos.symbol,
-                    amount_atomic=pos.token_amount,
-                    reason=reason,
-                    target_state_after_fill=FocusState.SCANNING,
-                    apply_cooldown=True,
-                    strategy="WHALE_SCALP",
-                    triggering_wallets=list(pos.triggering_wallets),
-                    rationale=f"[WHALE_SCALP EXIT] {pos.symbol}: {reason} (triggering whale sold)",
-                )
+            exit_order, monitor_event = evaluate_whale_exit_order(
+                pos,
+                current_sol_value=current_sol_value,
+                config=config,
+                db=db,
+                now_dt=now_dt,
+            )
+            if exit_order is not None:
                 return {
                     "active_position": pos.model_dump(),
-                    "pending_order": order.model_dump(),
-                    "monitor_event": reason,
+                    "pending_order": exit_order.model_dump(),
+                    "monitor_event": monitor_event,
                 }
-
-            # (b) Exit B (Front-Run TP): hard take-profit at +25%
-            if pnl_pct_100 + EPS >= config.WHALE_TP_PCT:
-                reason = "WHALE_FRONT_RUN_TP"
-                order = PendingOrder(
-                    side="SELL",
-                    mint=pos.mint,
-                    symbol=pos.symbol,
-                    amount_atomic=pos.token_amount,
-                    reason=reason,
-                    target_state_after_fill=FocusState.SCANNING,
-                    apply_cooldown=True,
-                    strategy="WHALE_SCALP",
-                    triggering_wallets=list(pos.triggering_wallets),
-                    rationale=f"[WHALE_SCALP TP] {pos.symbol}: {reason} ({pnl_pct_100:+.2f}% >= +{config.WHALE_TP_PCT:.0f}%)",
-                )
-                return {
-                    "active_position": pos.model_dump(),
-                    "pending_order": order.model_dump(),
-                    "monitor_event": reason,
-                }
-
-            # (c) Exit C (2-Tier Peak Drawdown):
-            # 6% drop from peak once >= +10%, tightening to 4% once >= +18%
-            if pos.trail_armed and pos.peak_sol_value > 0:
-                active_drop_limit = (
-                    config.WHALE_TIGHT_TRAIL_DROP_PCT
-                    if peak_pnl_pct_100 + EPS >= config.WHALE_TIGHT_TRAIL_ARM_PCT
-                    else config.WHALE_TRAIL_DROP_PCT
-                )
-                drop_from_peak_100 = ((pos.peak_sol_value - current_sol_value) / pos.peak_sol_value) * 100.0
-                if drop_from_peak_100 + EPS >= active_drop_limit:
-                    reason = "WHALE_PEAK_TRAIL"
-                    order = PendingOrder(
-                        side="SELL",
-                        mint=pos.mint,
-                        symbol=pos.symbol,
-                        amount_atomic=pos.token_amount,
-                        reason=reason,
-                        target_state_after_fill=FocusState.SCANNING,
-                        apply_cooldown=True,
-                        strategy="WHALE_SCALP",
-                        triggering_wallets=list(pos.triggering_wallets),
-                        rationale=(
-                            f"[WHALE_SCALP TRAIL] {pos.symbol}: {reason} "
-                            f"(peak {peak_pnl_pct_100:+.2f}%, drop -{drop_from_peak_100:.2f}% >= -{active_drop_limit:.0f}%)"
-                        ),
-                    )
-                    return {
-                        "active_position": pos.model_dump(),
-                        "pending_order": order.model_dump(),
-                        "monitor_event": reason,
-                    }
-
-            # (d) Exit D (Hard Stop): hard stop-loss at -12%
-            if pnl_pct_100 <= config.WHALE_HARD_STOP_PCT + EPS:
-                reason = "WHALE_HARD_STOP"
-                order = PendingOrder(
-                    side="SELL",
-                    mint=pos.mint,
-                    symbol=pos.symbol,
-                    amount_atomic=pos.token_amount,
-                    reason=reason,
-                    target_state_after_fill=FocusState.SCANNING,
-                    apply_cooldown=True,
-                    strategy="WHALE_SCALP",
-                    triggering_wallets=list(pos.triggering_wallets),
-                    rationale=f"[WHALE_SCALP STOP] {pos.symbol}: {reason} ({pnl_pct_100:+.2f}% <= {config.WHALE_HARD_STOP_PCT:.0f}%)",
-                )
-                return {
-                    "active_position": pos.model_dump(),
-                    "pending_order": order.model_dump(),
-                    "monitor_event": reason,
-                }
-
-            # (e) Exit E (Time Stop): held >= 90s with PnL < +8%
-            if pos.opened_at:
-                opened_dt = datetime.fromisoformat(pos.opened_at)
-                if opened_dt.tzinfo is None:
-                    opened_dt = opened_dt.replace(tzinfo=timezone.utc)
-                held_sec = (now_dt - opened_dt).total_seconds()
-                if held_sec + EPS >= config.WHALE_TIME_STOP_SECONDS and pnl_pct_100 + EPS < config.WHALE_TIME_STOP_MIN_PNL_PCT:
-                    reason = "WHALE_TIME_STOP"
-                    order = PendingOrder(
-                        side="SELL",
-                        mint=pos.mint,
-                        symbol=pos.symbol,
-                        amount_atomic=pos.token_amount,
-                        reason=reason,
-                        target_state_after_fill=FocusState.SCANNING,
-                        apply_cooldown=True,
-                        strategy="WHALE_SCALP",
-                        triggering_wallets=list(pos.triggering_wallets),
-                        rationale=(
-                            f"[WHALE_SCALP TIME] {pos.symbol}: {reason} "
-                            f"(held {held_sec:.0f}s >= {config.WHALE_TIME_STOP_SECONDS}s, "
-                            f"PnL {pnl_pct_100:+.2f}% < +{config.WHALE_TIME_STOP_MIN_PNL_PCT:.0f}%)"
-                        ),
-                    )
-                    return {
-                        "active_position": pos.model_dump(),
-                        "pending_order": order.model_dump(),
-                        "monitor_event": reason,
-                    }
-
             pos_dict = pos.model_dump()
             db.save_state(
                 focus_state=FocusState.IN_POSITION.value,
@@ -301,7 +185,7 @@ async def position_monitor_node(
             return {
                 "active_position": pos_dict,
                 "pending_order": None,
-                "monitor_event": "HOLD_WHALE_SCALP",
+                "monitor_event": monitor_event,
             }
 
         if peak_pnl_pct + EPS >= config.BREAKEVEN_ARM_PCT:
@@ -348,13 +232,20 @@ async def position_monitor_node(
                 "monitor_event": exodus_reason,
             }
 
-        # 3. Trailing TP (+12% armed, -6% pullback from peak) -> 100% sell -> WATCHING_REENTRY
+        # 3. Trailing TP (+12% armed, -6% pullback from peak) -> WATCHING_REENTRY (or SCANNING + cooldown if max re-entries hit)
         if pos.trail_armed and pos.peak_sol_value > 0:
             pullback_pct = (pos.peak_sol_value - current_sol_value) / pos.peak_sol_value
             if pullback_pct + EPS >= config.TRAIL_PULLBACK_PCT:
+                at_reentry_cap = pos.reentry_count >= config.MAX_REENTRIES_PER_MINT
+                target_state = FocusState.SCANNING if at_reentry_cap else FocusState.WATCHING_REENTRY
+                cap_suffix = (
+                    f" [MAX_REENTRIES={pos.reentry_count}/{config.MAX_REENTRIES_PER_MINT} -> COOLDOWN]"
+                    if at_reentry_cap
+                    else ""
+                )
                 reason = (
                     f"TRAILING_TP (peak {peak_pnl_pct * 100:+.2f}%, "
-                    f"pullback -{pullback_pct * 100:.2f}% >= -{config.TRAIL_PULLBACK_PCT * 100:.0f}%)"
+                    f"pullback -{pullback_pct * 100:.2f}% >= -{config.TRAIL_PULLBACK_PCT * 100:.0f}%){cap_suffix}"
                 )
                 order = PendingOrder(
                     side="SELL",
@@ -362,11 +253,11 @@ async def position_monitor_node(
                     symbol=pos.symbol,
                     amount_atomic=pos.token_amount,
                     reason=reason,
-                    target_state_after_fill=FocusState.WATCHING_REENTRY,
-                    apply_cooldown=False,
+                    target_state_after_fill=target_state,
+                    apply_cooldown=at_reentry_cap,
                     run_peak_sol=pos.peak_sol_value,
                     strategy=pos.strategy or "SCALPER",
-                    rationale=f"[MONITOR TP] {pos.symbol}: {reason} -> WATCHING_REENTRY",
+                    rationale=f"[MONITOR TP] {pos.symbol}: {reason} -> {target_state.value}",
                 )
                 return {
                     "active_position": pos.model_dump(),
@@ -420,6 +311,26 @@ async def position_monitor_node(
     if current_sol_value < retrace_low:
         retrace_low = current_sol_value
         pos.retrace_low_sol = retrace_low
+
+    # Abandonment 0: Max re-entries per mint reached -> cooldown + SCANNING
+    if pos.reentry_count >= config.MAX_REENTRIES_PER_MINT:
+        reason = f"MAX_REENTRIES_PER_MINT ({pos.reentry_count}/{config.MAX_REENTRIES_PER_MINT})"
+        db.set_cooldown(pos.mint, hours=config.COOLDOWN_HOURS, reason=reason)
+        rationale = f"[WATCH ABANDON] {pos.symbol}: {reason} -> SCANNING"
+        db.save_state(
+            focus_state=FocusState.SCANNING.value,
+            sol_balance=sol_balance,
+            daily_pnl_sol=daily_pnl_sol,
+            active_position=None,
+            last_decision_rationale=rationale,
+        )
+        return {
+            "focus_state": FocusState.SCANNING.value,
+            "active_position": None,
+            "pending_order": None,
+            "monitor_event": reason,
+            "last_decision_rationale": rationale,
+        }
 
     # Abandonment 1: Exodus
     if is_exodus:
@@ -512,6 +423,62 @@ async def position_monitor_node(
             db=db,
         )
         if reentry_dec.approved:
+            # Anti-Chase Guard: re-check live Jupiter quote after Decision-1 latency
+            curl_trigger_sol = current_sol_value
+            recheck_owns = http_client is None
+            recheck_client = http_client or httpx.AsyncClient()
+            try:
+                recheck_resp = await fetch_jupiter_order(
+                    input_mint=pos.mint,
+                    output_mint=SOL_MINT,
+                    amount_atomic=quote_amount,
+                    config=config,
+                    client=recheck_client,
+                    taker=None,
+                )
+                live_sol_value = int(recheck_resp["outAmount"]) / LAMPORTS_PER_SOL
+            finally:
+                if recheck_owns:
+                    await recheck_client.aclose()
+
+            chase_pct = (
+                (live_sol_value - curl_trigger_sol) / curl_trigger_sol
+                if curl_trigger_sol > 0
+                else 0.0
+            )
+            exceeded_chase = chase_pct > config.MAX_REENTRY_CHASE_PCT + EPS
+            exceeded_peak = run_peak > 0 and live_sol_value > run_peak + EPS
+            if exceeded_chase or exceeded_peak:
+                abort_reason = (
+                    f"REENTRY_ANTI_CHASE (live={live_sol_value:.4f} vs trigger={curl_trigger_sol:.4f} "
+                    f"[{chase_pct * 100:+.1f}% > +{config.MAX_REENTRY_CHASE_PCT * 100:.0f}%], "
+                    f"prior_peak={run_peak:.4f})"
+                )
+                rationale = f"[REENTRY ABORT] {pos.symbol}: {abort_reason} -> SCANNING"
+                logger.warning(rationale)
+                db.log_action(
+                    mode=config.EXECUTION_MODE,
+                    action="EVICT",
+                    symbol=pos.symbol,
+                    asset_id=pos.mint,
+                    strategy="LEG2_ENTRY",
+                    reason=abort_reason,
+                )
+                db.save_state(
+                    focus_state=FocusState.SCANNING.value,
+                    sol_balance=sol_balance,
+                    daily_pnl_sol=daily_pnl_sol,
+                    active_position=None,
+                    last_decision_rationale=rationale,
+                )
+                return {
+                    "focus_state": FocusState.SCANNING.value,
+                    "active_position": None,
+                    "pending_order": None,
+                    "monitor_event": "LEG_2_REENTRY_ABORT_CHASE",
+                    "last_decision_rationale": rationale,
+                }
+
             order = PendingOrder(
                 side="BUY",
                 mint=pos.mint,
@@ -521,6 +488,7 @@ async def position_monitor_node(
                 target_state_after_fill=FocusState.IN_POSITION,
                 apply_cooldown=False,
                 entry_liquidity_usd=current_liq or pos.entry_liquidity_usd,
+                strategy="LEG2_ENTRY",
                 rationale=reentry_dec.rationale,
             )
             return {

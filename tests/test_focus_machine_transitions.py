@@ -398,3 +398,120 @@ async def test_langgraph_end_to_end_and_telemetry_api(tmp_path):
     assert closed["exit_reason"] == "TRAILING_TP"
     assert closed["closed_at"]
     db.close()
+
+
+@pytest.mark.asyncio
+async def test_reentry_anti_chase_aborts_if_price_rips_during_decision_1(tmp_path):
+    db = AgentDatabase(db_path=str(tmp_path / "anti_chase.duckdb"), starting_sol=0.7)
+    cfg = AgentConfig(_env_file=None, MAX_REENTRY_CHASE_PCT=0.08)
+    leg2_approve = StubDecisionClient(
+        {
+            "leg_2_momentum": {"type": "score", "score": 4.2, "confidence": 0.90},
+            "is_dead_cat_bounce": {"type": "noul", "noul": 0.12, "confidence": 0.88},
+        }
+    )
+    watch_pos = ActivePosition(
+        mint="MintJensen111111111111111111111111111111111",
+        symbol="JENSEN",
+        entry_sol=0.5,
+        token_amount=0,
+        entry_liquidity_usd=100_000.0,
+        current_sol_value=0.48,
+        peak_sol_value=0.65,
+        run_peak_sol=0.65,
+        retrace_low_sol=0.48,
+        reference_token_amount=1_000_000,
+        watch_started_at=datetime.now(timezone.utc).isoformat(),
+    ).model_dump()
+
+    # 1st Jupiter quote = 0.5099 SOL (+6.2% curl trigger); 2nd re-check quote = 0.6018 SOL (+18% rip during Decision-1)
+    quote_calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/swap/v2/order" in str(request.url):
+            quote_calls["n"] += 1
+            sol_val = 0.5099 if quote_calls["n"] == 1 else 0.6018
+            return httpx.Response(200, json={"outAmount": str(int(round(sol_val * 1_000_000_000))), "transaction": None})
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "chainId": "solana",
+                    "liquidity": {"usd": 100_000.0},
+                    "volume": {"h1": 240_000.0, "m5": 36_000.0},
+                    "priceChange": {"h1": 28.0, "m5": 5.0},
+                    "txns": {"m5": {"buys": 65, "sells": 35}},
+                }
+            ],
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        res = await position_monitor_node(
+            {"focus_state": FocusState.WATCHING_REENTRY.value, "sol_balance": 0.80, "daily_pnl_sol": 0.10, "active_position": watch_pos},
+            config=cfg,
+            db=db,
+            decision_client=leg2_approve,  # type: ignore[arg-type]
+            http_client=client,
+        )
+
+    assert quote_calls["n"] == 2
+    assert res["pending_order"] is None
+    assert res["focus_state"] == FocusState.SCANNING.value
+    assert res["active_position"] is None
+    assert res["monitor_event"] == "LEG_2_REENTRY_ABORT_CHASE"
+    assert "REENTRY_ANTI_CHASE" in res["last_decision_rationale"]
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_max_reentries_per_mint_puts_mint_on_cooldown_after_second_reentry(tmp_path):
+    db = AgentDatabase(db_path=str(tmp_path / "max_reentries.duckdb"), starting_sol=0.7)
+    cfg = AgentConfig(_env_file=None, MAX_REENTRIES_PER_MINT=2)
+    dec = StubDecisionClient({})
+    mint = "MintExhaust11111111111111111111111111111111"
+
+    # Position on its 2nd re-entry leg (3rd total trade on this mint) with trailing TP armed
+    pos_leg3 = ActivePosition(
+        mint=mint,
+        symbol="EXH",
+        entry_sol=0.5,
+        token_amount=1_000_000,
+        strategy="LEG2_ENTRY",
+        entry_liquidity_usd=100_000.0,
+        current_sol_value=0.60,
+        peak_sol_value=0.60,
+        trail_armed=True,
+        reentry_count=2,
+    ).model_dump()
+
+    # Pulls back -6.5% from 0.60 peak -> 0.561 SOL -> hits Trailing TP, must exit to SCANNING + cooldown (NOT WATCHING_REENTRY)
+    async with _make_monitor_client(sol_quote=0.561) as client:
+        mon = await position_monitor_node(
+            {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.2, "daily_pnl_sol": 0.1, "active_position": pos_leg3},
+            config=cfg,
+            db=db,
+            decision_client=dec,  # type: ignore[arg-type]
+            http_client=client,
+        )
+        assert mon["pending_order"] is not None
+        assert mon["pending_order"]["target_state_after_fill"] == FocusState.SCANNING.value
+        assert mon["pending_order"]["apply_cooldown"] is True
+        assert "MAX_REENTRIES=2/2" in mon["pending_order"]["reason"]
+
+        ex = await executor_node(
+            {
+                "focus_state": FocusState.IN_POSITION.value,
+                "sol_balance": 0.2,
+                "daily_pnl_sol": 0.1,
+                "active_position": mon["active_position"],
+                "pending_order": mon["pending_order"],
+            },
+            config=cfg,
+            db=db,
+            http_client=client,
+        )
+
+    assert ex["focus_state"] == FocusState.SCANNING.value
+    assert ex["active_position"] is None
+    assert db.is_on_cooldown(mint)
+    db.close()

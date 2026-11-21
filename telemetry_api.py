@@ -51,36 +51,44 @@ def create_telemetry_app(
     async def get_telemetry() -> dict[str, Any]:
         st = database.get_state()
         pos = st.get("active_position")
+        whale_pos = st.get("whale_position")
 
-        live_pnl: Optional[dict[str, Any]] = None
-        active_mint: Optional[str] = None
-        active_symbol: Optional[str] = None
-
-        if isinstance(pos, dict):
-            active_mint = pos.get("mint")
-            active_symbol = pos.get("symbol")
-            entry_sol = float(pos.get("entry_sol") or 0.0)
-            current_sol = float(pos.get("current_sol_value") or 0.0)
-            peak_sol = float(pos.get("peak_sol_value") or 0.0)
-            pnl_sol = current_sol - entry_sol if entry_sol > 0 else 0.0
-            pnl_pct = (pnl_sol / entry_sol) * 100.0 if entry_sol > 0 else 0.0
-            live_pnl = {
-                "strategy": str(pos.get("strategy") or st.get("strategy") or "SCALPER"),
-                "triggering_wallets": list(pos.get("triggering_wallets") or st.get("triggering_wallets") or []),
-                "entry_sol": round(entry_sol, 6),
-                "current_sol_value": round(current_sol, 6),
-                "peak_sol_value": round(peak_sol, 6),
-                "pnl_sol": round(pnl_sol, 6),
-                "pnl_pct": round(pnl_pct, 2),
-                "breakeven_armed": bool(pos.get("breakeven_armed", False)),
-                "trail_armed": bool(pos.get("trail_armed", False)),
-                "retrace_low_sol": pos.get("retrace_low_sol"),
-                "run_peak_sol": pos.get("run_peak_sol"),
-                "watch_started_at": pos.get("watch_started_at"),
-                "last_5m_buy_ratio": pos.get("last_5m_buy_ratio"),
-                "last_5m_sell_ratio": pos.get("last_5m_sell_ratio"),
-                "last_liquidity_usd": pos.get("last_liquidity_usd"),
+        def _build_slot_pnl(p: dict[str, Any], slot_name: str) -> dict[str, Any]:
+            e_sol = float(p.get("entry_sol") or 0.0)
+            c_sol = float(p.get("current_sol_value") or 0.0)
+            pk_sol = float(p.get("peak_sol_value") or 0.0)
+            p_sol = c_sol - e_sol if e_sol > 0 else 0.0
+            p_pct = (p_sol / e_sol) * 100.0 if e_sol > 0 else 0.0
+            return {
+                "slot": slot_name,
+                "mint": p.get("mint"),
+                "symbol": p.get("symbol"),
+                "strategy": str(p.get("strategy") or ("WHALE_SCALP" if slot_name == "whale_slot" else st.get("strategy") or "SCALPER")),
+                "triggering_wallets": list(p.get("triggering_wallets") or []),
+                "entry_sol": round(e_sol, 6),
+                "current_sol_value": round(c_sol, 6),
+                "peak_sol_value": round(pk_sol, 6),
+                "pnl_sol": round(p_sol, 6),
+                "pnl_pct": round(p_pct, 2),
+                "breakeven_armed": bool(p.get("breakeven_armed", False)),
+                "trail_armed": bool(p.get("trail_armed", False)),
+                "retrace_low_sol": p.get("retrace_low_sol"),
+                "run_peak_sol": p.get("run_peak_sol"),
+                "watch_started_at": p.get("watch_started_at"),
+                "last_5m_buy_ratio": p.get("last_5m_buy_ratio"),
+                "last_5m_sell_ratio": p.get("last_5m_sell_ratio"),
+                "last_liquidity_usd": p.get("last_liquidity_usd"),
             }
+
+        chart_live_pnl = _build_slot_pnl(pos, "chart_slot") if isinstance(pos, dict) else None
+        whale_live_pnl = _build_slot_pnl(whale_pos, "whale_slot") if isinstance(whale_pos, dict) else None
+        active_positions = [p for p in (chart_live_pnl, whale_live_pnl) if p is not None]
+
+        # Backward-compatible primary focus fields (Slot 1 primary; fallback to Slot 2 if Slot 1 idle)
+        primary_pos = pos if isinstance(pos, dict) else (whale_pos if isinstance(whale_pos, dict) else None)
+        live_pnl = chart_live_pnl or whale_live_pnl
+        active_mint = primary_pos.get("mint") if isinstance(primary_pos, dict) else None
+        active_symbol = primary_pos.get("symbol") if isinstance(primary_pos, dict) else None
 
         daily_start = float(st.get("daily_start_sol") or cfg.PAPER_STARTING_SOL)
         daily_pnl = float(st.get("daily_pnl_sol") or 0.0)
@@ -163,13 +171,19 @@ def create_telemetry_app(
         whale_decisions = database.get_whale_decisions()
 
         # Enrich active_signals (Confluence) with agent_status & agent_reason
-        open_whale_mint = (
-            pos.get("mint")
-            if isinstance(pos, dict)
-            and st["focus_state"] == "IN_POSITION"
-            and str(pos.get("strategy") or st.get("strategy") or "").upper() == "WHALE_SCALP"
-            else None
+        open_whale_pos = (
+            whale_pos
+            if isinstance(whale_pos, dict)
+            else (
+                pos
+                if isinstance(pos, dict)
+                and st["focus_state"] == "IN_POSITION"
+                and str(pos.get("strategy") or st.get("strategy") or "").upper() == "WHALE_SCALP"
+                else None
+            )
         )
+        open_whale_mint = open_whale_pos.get("mint") if isinstance(open_whale_pos, dict) else None
+        open_whale_pnl = whale_live_pnl or live_pnl
         enriched_signals: list[dict[str, Any]] = []
         for sig in active_whales.values():
             dec_info = whale_decisions.get(sig["mint"])
@@ -210,8 +224,8 @@ def create_telemetry_app(
         avg_hold_sec = round(sum(holds) / len(holds), 1) if holds else 0.0
 
         whale_trades_payload: list[dict[str, Any]] = []
-        if open_whale_mint and isinstance(pos, dict) and live_pnl is not None:
-            opened_str = pos.get("opened_at")
+        if open_whale_mint and isinstance(open_whale_pos, dict) and open_whale_pnl is not None:
+            opened_str = open_whale_pos.get("opened_at")
             open_hold: Optional[float] = None
             if opened_str:
                 try:
@@ -224,19 +238,19 @@ def create_telemetry_app(
             whale_trades_payload.append(
                 {
                     "status": "OPEN",
-                    "symbol": pos.get("symbol") or "UNKNOWN",
+                    "symbol": open_whale_pos.get("symbol") or "UNKNOWN",
                     "mint": open_whale_mint,
-                    "entry_sol": live_pnl["entry_sol"],
-                    "exit_sol": live_pnl["current_sol_value"],
-                    "pnl_sol": live_pnl["pnl_sol"],
-                    "pnl_pct": live_pnl["pnl_pct"],
+                    "entry_sol": open_whale_pnl["entry_sol"],
+                    "exit_sol": open_whale_pnl["current_sol_value"],
+                    "pnl_sol": open_whale_pnl["pnl_sol"],
+                    "pnl_pct": open_whale_pnl["pnl_pct"],
                     "exit_reason": "OPEN",
                     "opened_at": opened_str,
                     "closed_at": None,
                     "hold_seconds": open_hold,
                     "triggering_wallets": [
                         {"wallet": w, "label": cfg.resolve_wallet_label(w)}
-                        for w in (live_pnl.get("triggering_wallets") or [])
+                        for w in (open_whale_pnl.get("triggering_wallets") or [])
                     ],
                 }
             )
@@ -248,6 +262,9 @@ def create_telemetry_app(
             "hunting_lane": cfg.HUNTING_LANE,
             "active_mint": active_mint,
             "active_symbol": active_symbol,
+            "active_position": pos,
+            "whale_position": whale_live_pnl,
+            "active_positions": active_positions,
             "active_watchlist": active_watchlist_payload,
             "x_discovery": {
                 "enabled": cfg.ENABLE_X_DISCOVERY,
@@ -330,7 +347,14 @@ def create_telemetry_app(
             payload = await request.json()
         except Exception:
             return {"status": "ok", "received": 0, "recorded": 0, "duplicates": 0, "ignored": 0}
-        return process_helius_webhook_payload(payload, config=cfg, db=database)
+        tracked_wallets = await fetch_helius_tracked_wallets(cfg)
+        return process_helius_webhook_payload(
+            payload,
+            config=cfg,
+            db=database,
+            active_roster=set(tracked_wallets),
+            strict_roster=True,
+        )
 
     @app.post("/api/webhooks/helius/sync")
     async def helius_webhook_sync() -> dict[str, Any]:

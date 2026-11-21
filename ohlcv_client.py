@@ -47,23 +47,24 @@ def parse_geckoterminal_ohlcv(payload: dict[str, Any]) -> list[dict[str, float]]
     return candles
 
 
-async def fetch_ohlcv_5m(
+async def _fetch_ohlcv_interval(
     pair_address: str,
     config: AgentConfig,
     client: httpx.AsyncClient,
     *,
+    aggregate: str,
+    limit: str,
+    cache_suffix: str,
     now_ts: Optional[float] = None,
 ) -> tuple[list[dict[str, float]], bool]:
-    """Fetch 30 x 5m USD candles for a Solana pool.
-
-    Returns (candles_oldest_first, made_network_call).
-    """
+    """Fetch GeckoTerminal minute OHLCV bars with 90s cache and 429 exponential backoff."""
     addr = (pair_address or "").strip()
     if not addr:
         return [], False
 
+    cache_key = f"{addr}{cache_suffix}"
     current_ts = now_ts if now_ts is not None else time.time()
-    entry = _ohlcv_cache.get(addr)
+    entry = _ohlcv_cache.get(cache_key)
     if entry is not None:
         if current_ts < float(entry.get("backoff_until") or 0.0):
             return list(entry.get("candles") or []), False
@@ -72,7 +73,7 @@ async def fetch_ohlcv_5m(
             return list(entry.get("candles") or []), False
 
     url = f"{config.GECKOTERMINAL_BASE_URL}/networks/solana/pools/{addr}/ohlcv/minute"
-    params = {"aggregate": "5", "limit": "30", "currency": "usd"}
+    params = {"aggregate": aggregate, "limit": limit, "currency": "usd"}
     prev_candles = list((entry or {}).get("candles") or [])
     prev_errors = int((entry or {}).get("errors") or 0)
 
@@ -86,14 +87,15 @@ async def fetch_ohlcv_5m(
         if resp.status_code == 429:
             errors = prev_errors + 1
             backoff = min(300.0, 30.0 * (2 ** (errors - 1)))
-            _ohlcv_cache[addr] = {
+            _ohlcv_cache[cache_key] = {
                 "fetched_at": (entry or {}).get("fetched_at"),
                 "candles": prev_candles,
                 "backoff_until": current_ts + backoff,
                 "errors": errors,
             }
             logger.warning(
-                "[OHLCV] GeckoTerminal 429 for pool %s..; backing off %.0fs (cached=%d candles)",
+                "[OHLCV] GeckoTerminal 429 (%sm) for pool %s..; backing off %.0fs (cached=%d candles)",
+                aggregate,
                 addr[:8],
                 backoff,
                 len(prev_candles),
@@ -102,7 +104,7 @@ async def fetch_ohlcv_5m(
 
         resp.raise_for_status()
         candles = parse_geckoterminal_ohlcv(resp.json())
-        _ohlcv_cache[addr] = {
+        _ohlcv_cache[cache_key] = {
             "fetched_at": current_ts,
             "candles": candles,
             "backoff_until": 0.0,
@@ -112,20 +114,47 @@ async def fetch_ohlcv_5m(
     except Exception as exc:
         errors = prev_errors + 1
         backoff = min(300.0, 15.0 * (2 ** (errors - 1)))
-        _ohlcv_cache[addr] = {
+        _ohlcv_cache[cache_key] = {
             "fetched_at": (entry or {}).get("fetched_at"),
             "candles": prev_candles,
             "backoff_until": current_ts + backoff,
             "errors": errors,
         }
         logger.warning(
-            "[OHLCV] Fetch failed for pool %s.. (%s); backing off %.0fs (cached=%d candles)",
+            "[OHLCV] Fetch failed (%sm) for pool %s.. (%s); backing off %.0fs (cached=%d candles)",
+            aggregate,
             addr[:8],
             exc,
             backoff,
             len(prev_candles),
         )
         return prev_candles, True
+
+
+async def fetch_ohlcv_5m(
+    pair_address: str,
+    config: AgentConfig,
+    client: httpx.AsyncClient,
+    *,
+    now_ts: Optional[float] = None,
+) -> tuple[list[dict[str, float]], bool]:
+    """Fetch 30 x 5m USD candles for a Solana pool."""
+    return await _fetch_ohlcv_interval(
+        pair_address, config, client, aggregate="5", limit="30", cache_suffix="", now_ts=now_ts
+    )
+
+
+async def fetch_ohlcv_1m(
+    pair_address: str,
+    config: AgentConfig,
+    client: httpx.AsyncClient,
+    *,
+    now_ts: Optional[float] = None,
+) -> tuple[list[dict[str, float]], bool]:
+    """Fetch 30 x 1m USD candles for fresh Solana runners lacking 12 x 5m bars."""
+    return await _fetch_ohlcv_interval(
+        pair_address, config, client, aggregate="1", limit="30", cache_suffix=":1m", now_ts=now_ts
+    )
 
 
 async def fetch_ohlcv_batch(
@@ -145,6 +174,30 @@ async def fetch_ohlcv_batch(
         if network_calls > 0 and config.OHLCV_PACING_DELAY_SECONDS > 0:
             await asyncio.sleep(config.OHLCV_PACING_DELAY_SECONDS)
         candles, did_net = await fetch_ohlcv_5m(addr, config, client, now_ts=now_ts)
+        results[addr] = candles
+        if did_net:
+            network_calls += 1
+
+    return results
+
+
+async def fetch_ohlcv_1m_batch(
+    pair_addresses: list[str],
+    config: AgentConfig,
+    client: httpx.AsyncClient,
+    *,
+    now_ts: Optional[float] = None,
+) -> dict[str, list[dict[str, float]]]:
+    """Fetch 1m OHLCV fallback for pools with fewer than 12 x 5m candles."""
+    results: dict[str, list[dict[str, float]]] = {}
+    network_calls = 0
+
+    for addr in pair_addresses:
+        if not addr or addr in results:
+            continue
+        if network_calls > 0 and config.OHLCV_PACING_DELAY_SECONDS > 0:
+            await asyncio.sleep(config.OHLCV_PACING_DELAY_SECONDS)
+        candles, did_net = await fetch_ohlcv_1m(addr, config, client, now_ts=now_ts)
         results[addr] = candles
         if did_net:
             network_calls += 1

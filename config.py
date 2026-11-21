@@ -18,7 +18,6 @@ DEFAULT_WHALE_WALLET_LABELS: dict[str, str] = {
     "387FRwow6MKDhSwuMULhKjqeXuxoBY4BbbaSntdk9LaH": "Shawty",
     "ardinRsN1mNYVeoJWTBsWeYeXvuR9UUDGMsCDKpb6AT": "trunoest",
     "4vw54B78b2h7rw9Ud9": "decu",
-    "EqiFgyNw6kgrmYstWyrP8VjKhka7XEmKTZzHSmwpr1Zb": "ban",
 }
 
 
@@ -49,6 +48,8 @@ class AgentConfig(BaseSettings):
     TRAIL_ARM_PCT: float = Field(default=0.12, gt=0.0)
     TRAIL_PULLBACK_PCT: float = Field(default=0.06, gt=0.0, lt=1.0)
     REENTRY_CURL_PCT: float = Field(default=0.05, gt=0.0)
+    MAX_REENTRY_CHASE_PCT: float = Field(default=0.08, gt=0.0, lt=1.0)
+    MAX_REENTRIES_PER_MINT: int = Field(default=2, ge=0)
     EXODUS_SELL_RATIO: float = Field(default=0.65, gt=0.0, le=1.0)
     EXODUS_LIQ_DROP_PCT: float = Field(default=0.10, gt=0.0, le=1.0)
     WATCH_TIMEOUT_MINUTES: int = Field(default=20, gt=0)
@@ -132,22 +133,26 @@ class AgentConfig(BaseSettings):
     WHALE_SIGNAL_TTL_MINUTES: int = Field(default=30, gt=0)
     WHALE_MIN_SOL_SPENT: float = Field(default=0.5, ge=0.0)
 
-    # WHALE_SCALP Fast-Track Strategy (Consistent 10-15% Base Hits up to $50M MCAP)
+    # WHALE_SCALP Fast-Track Strategy (Slot 2: Multi-Whale Confluence up to $50M MCAP)
     WHALE_STRATEGY_ENABLED: bool = True
     WHALE_POSITION_SOL: float = Field(default=0.25, gt=0.0)
     WHALE_MIN_SOLO_BUY_SOL: float = Field(default=1.5, gt=0.0)
+    WHALE_MIN_UNIQUE_WALLETS: int = Field(default=2, ge=1)
     WHALE_MIN_CONFLUENCE_WALLETS: int = Field(default=2, ge=1)
     WHALE_ENTRY_MAX_AGE_SECONDS: int = Field(default=60, gt=0)
     WHALE_MIN_MCAP_USD: float = Field(default=15_000.0, ge=0.0)
     WHALE_MAX_MCAP_USD: float = Field(default=50_000_000.0, gt=0.0)
-    WHALE_MIN_LIQUIDITY_USD: float = Field(default=10_000.0, ge=0.0)
+    WHALE_MIN_LIQ_USD: float | None = Field(default=None, ge=0.0)
+    WHALE_MIN_LIQUIDITY_USD: float = Field(default=40_000.0, ge=0.0)
     WHALE_TP_PCT: float = Field(default=15.0, gt=0.0)
+    WHALE_BREAKEVEN_ARM_PCT: float = Field(default=5.0, gt=0.0)
+    WHALE_BREAKEVEN_FLOOR_PCT: float = Field(default=1.0, ge=0.0)
     WHALE_TRAIL_ARM_PCT: float = Field(default=8.0, gt=0.0)
     WHALE_TRAIL_DROP_PCT: float = Field(default=3.5, gt=0.0, lt=100.0)
     WHALE_TIGHT_TRAIL_ARM_PCT: float = Field(default=12.0, gt=0.0)
     WHALE_TIGHT_TRAIL_DROP_PCT: float = Field(default=2.5, gt=0.0, lt=100.0)
     WHALE_HARD_STOP_PCT: float = Field(default=-10.0, lt=0.0, gt=-100.0)
-    WHALE_TIME_STOP_SECONDS: int = Field(default=90, gt=0)
+    WHALE_TIME_STOP_SECONDS: int = Field(default=300, gt=0)
     WHALE_TIME_STOP_MIN_PNL_PCT: float = Field(default=4.0)
     WHALE_MONITOR_POLL_SECONDS: float = Field(default=2.0, gt=0.0)
 
@@ -187,6 +192,16 @@ class AgentConfig(BaseSettings):
     def helius_tracked_wallet_set(self) -> set[str]:
         """Return parsed comma-separated HELIUS_TRACKED_WALLETS."""
         return {item.strip() for item in self.HELIUS_TRACKED_WALLETS.split(",") if item.strip()}
+
+    def whale_min_unique_wallets(self) -> int:
+        """Return required unique tracked wallets for WHALE_SCALP confluence."""
+        return max(int(self.WHALE_MIN_UNIQUE_WALLETS), int(self.WHALE_MIN_CONFLUENCE_WALLETS))
+
+    def whale_min_liquidity_usd(self) -> float:
+        """Return WHALE_SCALP liquidity floor (WHALE_MIN_LIQ_USD takes precedence if set)."""
+        if self.WHALE_MIN_LIQ_USD is not None:
+            return float(self.WHALE_MIN_LIQ_USD)
+        return float(self.WHALE_MIN_LIQUIDITY_USD)
 
     def resolve_wallet_label(self, wallet: str) -> str:
         """Resolve a human-readable Kolscan/custom label or fall back to truncated AbCd...wXyZ."""

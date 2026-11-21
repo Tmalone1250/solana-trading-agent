@@ -6,6 +6,7 @@ from typing import Any, Optional, Sequence
 
 from pydantic import BaseModel
 
+from breakout_ignition import detect_breakout_ignition
 from config import AgentConfig
 
 
@@ -13,10 +14,11 @@ class ScalperEntryResult(BaseModel):
     """Deterministic 4-gate Scalper Expert Entry Engine verdict."""
 
     eligible: bool
-    setup_type: str = "NONE"  # SWEEP_RECLAIM | DISPLACEMENT_RETEST | NONE
+    setup_type: str = "NONE"  # SWEEP_RECLAIM | DISPLACEMENT_RETEST | BREAKOUT_IGNITION | NONE
     rsi_5m: float = 50.0
     dist_from_1h_high_pct: float = 0.0
     rejection_reason: Optional[str] = None
+    breakout_metrics: Optional[dict[str, Any]] = None
 
 
 def _normalize_candles(raw_candles: Sequence[Any]) -> list[dict[str, float]]:
@@ -185,30 +187,59 @@ def evaluate_scalper_entry(
     time_in_slot_min: float,
     *,
     config: Optional[AgentConfig] = None,
+    candles_1m: Optional[Sequence[Any]] = None,
 ) -> ScalperEntryResult:
-    """Run all 4 deterministic gates of the Scalper Expert Entry Engine."""
+    """Run all 4 deterministic gates of the Scalper Expert Entry Engine (+ BREAKOUT_IGNITION)."""
     min_soak = config.MIN_WATCHLIST_SOAK_MINUTES if config else 3.0
     high_buf = config.ANTI_CHASE_HIGH_BUFFER_PCT if config else 0.05
     max_rsi = config.SCALPER_MAX_RSI_5M if config else 70.0
+    breakout_max_rsi = 78.0
     min_buy_ratio = config.SCALPER_MIN_BUY_RATIO_5M if config else 0.58
     min_txns = config.SCALPER_MIN_TXNS_5M if config else 15
 
     candles = _normalize_candles(candles_5m)
-    reasons: list[str] = []
+    norm_1m = _normalize_candles(candles_1m) if candles_1m else []
+    buys_5m, sells_5m, buy_ratio_5m = _extract_order_flow(pair_data)
+    total_5m = buys_5m + sells_5m
 
-    # Gate 1: Mandatory Soak
-    if time_in_slot_min < min_soak:
-        reasons.append(f"soak {time_in_slot_min:.1f}m < {min_soak:.0f}m")
-
+    # 1m Candle Fallback: when < 12 5m candles exist, evaluate BREAKOUT_IGNITION on >= 15 1m bars
     if len(candles) < 12:
-        reasons.append(f"insufficient 5m candles ({len(candles)} < 12)")
+        if len(norm_1m) >= 15:
+            bi_1m = detect_breakout_ignition(norm_1m, pair_data, bar_minutes=1)
+            closes_1m = [c["close"] for c in norm_1m]
+            rsi_1m = compute_rsi(closes_1m, period=14)
+            high_1m = max(c["high"] for c in norm_1m)
+            curr_p = float(pair_data.get("price_usd") or pair_data.get("priceUsd") or closes_1m[-1])
+            dist_1m = max(0.0, (high_1m - curr_p) / high_1m) if high_1m > 0 else 0.0
+            fb_reasons: list[str] = []
+            if time_in_slot_min < min_soak:
+                fb_reasons.append(f"soak {time_in_slot_min:.1f}m < {min_soak:.0f}m")
+            if total_5m < min_txns:
+                fb_reasons.append(f"5m txns {total_5m} < {min_txns}")
+            if not bi_1m.detected:
+                fb_reasons.append(f"BREAKOUT_IGNITION(1m): {bi_1m.rejection_reason}")
+            elif rsi_1m > breakout_max_rsi:
+                fb_reasons.append(f"RSI={rsi_1m:.1f} > {breakout_max_rsi:.0f}")
+            return ScalperEntryResult(
+                eligible=bi_1m.detected and len(fb_reasons) == 0,
+                setup_type="BREAKOUT_IGNITION" if bi_1m.detected else "NONE",
+                rsi_5m=round(rsi_1m, 2),
+                dist_from_1h_high_pct=round(dist_1m, 4),
+                rejection_reason=" / ".join(fb_reasons) if fb_reasons else None,
+                breakout_metrics=bi_1m.model_dump(),
+            )
+
+        reasons_short: list[str] = []
+        if time_in_slot_min < min_soak:
+            reasons_short.append(f"soak {time_in_slot_min:.1f}m < {min_soak:.0f}m")
+        reasons_short.append(f"insufficient 5m candles ({len(candles)} < 12)")
         rsi_val = compute_rsi([c["close"] for c in candles], period=14) if candles else 50.0
         return ScalperEntryResult(
             eligible=False,
             setup_type="NONE",
             rsi_5m=rsi_val,
             dist_from_1h_high_pct=0.0,
-            rejection_reason=" / ".join(reasons),
+            rejection_reason=" / ".join(reasons_short),
         )
 
     closes = [c["close"] for c in candles]
@@ -222,29 +253,49 @@ def evaluate_scalper_entry(
         max(0.0, (high_1h - current_price) / high_1h) if high_1h > 0 else 0.0
     )
 
-    # Gate 2: Anti-Chase & 5m RSI Cooling
-    if rsi_5m > max_rsi:
-        reasons.append(f"RSI={rsi_5m:.1f} > {max_rsi:.0f}")
-    if dist_from_1h_high_pct < high_buf:
-        reasons.append(
-            f"near 1h high ({dist_from_1h_high_pct * 100:.1f}% < {high_buf * 100:.0f}%)"
-        )
-
-    # Gate 3: Core Market-Physics Setup (SWEEP_RECLAIM or DISPLACEMENT_RETEST)
+    # Gate 3: Core Market-Physics Setup (SWEEP_RECLAIM / DISPLACEMENT_RETEST unchanged; BREAKOUT_IGNITION added)
     setup_type = "NONE"
+    breakout_res = None
     if _detect_sweep_reclaim(candles):
         setup_type = "SWEEP_RECLAIM"
     elif _detect_displacement_retest(candles, rsi_5m):
         setup_type = "DISPLACEMENT_RETEST"
     else:
-        reasons.append("no SWEEP_RECLAIM or DISPLACEMENT_RETEST setup")
+        breakout_res = detect_breakout_ignition(candles, pair_data, bar_minutes=5)
+        if breakout_res.detected:
+            setup_type = "BREAKOUT_IGNITION"
 
-    # Gate 4: Order-Flow Imbalance (5m buy ratio >= 58% and total txns >= 15)
-    buys_5m, sells_5m, buy_ratio_5m = _extract_order_flow(pair_data)
-    total_5m = buys_5m + sells_5m
+    reasons: list[str] = []
+
+    # Gate 1: Mandatory Soak
+    if time_in_slot_min < min_soak:
+        reasons.append(f"soak {time_in_slot_min:.1f}m < {min_soak:.0f}m")
+
+    # Gate 2: Breakout-aware Anti-Chase & RSI Cooling
+    if setup_type == "BREAKOUT_IGNITION":
+        # Bypass near-1h-high (<5%) block (anti-chase <=12% above EMA9/VWAP already enforced); allow RSI <= 78
+        if rsi_5m > breakout_max_rsi:
+            reasons.append(f"RSI={rsi_5m:.1f} > {breakout_max_rsi:.0f}")
+    else:
+        if rsi_5m > max_rsi:
+            reasons.append(f"RSI={rsi_5m:.1f} > {max_rsi:.0f}")
+        if dist_from_1h_high_pct < high_buf:
+            reasons.append(
+                f"near 1h high ({dist_from_1h_high_pct * 100:.1f}% < {high_buf * 100:.0f}%)"
+            )
+        if setup_type == "NONE":
+            if breakout_res and breakout_res.rejection_reason and (
+                "over-extended" in breakout_res.rejection_reason
+                or "upper-wick fakeout" in breakout_res.rejection_reason
+            ):
+                reasons.append(f"BREAKOUT_IGNITION rejected: {breakout_res.rejection_reason}")
+            else:
+                reasons.append("no SWEEP_RECLAIM, DISPLACEMENT_RETEST, or BREAKOUT_IGNITION setup")
+
+    # Gate 4: Order-Flow Imbalance
     if total_5m < min_txns:
         reasons.append(f"5m txns {total_5m} < {min_txns}")
-    elif buy_ratio_5m < min_buy_ratio:
+    elif setup_type != "BREAKOUT_IGNITION" and buy_ratio_5m < min_buy_ratio:
         reasons.append(
             f"5m buy_ratio {buy_ratio_5m * 100:.0f}% < {min_buy_ratio * 100:.0f}%"
         )
@@ -256,4 +307,5 @@ def evaluate_scalper_entry(
         rsi_5m=round(rsi_5m, 2),
         dist_from_1h_high_pct=round(dist_from_1h_high_pct, 4),
         rejection_reason=" / ".join(reasons) if reasons else None,
+        breakout_metrics=breakout_res.model_dump() if breakout_res is not None else None,
     )

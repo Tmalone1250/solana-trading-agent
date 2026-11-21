@@ -14,6 +14,7 @@ from decision_client import GeminiDecisionClient
 from graph import build_agent_graph
 from state import FocusState
 from telemetry_api import create_telemetry_app
+from whale_lane import run_whale_lane_tick
 from x_discovery_worker import run_x_discovery_loop
 
 logging.basicConfig(
@@ -50,6 +51,7 @@ async def run_autonomous_loop(config, db: AgentDatabase) -> None:
                 "daily_start_sol": st["daily_start_sol"],
                 "daily_pnl_sol": st["daily_pnl_sol"],
                 "active_position": st["active_position"],
+                "whale_position": st["whale_position"],
                 "last_decision_rationale": st["last_decision_rationale"],
             }
             try:
@@ -75,6 +77,19 @@ async def run_autonomous_loop(config, db: AgentDatabase) -> None:
             await asyncio.sleep(sleep_sec)
 
 
+async def run_whale_lane_loop(config, db: AgentDatabase) -> None:
+    """Slot 2 independent loop: monitors/enters WHALE_SCALP concurrently with Slot 1 Chart lane."""
+    async with httpx.AsyncClient(follow_redirects=True) as http_client:
+        while True:
+            try:
+                res = await run_whale_lane_tick(config=config, db=db, http_client=http_client)
+                has_open = res.get("whale_position") is not None
+            except Exception as exc:
+                logger.exception("Error during Whale Lane tick: %s", exc)
+                has_open = False
+            await asyncio.sleep(config.WHALE_MONITOR_POLL_SECONDS if has_open else 5.0)
+
+
 async def main() -> None:
     config = load_config()
     db = AgentDatabase(
@@ -92,6 +107,11 @@ async def main() -> None:
     server = uvicorn.Server(uv_config)
 
     agent_task = asyncio.create_task(run_autonomous_loop(config, db))
+    whale_task = (
+        asyncio.create_task(run_whale_lane_loop(config, db))
+        if config.WHALE_STRATEGY_ENABLED
+        else None
+    )
     x_task = (
         asyncio.create_task(run_x_discovery_loop(config, db))
         if config.ENABLE_X_DISCOVERY
@@ -101,6 +121,8 @@ async def main() -> None:
         await server.serve()
     finally:
         agent_task.cancel()
+        if whale_task is not None:
+            whale_task.cancel()
         if x_task is not None:
             x_task.cancel()
         db.close()

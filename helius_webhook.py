@@ -251,6 +251,7 @@ def parse_helius_swap_event(
     *,
     tracked_wallets: set[str],
     min_sol_spent: float,
+    strict_roster: bool = False,
     now_dt: Optional[datetime] = None,
 ) -> Optional[dict[str, Any]]:
     """Parse a single Helius Enhanced Webhook SWAP transaction into a whale event."""
@@ -263,12 +264,18 @@ def parse_helius_swap_event(
     if not signature:
         return None
 
+    if strict_roster and not tracked_wallets:
+        return None
+
     wallet = _resolve_actor_wallet(tx, tracked_wallets)
     if not wallet:
+        return None
+    if strict_roster and wallet not in tracked_wallets:
         return None
 
     # Aggregate net SPL token flows for non-base mints involving this wallet
     net_by_mint: dict[str, float] = {}
+    symbol_by_mint: dict[str, str] = {}
     for tf in tx.get("tokenTransfers") or []:
         if not isinstance(tf, dict):
             continue
@@ -278,6 +285,9 @@ def parse_helius_swap_event(
         amt = float(tf.get("tokenAmount") or 0.0)
         if amt <= 0:
             continue
+        tok_sym = str(tf.get("symbol") or tf.get("tokenSymbol") or "").strip()
+        if tok_sym and mint not in symbol_by_mint:
+            symbol_by_mint[mint] = tok_sym
         if tf.get("toUserAccount") == wallet:
             net_by_mint[mint] = net_by_mint.get(mint, 0.0) + amt
         if tf.get("fromUserAccount") == wallet:
@@ -299,10 +309,13 @@ def parse_helius_swap_event(
         return None
 
     ts_utc = _parse_tx_timestamp(tx.get("timestamp"), now_dt or utc_now())
+    short_mint = f"{primary_mint[:6]}..{primary_mint[-4:]}" if len(primary_mint) > 10 else primary_mint
+    token_symbol = symbol_by_mint.get(primary_mint) or short_mint
     return {
         "signature": signature,
         "wallet": wallet,
         "mint": primary_mint,
+        "token_symbol": token_symbol,
         "side": side,
         "sol_amount": sol_amount,
         "token_amount": token_amount,
@@ -315,12 +328,18 @@ def process_helius_webhook_payload(
     *,
     config: AgentConfig,
     db: AgentDatabase,
+    active_roster: Optional[set[str]] = None,
+    strict_roster: bool = False,
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
     """Ingest a Helius Enhanced Webhook JSON array payload idempotently into DuckDB."""
     now_dt = now or utc_now()
     items = payload if isinstance(payload, list) else ([payload] if isinstance(payload, dict) else [])
-    tracked_wallets = config.helius_tracked_wallet_set()
+    if active_roster is not None:
+        tracked_wallets = {w.strip() for w in active_roster if w and w.strip()}
+    else:
+        tracked_wallets = set(_helius_roster_cache.get("wallets") or []) | config.helius_tracked_wallet_set()
+    enforce_roster = strict_roster or bool(tracked_wallets)
 
     recorded = 0
     duplicates = 0
@@ -332,6 +351,7 @@ def process_helius_webhook_payload(
             tx,
             tracked_wallets=tracked_wallets,
             min_sol_spent=config.WHALE_MIN_SOL_SPENT,
+            strict_roster=enforce_roster,
             now_dt=now_dt,
         )
         if ev is None:
@@ -363,12 +383,12 @@ def process_helius_webhook_payload(
                 )
         elif ev["side"] == "BUY":
             st = db.get_state()
-            if st.get("focus_state") != "SCANNING":
+            if st.get("whale_position") is not None:
                 db.upsert_whale_decision(ev["mint"], "SKIPPED", "POSITION_OPEN", updated_at=now_dt.isoformat())
         db.log_action(
             mode=config.EXECUTION_MODE,
             action="WHALE_WEBHOOK",
-            symbol=ev["side"],
+            symbol=ev["token_symbol"],
             asset_id=ev["mint"],
             qty=ev["token_amount"],
             notional=round(ev["sol_amount"], 6),

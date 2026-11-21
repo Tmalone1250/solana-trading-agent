@@ -12,7 +12,7 @@ from config import LAMPORTS_PER_SOL, AgentConfig
 from db import AgentDatabase, utc_now
 from decision_client import GeminiDecisionClient
 from leg2_predictor import Leg2Result, compute_leg2_score
-from ohlcv_client import fetch_ohlcv_batch
+from ohlcv_client import fetch_ohlcv_1m_batch, fetch_ohlcv_batch
 from scalper_entry_engine import ScalperEntryResult, evaluate_scalper_entry
 from state import (
     AgentGraphState,
@@ -320,6 +320,7 @@ async def alpha_node(
                 pairs_to_fetch.append(p_addr)
 
     ohlcv_by_pair: dict[str, list[dict[str, float]]] = {}
+    ohlcv_1m_by_pair: dict[str, list[dict[str, float]]] = {}
     if pairs_to_fetch:
         owns_client = http_client is None
         client = http_client or httpx.AsyncClient()
@@ -327,6 +328,11 @@ async def alpha_node(
             ohlcv_by_pair = await fetch_ohlcv_batch(
                 pairs_to_fetch, config, client, now_ts=now_dt.timestamp()
             )
+            short_pairs = [p for p in pairs_to_fetch if len(ohlcv_by_pair.get(p) or []) < 12]
+            if short_pairs:
+                ohlcv_1m_by_pair = await fetch_ohlcv_1m_batch(
+                    short_pairs, config, client, now_ts=now_dt.timestamp()
+                )
         finally:
             if owns_client:
                 await client.aclose()
@@ -352,6 +358,9 @@ async def alpha_node(
         candles_5m = cand.get("candles_5m")
         if candles_5m is None:
             candles_5m = ohlcv_by_pair.get(p_addr, [])
+        candles_1m = cand.get("candles_1m")
+        if candles_1m is None and len(candles_5m) < 12:
+            candles_1m = ohlcv_1m_by_pair.get(p_addr, [])
 
         scalper_results.append(
             evaluate_scalper_entry(
@@ -359,6 +368,7 @@ async def alpha_node(
                 cand,
                 time_in_slot_min,
                 config=config,
+                candles_1m=candles_1m,
             )
         )
 
@@ -453,6 +463,7 @@ async def alpha_node(
             "setup_type": scalper.setup_type,
             "scalper_eligible": scalper.eligible,
             "dist_from_1h_high_pct": scalper.dist_from_1h_high_pct,
+            "breakout_metrics": scalper.breakout_metrics,
             "approved": dec.approved,
         }
 
@@ -468,18 +479,40 @@ async def alpha_node(
         cand_mc = float(cand.get("market_cap_usd") or 0.0) or None
         cand_liq = float(cand.get("liquidity_usd") or 0.0) or None
         cand_soak = soak_minutes_list[idx]
-        dec_outcome = (
-            "APPROVE"
-            if approved
-            else (f"BLOCKED: {scalper.rejection_reason}" if decision1_wants_buy else dec.action)
-        )
+        bi_suffix = ""
+        if scalper.breakout_metrics and scalper.setup_type == "BREAKOUT_IGNITION":
+            bm = scalper.breakout_metrics
+            bi_suffix = (
+                f" [tf={bm.get('timeframe')} vol={bm.get('vol_ratio')}x "
+                f"ext_ema9={float(bm.get('ext_above_ema9_pct') or 0)*100:+.1f}% "
+                f"ext_vwap={float(bm.get('ext_above_vwap_pct') or 0)*100:+.1f}%]"
+            )
+        if approved:
+            dec_reason = f"{dec.action} -> APPROVE{bi_suffix}"
+        elif dec.action == "BUY" or decision1_wants_buy:
+            block_reasons: list[str] = []
+            if not scalper.eligible and scalper.rejection_reason:
+                block_reasons.append(scalper.rejection_reason)
+            elif scalper.setup_type == "NONE":
+                block_reasons.append("NO_VALID_SETUP")
+            if conf < config.MIN_BUY_CONFIDENCE:
+                block_reasons.append(f"conf={conf:.2f} < {config.MIN_BUY_CONFIDENCE:.2f}")
+            if vamp > config.MAX_VAMP_ENTRY:
+                block_reasons.append(f"vamp={vamp:.2f} > {config.MAX_VAMP_ENTRY:.2f}")
+            if narr < config.MIN_NARRATIVE_SCORE:
+                block_reasons.append(f"narr={narr:.1f} < {config.MIN_NARRATIVE_SCORE:.1f}")
+            if mom < config.MIN_MOMENTUM_SCORE:
+                block_reasons.append(f"mom={mom:.1f} < {config.MIN_MOMENTUM_SCORE:.1f}")
+            dec_reason = f"BLOCKED: {'; '.join(block_reasons) or 'GATE_REJECT'}"
+        else:
+            dec_reason = f"{dec.action} -> {dec.action}"
         db.log_action(
             mode=config.EXECUTION_MODE,
             action="DECISION_1",
             symbol=dec.symbol,
             asset_id=dec.mint,
             strategy="LEG2_ENTRY" if (approved and leg2_fast_track and not standard_approved) else scalper.setup_type,
-            reason=f"{dec.action} -> {dec_outcome}",
+            reason=dec_reason,
             timestamp_utc=now_iso,
             mc_usd=cand_mc,
             liq_usd=cand_liq,
@@ -633,11 +666,43 @@ async def alpha_node(
                 )
                 continue
 
+        # Coiling base check: liq >= $40K, vamp < 0.65, within 5% of 1h high
+        is_coiling_base = (
+            float(cand.get("liquidity_usd") or 0.0) >= 40_000.0
+            and dec.is_copycat_vamp < 0.65
+            and scalper.dist_from_1h_high_pct <= 0.05
+        )
+        prev_scores = (watchlist_by_mint.get(dec.mint) or {}).get("latest_scores") or {}
+        prev_low_strikes = int(prev_scores.get("low_score_strikes") or 0)
+
         # Eviction Rule 2: Weak Narrative & Momentum (< 2.0 AND < 2.0 -> 15m cooldown)
+        # Coiling bases require 2 consecutive LOW_SCORE ticks so quiet coils aren't evicted prematurely
         if (
             dec.narrative_strength < config.LOW_SCORE_EVICT_THRESHOLD
             and dec.momentum_quality < config.LOW_SCORE_EVICT_THRESHOLD
         ):
+            new_low_strikes = prev_low_strikes + 1
+            if is_coiling_base and new_low_strikes < 2:
+                scores_payload["low_score_strikes"] = new_low_strikes
+                db.update_watchlist_scores(
+                    mint=dec.mint,
+                    scores=scores_payload,
+                    last_evaluated_at=now_iso,
+                    vamp_strikes=new_vamp_strikes,
+                    rsi_5m=scalper.rsi_5m,
+                    setup_type=scalper.setup_type,
+                    scalper_eligible=scalper.eligible,
+                    dist_from_1h_high_pct=scalper.dist_from_1h_high_pct,
+                )
+                logger.info(
+                    "[Alpha] $%s | COILING BASE (liq=$%.0f, vamp=%.2f, dist=%.1f%%) -> retained on 1st LOW_SCORE strike (1/2)",
+                    dec.symbol,
+                    float(cand.get("liquidity_usd") or 0.0),
+                    dec.is_copycat_vamp,
+                    scalper.dist_from_1h_high_pct * 100.0,
+                )
+                continue
+
             evict_reason = (
                 f"LOW_SCORE (narr={dec.narrative_strength:.2f}, "
                 f"mom={dec.momentum_quality:.2f} < {config.LOW_SCORE_EVICT_THRESHOLD:.1f})"
@@ -673,15 +738,18 @@ async def alpha_node(
             )
             continue
 
-        # Eviction Rule 3: Stale Watch Timeout (> 15m in slot without BUY -> 10m cooldown)
+        scores_payload["low_score_strikes"] = 0
+
+        # Eviction Rule 3: Stale Watch Timeout (> 15m, or > 25m for coiling bases -> 10m cooldown)
+        stale_limit_min = max(25, config.STALE_WATCH_TIMEOUT_MINUTES) if is_coiling_base else config.STALE_WATCH_TIMEOUT_MINUTES
         added_at_str = cand.get("added_at") or (watchlist_by_mint.get(dec.mint) or {}).get("added_at")
         if added_at_str:
             added_dt = datetime.fromisoformat(added_at_str)
             if added_dt.tzinfo is None:
                 added_dt = added_dt.replace(tzinfo=timezone.utc)
             elapsed_min = (now_dt - added_dt).total_seconds() / 60.0
-            if elapsed_min > config.STALE_WATCH_TIMEOUT_MINUTES:
-                evict_reason = f"STALE_WATCH ({elapsed_min:.1f}m > {config.STALE_WATCH_TIMEOUT_MINUTES}m)"
+            if elapsed_min > stale_limit_min:
+                evict_reason = f"STALE_WATCH ({elapsed_min:.1f}m > {stale_limit_min}m)"
                 db.remove_from_watchlist(dec.mint)
                 db.set_cooldown_minutes(
                     dec.mint,
@@ -742,6 +810,12 @@ async def alpha_node(
             scalper.rsi_5m,
             strike_note,
         )
+
+    # Shared Guard: exclude any mint already open in Slot 2 (whale_slot)
+    whale_pos = state.get("whale_position") or db.get_state().get("whale_position")
+    whale_mint = str(whale_pos.get("mint") or "") if isinstance(whale_pos, dict) else ""
+    if whale_mint:
+        approved_pairs = [item for item in approved_pairs if item[0].mint != whale_mint]
 
     if not approved_pairs:
         latest_rationale = decisions[0].rationale if decisions else ""

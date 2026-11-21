@@ -254,9 +254,13 @@ async def safety_gate_node(
     fast_track_order: Optional[dict[str, Any]] = None
     sol_balance = float(state.get("sol_balance") or 0.0)
     try:
-        # Priority: WHALE_SCALP fast-track instant safety gate (bypasses 3m soak & 5m OHLCV)
+        # Priority: WHALE_SCALP fast-track instant safety gate (Slot 2: bypasses 3m soak & 5m OHLCV)
         if config.WHALE_STRATEGY_ENABLED and whale_fast_candidates:
-            if state.get("active_position"):
+            whale_pos = state.get("whale_position") or (db.get_state().get("whale_position") if db is not None else None)
+            chart_pos = state.get("active_position")
+            chart_mint = str(chart_pos.get("mint") or "") if isinstance(chart_pos, dict) else ""
+            min_whale_liq = config.whale_min_liquidity_usd()
+            if whale_pos:
                 if db is not None:
                     for w_cand in whale_fast_candidates:
                         db.upsert_whale_decision(
@@ -278,6 +282,11 @@ async def safety_gate_node(
                 for w_cand in whale_fast_candidates:
                     mint = w_cand["mint"]
                     symbol = w_cand.get("symbol", "UNKNOWN")
+                    if chart_mint and mint == chart_mint:
+                        if db is not None:
+                            db.upsert_whale_decision(mint, "SKIPPED", "DUPLICATE_MINT_IN_CHART_SLOT", updated_at=now.isoformat() if now else None)
+                        rejected.append({"mint": mint, "symbol": symbol, "reasons": ["Duplicate mint already open in chart_slot"]})
+                        continue
                     jup_sus = w_cand.get("jup_is_sus") is True or (
                         isinstance(w_cand.get("jup_meta"), dict) and w_cand["jup_meta"].get("is_sus") is True
                     )
@@ -289,15 +298,15 @@ async def safety_gate_node(
                             db.upsert_whale_decision(mint, "SKIPPED", "AUDIT_SUS", updated_at=now.isoformat() if now else None)
                         rejected.append({"mint": mint, "symbol": symbol, "reasons": ["Jupiter Token v2: audit.isSus=True"]})
                         continue
-                    if liq_usd < config.WHALE_MIN_LIQUIDITY_USD:
+                    if liq_usd < min_whale_liq:
                         if db is not None:
                             db.upsert_whale_decision(
                                 mint,
                                 "SKIPPED",
-                                f"LIQ < ${config.WHALE_MIN_LIQUIDITY_USD / 1000:.0f}K",
+                                f"LIQ < ${min_whale_liq / 1000:.0f}K",
                                 updated_at=now.isoformat() if now else None,
                             )
-                        rejected.append({"mint": mint, "symbol": symbol, "reasons": [f"Liquidity ${liq_usd:,.0f} < ${config.WHALE_MIN_LIQUIDITY_USD:,.0f}"]})
+                        rejected.append({"mint": mint, "symbol": symbol, "reasons": [f"Liquidity ${liq_usd:,.0f} < ${min_whale_liq:,.0f}"]})
                         continue
                     if not (config.WHALE_MIN_MCAP_USD <= mc_usd <= config.WHALE_MAX_MCAP_USD):
                         def _fmt_usd(v: float) -> str:
@@ -372,6 +381,8 @@ async def safety_gate_node(
                         target_state_after_fill=FocusState.IN_POSITION,
                         apply_cooldown=False,
                         entry_liquidity_usd=liq_usd,
+                        entry_mc_usd=round(mc_usd, 2) if mc_usd else None,
+                        whale_sol_flow=round(float(w_cand.get("whale_total_sol") or 0.0), 6),
                         strategy="WHALE_SCALP",
                         triggering_wallets=trig_wallets,
                         rationale=rationale,

@@ -89,6 +89,8 @@ class PendingOrder(BaseModel):
     target_state_after_fill: FocusState
     apply_cooldown: bool = False
     entry_liquidity_usd: float = 0.0
+    entry_mc_usd: Optional[float] = None
+    whale_sol_flow: Optional[float] = None
     run_peak_sol: Optional[float] = None
     strategy: str = "SCALPER"
     triggering_wallets: list[str] = Field(default_factory=list)
@@ -96,7 +98,7 @@ class PendingOrder(BaseModel):
 
 
 class ActivePosition(BaseModel):
-    """Tracked state for the single focused token."""
+    """Tracked state for a focused token slot (Slot 1 chart_slot or Slot 2 whale_slot)."""
 
     mint: str
     symbol: str
@@ -107,6 +109,8 @@ class ActivePosition(BaseModel):
     whale_shadow_exit_flag: bool = False
     opened_at: Optional[str] = None
     entry_liquidity_usd: float = 0.0
+    entry_mc_usd: Optional[float] = None
+    whale_sol_flow: Optional[float] = None
     current_sol_value: float = 0.0
     peak_sol_value: float = 0.0
     breakeven_armed: bool = False
@@ -115,6 +119,7 @@ class ActivePosition(BaseModel):
     run_peak_sol: Optional[float] = None
     watch_started_at: Optional[str] = None
     reference_token_amount: int = 0
+    reentry_count: int = 0
     last_5m_buy_ratio: Optional[float] = None
     last_5m_sell_ratio: Optional[float] = None
     last_liquidity_usd: Optional[float] = None
@@ -152,6 +157,8 @@ class AgentGraphState(TypedDict, total=False):
     halted_daily_loss: bool
 
     active_position: Optional[dict[str, Any]]
+    whale_position: Optional[dict[str, Any]]
+    slot: Optional[str]
     active_watchlist: list[dict[str, Any]]
     whale_fast_track_candidates: list[dict[str, Any]]
     raw_candidates: list[dict[str, Any]]

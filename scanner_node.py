@@ -336,8 +336,14 @@ def _evict_stale_or_cooled_watchlist(
             added_dt = added_dt.replace(tzinfo=timezone.utc)
         elapsed_min = (now_dt - added_dt).total_seconds() / 60.0
 
-        if elapsed_min > config.STALE_WATCH_TIMEOUT_MINUTES:
-            stale_reason = f"STALE_WATCH ({elapsed_min:.1f}m > {config.STALE_WATCH_TIMEOUT_MINUTES}m)"
+        cand_liq = float((entry.get("candidate") or {}).get("liquidity_usd") or entry.get("entry_liquidity_usd") or 0.0)
+        latest_vamp = float((entry.get("latest_scores") or {}).get("is_copycat_vamp", 1.0))
+        dist_high = entry.get("dist_from_1h_high_pct")
+        is_coiling = cand_liq >= 40_000.0 and latest_vamp < 0.65 and dist_high is not None and float(dist_high) <= 0.05
+        stale_limit = max(25, config.STALE_WATCH_TIMEOUT_MINUTES) if is_coiling else config.STALE_WATCH_TIMEOUT_MINUTES
+
+        if elapsed_min > stale_limit:
+            stale_reason = f"STALE_WATCH ({elapsed_min:.1f}m > {stale_limit}m)"
             db.remove_from_watchlist(mint)
             db.set_cooldown_minutes(
                 mint,
@@ -423,10 +429,11 @@ async def scanner_node(
     )
     whale_fast_triggers: dict[str, dict[str, Any]] = {}
     if config.WHALE_STRATEGY_ENABLED:
+        min_unique_whales = config.whale_min_unique_wallets()
         for trig in db.get_whale_fast_track_triggers(
             confluence_window_minutes=5,
             max_age_seconds=config.WHALE_ENTRY_MAX_AGE_SECONDS,
-            min_confluence_wallets=config.WHALE_MIN_CONFLUENCE_WALLETS,
+            min_confluence_wallets=min_unique_whales,
             min_solo_sol=config.WHALE_MIN_SOLO_BUY_SOL,
             now=now_dt,
         ):
@@ -460,7 +467,7 @@ async def scanner_node(
                 db.upsert_whale_decision(
                     w_mint,
                     "SKIPPED",
-                    f"< {config.WHALE_MIN_SOLO_BUY_SOL:.1f} SOL",
+                    f"< {min_unique_whales} UNIQUE WHALES",
                     updated_at=now_dt.isoformat(),
                 )
 
