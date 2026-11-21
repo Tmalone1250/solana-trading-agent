@@ -81,14 +81,18 @@ def _build_batch_entry_prompt(
     candidates: list[dict[str, Any]],
     leg2_results: list[Leg2Result],
     scalper_results: list[ScalperEntryResult],
+    social_by_mint: Optional[dict[str, dict[str, Any]]] = None,
+    whale_by_mint: Optional[dict[str, dict[str, Any]]] = None,
 ) -> str:
     lines = ["Evaluate the following Solana memecoin candidates that passed safety checks:"]
+    social_map = social_by_mint or {}
+    whale_map = whale_by_mint or {}
     for idx, (c, leg2, sc) in enumerate(zip(candidates, leg2_results, scalper_results)):
         buys_5m = int(c.get("buys_5m") or 0)
         sells_5m = int(c.get("sells_5m") or 0)
         total_5m = buys_5m + sells_5m
         buy_ratio_5m = (buys_5m / total_5m) if total_5m > 0 else 0.0
-        lines.append(
+        line = (
             f"[TOKEN_{idx}] symbol={c.get('symbol')} name={c.get('name')} mint={c.get('mint')} | "
             f"mc=${float(c.get('market_cap_usd') or 0):,.0f} | "
             f"liq=${float(c.get('liquidity_usd') or 0):,.0f} | "
@@ -104,6 +108,43 @@ def _build_batch_entry_prompt(
             f"dist_from_1h_high={sc.dist_from_1h_high_pct * 100:.1f}% "
             f"scalper_eligible={sc.eligible}"
         )
+        j_meta = c.get("jup_meta") if isinstance(c.get("jup_meta"), dict) else {}
+        jup_org = c.get("jup_organic_score")
+        if jup_org is None:
+            jup_org = j_meta.get("organic_score")
+        if jup_org is not None:
+            jup_ver = c.get("jup_is_verified") if c.get("jup_is_verified") is not None else j_meta.get("is_verified", False)
+            jup_holders = c.get("jup_holder_count") if c.get("jup_holder_count") is not None else j_meta.get("holder_count", 0)
+            jup_top = c.get("jup_top_holders_pct") if c.get("jup_top_holders_pct") is not None else j_meta.get("top_holders_pct")
+            top_str = f"{float(jup_top):.1f}%" if jup_top is not None else "n/a"
+            line += (
+                f" | jup_organic_score={float(jup_org):.1f}/100"
+                f" jup_is_verified={bool(jup_ver)}"
+                f" jup_holder_count={int(jup_holders or 0)}"
+                f" jup_top_holders_pct={top_str}"
+            )
+        sig = social_map.get(c.get("mint", ""))
+        if sig:
+            snippets = sig.get("top_snippets") or []
+            formatted_snips = " || ".join(
+                f"@{s.get('author')} ({s.get('followers', 0)}f, {s.get('likes', 0)}L): {str(s.get('text') or '').replace(chr(10), ' ')}"
+                for s in snippets[:5]
+            )
+            line += (
+                f" | x_mentions={sig.get('mention_count', 0)}"
+                f" x_unique_authors={sig.get('unique_authors', 0)}"
+                f" x_total_likes={sig.get('total_likes', 0)}"
+                f" x_snippets=[{formatted_snips}]"
+            )
+        wh = whale_map.get(c.get("mint", ""))
+        if wh:
+            line += (
+                f" | whale_buy_count={wh.get('buy_count', 0)}"
+                f" whale_unique_wallets={wh.get('unique_whales', 0)}"
+                f" whale_total_sol_spent={float(wh.get('total_sol_spent') or 0.0):.3f}"
+                f" whale_sell_count={wh.get('sell_count', 0)}"
+            )
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -319,7 +360,22 @@ async def alpha_node(
             )
         )
 
-    input_text = _build_batch_entry_prompt(safe_candidates, leg2_results, scalper_results)
+    active_social = db.get_active_social_signals(
+        ttl_minutes=config.X_SIGNAL_TTL_MINUTES,
+        now=now_dt,
+    )
+    active_whales = db.get_active_whale_signals(
+        ttl_minutes=config.WHALE_SIGNAL_TTL_MINUTES,
+        min_buys=0,
+        now=now_dt,
+    )
+    input_text = _build_batch_entry_prompt(
+        safe_candidates,
+        leg2_results,
+        scalper_results,
+        social_by_mint=active_social,
+        whale_by_mint=active_whales,
+    )
     questions = _build_batch_entry_questions(safe_candidates)
     answers = await decision_client.decide(input_text=input_text, questions=questions)
 

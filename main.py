@@ -14,6 +14,7 @@ from decision_client import GeminiDecisionClient
 from graph import build_agent_graph
 from state import FocusState
 from telemetry_api import create_telemetry_app
+from x_discovery_worker import run_x_discovery_loop
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,10 +84,17 @@ async def main() -> None:
     server = uvicorn.Server(uv_config)
 
     agent_task = asyncio.create_task(run_autonomous_loop(config, db))
+    x_task = (
+        asyncio.create_task(run_x_discovery_loop(config, db))
+        if config.ENABLE_X_DISCOVERY
+        else None
+    )
     try:
         await server.serve()
     finally:
         agent_task.cancel()
+        if x_task is not None:
+            x_task.cancel()
         db.close()
 
 

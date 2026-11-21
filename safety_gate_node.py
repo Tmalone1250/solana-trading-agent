@@ -254,6 +254,40 @@ async def safety_gate_node(
             mint = cand["mint"]
             symbol = cand.get("symbol", "UNKNOWN")
 
+            # Hard Guardrail: Jupiter Token API v2 audit.isSus == True -> immediate reject
+            jup_sus = cand.get("jup_is_sus") is True or (
+                isinstance(cand.get("jup_meta"), dict) and cand["jup_meta"].get("is_sus") is True
+            )
+            if jup_sus:
+                reason_str = "Jupiter Token v2: audit.isSus=True"
+                if db is not None:
+                    db.remove_from_watchlist(mint)
+                    db.set_cooldown_minutes(
+                        mint,
+                        minutes=config.SAFETY_REJECT_COOLDOWN_MINUTES,
+                        reason=f"SAFETY_REJECT: {reason_str}",
+                        now=now,
+                    )
+                    db.log_action(
+                        mode=config.EXECUTION_MODE,
+                        action="EVICT",
+                        symbol=symbol,
+                        asset_id=mint,
+                        strategy="SAFETY_GATE",
+                        reason=f"SAFETY_REJECT: {reason_str}",
+                        timestamp_utc=now.isoformat() if now else None,
+                    )
+                logger.info(
+                    "[SafetyGate] $%s | REJECTED (%s) -> EVICTED (%dm cooldown)",
+                    symbol,
+                    reason_str,
+                    config.SAFETY_REJECT_COOLDOWN_MINUTES,
+                )
+                rejected.append(
+                    {"mint": mint, "symbol": symbol, "reasons": [reason_str]}
+                )
+                continue
+
             # Cache hit: skip RugCheck + Jupiter Shield on retained active_watchlist slots
             if cand.get("safety_passed") is True or watchlist_safety.get(mint) is True:
                 enriched = dict(cand)

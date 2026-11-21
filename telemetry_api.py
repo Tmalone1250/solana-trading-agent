@@ -7,11 +7,16 @@ import io
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import FastAPI, Query, Response
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import AgentConfig, load_config
 from db import ACTION_LOG_COLUMNS, AgentDatabase, utc_now
+from helius_webhook import (
+    fetch_helius_tracked_wallets,
+    process_helius_webhook_payload,
+    verify_helius_auth,
+)
 
 
 def create_telemetry_app(
@@ -33,7 +38,7 @@ def create_telemetry_app(
         CORSMiddleware,
         allow_origins=["*"],
         allow_credentials=False,
-        allow_methods=["GET"],
+        allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],
     )
 
@@ -42,7 +47,7 @@ def create_telemetry_app(
         return {"status": "ok"}
 
     @app.get("/api/telemetry")
-    def get_telemetry() -> dict[str, Any]:
+    async def get_telemetry() -> dict[str, Any]:
         st = database.get_state()
         pos = st.get("active_position")
 
@@ -81,6 +86,15 @@ def create_telemetry_app(
         recent_decisions = database.get_recent_decisions(limit=15)
 
         now_dt = utc_now()
+        active_social = database.get_active_social_signals(
+            ttl_minutes=cfg.X_SIGNAL_TTL_MINUTES,
+            now=now_dt,
+        )
+        active_whales = database.get_active_whale_signals(
+            ttl_minutes=cfg.WHALE_SIGNAL_TTL_MINUTES,
+            min_buys=1,
+            now=now_dt,
+        )
         active_watchlist_payload = []
         for entry in database.get_watchlist():
             added_dt = datetime.fromisoformat(entry["added_at"])
@@ -100,6 +114,8 @@ def create_telemetry_app(
                 slot_status = "BLOCKED"
             else:
                 slot_status = "READY"
+            sig = active_social.get(entry["mint"])
+            wh = active_whales.get(entry["mint"])
             active_watchlist_payload.append(
                 {
                     "mint": entry["mint"],
@@ -118,6 +134,10 @@ def create_telemetry_app(
                     "setup_type": entry.get("setup_type") or "NONE",
                     "scalper_eligible": scalper_ok,
                     "dist_from_1h_high_pct": entry.get("dist_from_1h_high_pct"),
+                    "discovery_source": entry.get("discovery_source") or "DEXSCREENER",
+                    "jup_organic_score": entry.get("jup_organic_score"),
+                    "x_mentions": int(sig["mention_count"]) if sig else 0,
+                    "whale_buys": int(wh["buy_count"]) if wh else 0,
                     "status": slot_status,
                     "time_in_slot_seconds": round(in_slot_sec, 1),
                     "time_in_slot_minutes": round(in_slot_sec / 60.0, 2),
@@ -126,6 +146,18 @@ def create_telemetry_app(
                 }
             )
 
+        tracked_wallets = await fetch_helius_tracked_wallets(cfg)
+        recent_whale_events = [
+            {**ev, "wallet_label": cfg.resolve_wallet_label(ev["wallet"])}
+            for ev in database.get_recent_whale_events(limit=25)
+        ]
+        whale_roster = [
+            {**row, "wallet_label": cfg.resolve_wallet_label(row["wallet"])}
+            for row in database.get_whale_roster_stats(
+                tracked_wallets, window_hours=24, now=now_dt
+            )
+        ]
+
         return {
             "focus_state": st["focus_state"],
             "execution_mode": cfg.EXECUTION_MODE,
@@ -133,6 +165,23 @@ def create_telemetry_app(
             "active_mint": active_mint,
             "active_symbol": active_symbol,
             "active_watchlist": active_watchlist_payload,
+            "x_discovery": {
+                "enabled": cfg.ENABLE_X_DISCOVERY,
+                "tweets_today": database.count_x_tweets_today(now=now_dt),
+                "daily_cap": cfg.X_DAILY_TWEET_CAP,
+                "active_signal_mints": len(active_social),
+                "last_poll_utc": database.get_x_last_poll_utc(),
+            },
+            "whale_discovery": {
+                "enabled": cfg.ENABLE_HELIUS_WHALE_WEBHOOK,
+                "tracked_wallet_count": len(tracked_wallets),
+                "active_whale_mints": len(active_whales),
+                "events_today": database.count_whale_events_today(now=now_dt),
+                "total_sol_volume_today": database.get_whale_sol_volume_today(now=now_dt),
+                "active_signals": list(active_whales.values()),
+                "recent_events": recent_whale_events,
+                "roster": whale_roster,
+            },
             "live_jupiter_pnl": live_pnl,
             "sol_balance": round(float(st["sol_balance"]), 6),
             "daily_pnl_sol": round(daily_pnl, 6),
@@ -178,6 +227,24 @@ def create_telemetry_app(
                 "Content-Disposition": 'attachment; filename="solana_actions.csv"',
             },
         )
+
+    @app.post("/api/webhooks/helius")
+    async def helius_webhook(
+        request: Request,
+        authorization: Optional[str] = Header(default=None),
+    ) -> dict[str, Any]:
+        if not verify_helius_auth(authorization, cfg.HELIUS_AUTH_HEADER):
+            raise HTTPException(status_code=401, detail="Invalid Authorization header")
+        try:
+            payload = await request.json()
+        except Exception:
+            return {"status": "ok", "received": 0, "recorded": 0, "duplicates": 0, "ignored": 0}
+        return process_helius_webhook_payload(payload, config=cfg, db=database)
+
+    @app.post("/api/webhooks/helius/sync")
+    async def helius_webhook_sync() -> dict[str, Any]:
+        wallets = await fetch_helius_tracked_wallets(cfg, force_refresh=True)
+        return {"synced_count": len(wallets), "wallets": wallets}
 
     return app
 

@@ -11,6 +11,7 @@ import httpx
 
 from config import AgentConfig
 from db import AgentDatabase, utc_now
+from jupiter_token_client import enrich_mints, fetch_discovery_mints
 from leg2_predictor import compute_leg2_score
 from state import AgentGraphState, CandidateToken, FocusState
 
@@ -223,26 +224,50 @@ async def fetch_dexscreener_trending_solana(
     config: AgentConfig,
     client: httpx.AsyncClient,
     extra_mints: Optional[list[str]] = None,
+    whale_mints: Optional[list[str]] = None,
+    x_mints: Optional[list[str]] = None,
+    jupiter_mints: Optional[list[str]] = None,
     now_ts: Optional[float] = None,
-) -> tuple[list[dict[str, Any]], dict[str, float]]:
-    """Merge GeckoTerminal trending + DexScreener boosts/profiles/CTOs and batch-fetch pairs."""
+) -> tuple[list[dict[str, Any]], dict[str, float], dict[str, str]]:
+    """Merge WHALE + X + Jupiter v2 + GeckoTerminal + DexScreener mints and batch-fetch pairs."""
     boost_map: dict[str, float] = {}
+    source_by_mint: dict[str, str] = {}
     mints: list[str] = []
     seen: set[str] = set()
 
-    def _add_mint(addr: str) -> None:
+    source_priority = {"WHALE": 5, "X": 4, "JUPITER": 3, "GECKO": 2, "DEXSCREENER": 1}
+
+    def _add_mint(addr: str, source: Optional[str] = None) -> None:
         cleaned = addr.strip()
-        if cleaned and cleaned not in seen:
+        if not cleaned:
+            return
+        if source:
+            existing = source_by_mint.get(cleaned)
+            if existing is None or source_priority.get(source, 0) > source_priority.get(existing, 0):
+                source_by_mint[cleaned] = source
+        if cleaned not in seen:
             seen.add(cleaned)
             mints.append(cleaned)
 
     for m in extra_mints or []:
         _add_mint(m)
 
+    # 0a. Helius Whale Webhook signals (highest priority discovery source)
+    for m in whale_mints or []:
+        _add_mint(m, source="WHALE")
+
+    # 0b. X (TwitterAPI.io) social signal mints
+    for m in x_mints or []:
+        _add_mint(m, source="X")
+
+    # 0c. Jupiter Token API v2 discovery mints (/toporganicscore/5m & /toptrending/5m)
+    for m in jupiter_mints or []:
+        _add_mint(m, source="JUPITER")
+
     # 1. Organic trending discovery from GeckoTerminal (60s cached)
     gecko_mints = await fetch_geckoterminal_trending_solana(config, client, now_ts=now_ts)
     for m in gecko_mints:
-        _add_mint(m)
+        _add_mint(m, source="GECKO")
 
     # 2. DexScreener boosts, profiles, and community takeovers (CTOs)
     endpoints = [
@@ -267,7 +292,7 @@ async def fetch_dexscreener_trending_solana(
                         boost_map.get(addr, 0.0),
                         float(item.get("totalAmount") or item.get("amount") or 0.0),
                     )
-                    _add_mint(addr)
+                    _add_mint(addr, source="DEXSCREENER")
         except Exception as exc:
             logger.warning("DexScreener discovery fetch failed (%s): %s", url, exc)
 
@@ -287,7 +312,7 @@ async def fetch_dexscreener_trending_solana(
         except Exception as exc:
             logger.warning("DexScreener batch pair fetch failed: %s", exc)
 
-    return pairs, boost_map
+    return pairs, boost_map, source_by_mint
 
 
 def _evict_stale_or_cooled_watchlist(
@@ -390,26 +415,77 @@ async def scanner_node(
     kept_entries = _evict_stale_or_cooled_watchlist(config=config, db=db, now_dt=now_dt)
     kept_mints = [e["mint"] for e in kept_entries]
 
-    # 2. Fetch widened DexScreener discovery feeds + refresh kept watchlist mints
+    # 1b. Query active Helius whale signals (buy_count >= 1) and X social signals
+    active_whales = db.get_active_whale_signals(
+        ttl_minutes=config.WHALE_SIGNAL_TTL_MINUTES,
+        min_buys=1,
+        now=now_dt,
+    )
+    whale_mints = list(active_whales.keys())
+
+    active_social = db.get_active_social_signals(
+        ttl_minutes=config.X_SIGNAL_TTL_MINUTES,
+        now=now_dt,
+    )
+    x_mints = list(active_social.keys())
+
+    # 2. Fetch Jupiter v2 + DexScreener + GeckoTerminal + X + Whale discovery feeds & refresh kept watchlist mints
     owns_client = http_client is None
     client = http_client or httpx.AsyncClient()
+    jup_meta_by_mint: dict[str, dict[str, Any]] = {}
     try:
-        pairs, boost_map = await fetch_dexscreener_trending_solana(
-            config, client, extra_mints=kept_mints, now_ts=now_dt.timestamp()
+        if config.ENABLE_JUPITER_DISCOVERY:
+            jup_meta_by_mint = await fetch_discovery_mints(
+                config, client, now_ts=now_dt.timestamp()
+            )
+        pairs, boost_map, source_by_mint = await fetch_dexscreener_trending_solana(
+            config,
+            client,
+            extra_mints=kept_mints,
+            whale_mints=whale_mints,
+            x_mints=x_mints,
+            jupiter_mints=list(jup_meta_by_mint.keys()),
+            now_ts=now_dt.timestamp(),
         )
+        parsed = [
+            c
+            for p in pairs
+            if (c := _parse_pair_to_candidate(p, boost_map, current_ms)) is not None
+        ]
+        eligible = filter_candidates(parsed, config, db, now_dt=now_dt)
+
+        # Enrich any eligible or kept watchlist mints not already in jup_meta_by_mint
+        if config.ENABLE_JUPITER_DISCOVERY:
+            to_enrich = [
+                m
+                for m in ([c.mint for c in eligible] + kept_mints)
+                if m not in jup_meta_by_mint
+            ]
+            if to_enrich:
+                enriched = await enrich_mints(
+                    to_enrich, config, client, now_ts=now_dt.timestamp()
+                )
+                jup_meta_by_mint.update(enriched)
     finally:
         if owns_client:
             await client.aclose()
 
-    parsed = [
-        c
-        for p in pairs
-        if (c := _parse_pair_to_candidate(p, boost_map, current_ms)) is not None
-    ]
-    eligible = filter_candidates(parsed, config, db, now_dt=now_dt)
+    # Hard Guardrail: reject tokens flagged audit.isSus == True by Jupiter Token v2
+    clean_eligible: list[CandidateToken] = []
+    for c in eligible:
+        j_meta = jup_meta_by_mint.get(c.mint)
+        if j_meta and j_meta.get("is_sus") is True:
+            logger.info(
+                "[Scanner] $%s | REJECTED (Jupiter audit.isSus=True) -> blocked from watchlist",
+                c.symbol,
+            )
+            continue
+        clean_eligible.append(c)
+
+    eligible = clean_eligible
     eligible_by_mint = {c.mint: c for c in eligible}
 
-    # 3. Keep existing valid watchlist mints (updating live metrics, peak_mc/low_mc, leg2_score)
+    # 3. Keep existing valid watchlist mints (updating live metrics, peak_mc/low_mc, leg2_score, jup_meta)
     active_mints: set[str] = set()
     for entry in kept_entries:
         mint = entry["mint"]
@@ -430,6 +506,8 @@ async def scanner_node(
                 tracked_low_mc=low_mc,
                 entry_liquidity_usd=entry_liq,
             )
+            j_meta = jup_meta_by_mint.get(mint) or entry.get("jup_meta")
+            j_score = float(j_meta["organic_score"]) if isinstance(j_meta, dict) and j_meta.get("organic_score") is not None else entry.get("jup_organic_score")
             db.upsert_watchlist_entry(
                 mint=mint,
                 symbol=fresh.symbol,
@@ -441,13 +519,16 @@ async def scanner_node(
                 low_mc=low_mc,
                 leg2_score=leg2.score,
                 leg2_breakdown=leg2.model_dump(),
+                discovery_source=source_by_mint.get(mint, entry.get("discovery_source") or "DEXSCREENER"),
+                jup_organic_score=j_score,
+                jup_meta=j_meta,
             )
             active_mints.add(mint)
         else:
-            # No longer meets lane/liquidity/volume criteria -> free slot
+            # No longer meets lane/liquidity/volume or flagged isSus -> free slot
             db.remove_from_watchlist(mint)
             logger.info(
-                "[Scanner] $%s | no longer meets lane/liq/vol filters -> EVICTED (slot freed)",
+                "[Scanner] $%s | no longer meets lane/liq/vol/safety filters -> EVICTED (slot freed)",
                 entry["symbol"],
             )
 
@@ -463,6 +544,9 @@ async def scanner_node(
             tracked_low_mc=cand.market_cap_usd,
             entry_liquidity_usd=cand.liquidity_usd,
         )
+        src = source_by_mint.get(cand.mint, "DEXSCREENER")
+        j_meta = jup_meta_by_mint.get(cand.mint)
+        j_score = float(j_meta["organic_score"]) if isinstance(j_meta, dict) and j_meta.get("organic_score") is not None else None
         db.upsert_watchlist_entry(
             mint=cand.mint,
             symbol=cand.symbol,
@@ -475,15 +559,20 @@ async def scanner_node(
             low_mc=cand.market_cap_usd,
             leg2_score=leg2.score,
             leg2_breakdown=leg2.model_dump(),
+            discovery_source=src,
+            jup_organic_score=j_score,
+            jup_meta=j_meta,
         )
         active_mints.add(cand.mint)
         logger.info(
-            "[Scanner] +SLOT $%s (vol_1h=$%s, liq=$%s, mc=$%s, leg2=%.0f/100) -> added to watchlist (%d/%d)",
+            "[Scanner] +SLOT $%s [%s] (vol_1h=$%s, liq=$%s, mc=$%s, leg2=%.0f/100, jup_org=%s) -> added to watchlist (%d/%d)",
             cand.symbol,
+            src,
             f"{cand.volume_1h_usd:,.0f}",
             f"{cand.liquidity_usd:,.0f}",
             f"{cand.market_cap_usd:,.0f}",
             leg2.score,
+            f"{j_score:.0f}" if j_score is not None else "n/a",
             len(active_mints),
             config.MAX_WATCH_BATCH,
         )
@@ -493,6 +582,7 @@ async def scanner_node(
     for entry in final_watchlist:
         cand_dict = dict(entry.get("candidate") or {})
         cand_dict["pair_address"] = entry.get("pair_address") or cand_dict.get("pair_address") or ""
+        cand_dict["discovery_source"] = entry.get("discovery_source") or "DEXSCREENER"
         cand_dict["added_at"] = entry["added_at"]
         cand_dict["safety_passed"] = bool(entry.get("safety_passed", False))
         cand_dict["entry_liquidity_usd"] = float(entry.get("entry_liquidity_usd") or 0.0)
@@ -500,6 +590,14 @@ async def scanner_node(
         cand_dict["low_mc"] = float(entry.get("low_mc") or 0.0)
         cand_dict["leg2_score"] = float(entry.get("leg2_score") or 0.0)
         cand_dict["leg2_breakdown"] = entry.get("leg2_breakdown")
+        j_meta = entry.get("jup_meta")
+        cand_dict["jup_organic_score"] = entry.get("jup_organic_score")
+        cand_dict["jup_meta"] = j_meta
+        if isinstance(j_meta, dict):
+            cand_dict["jup_is_verified"] = bool(j_meta.get("is_verified", False))
+            cand_dict["jup_holder_count"] = int(j_meta.get("holder_count") or 0)
+            cand_dict["jup_top_holders_pct"] = j_meta.get("top_holders_pct")
+            cand_dict["jup_is_sus"] = bool(j_meta.get("is_sus", False))
         batch_candidates.append(cand_dict)
 
     logger.info(

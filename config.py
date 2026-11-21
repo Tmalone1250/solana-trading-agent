@@ -10,6 +10,17 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 SOL_MINT = "So11111111111111111111111111111111111111112"
 LAMPORTS_PER_SOL = 1_000_000_000
 
+DEFAULT_WHALE_WALLET_LABELS: dict[str, str] = {
+    "862TYS3qj1vRGWo2": "Wugi",
+    "J9TYAsWWidbrcZybmLSfrLzryANf4CgJBLdvwdGuC8MB": "Johnson",
+    "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk": "Jijo",
+    "BQVz7fQ1WsQmSTMY3umdPEPPTm1sdcBcX9sP7o6kPRmB": "Limfork.eth",
+    "387FRwow6MKDhSwuMULhKjqeXuxoBY4BbbaSntdk9LaH": "Shawty",
+    "ardinRsN1mNYVeoJWTBsWeYeXvuR9UUDGMsCDKpb6AT": "trunoest",
+    "4vw54B78b2h7rw9Ud9": "decu",
+    "EqiFgyNw6kgrmYstWyrP8VjKhka7XEmKTZzHSmwpr1Zb": "ban",
+}
+
 
 class AgentConfig(BaseSettings):
     """Runtime configuration loaded from environment variables / .env."""
@@ -89,6 +100,37 @@ class AgentConfig(BaseSettings):
     SCALPER_MIN_BUY_RATIO_5M: float = Field(default=0.58, ge=0.0, le=1.0)
     SCALPER_MIN_TXNS_5M: int = Field(default=15, ge=1)
 
+    # Jupiter Token API v2 Discovery & Organic Enrichment
+    ENABLE_JUPITER_DISCOVERY: bool = True
+    JUPITER_TOKENS_V2_BASE_URL: str = "https://api.jup.ag/tokens/v2"
+    JUPITER_POLL_CACHE_SECONDS: float = Field(default=60.0, gt=0.0)
+    JUPITER_MIN_ORGANIC_SCORE: float = Field(default=0.0, ge=0.0, le=100.0)
+    JUPITER_REQUEST_DELAY_SECONDS: float = Field(default=0.25, ge=0.0)
+
+    # X (TwitterAPI.io) Discovery & Sentiment
+    ENABLE_X_DISCOVERY: bool = False
+    TWITTERAPI_IO_KEY: str = ""
+    TWITTERAPI_IO_BASE_URL: str = "https://api.twitterapi.io"
+    X_LIST_IDS: str = ""
+    X_SEARCH_QUERY: str = '"pump" (solana OR dexscreener) min_faves:5 -filter:retweets'
+    X_POLL_INTERVAL_MINUTES: int = Field(default=30, gt=0)
+    X_DAILY_TWEET_CAP: int = Field(default=1000, gt=0)
+    X_SIGNAL_TTL_MINUTES: int = Field(default=60, gt=0)
+
+    # Helius Enhanced Webhook Whale Tracking
+    ENABLE_HELIUS_WHALE_WEBHOOK: bool = False
+    HELIUS_API_KEY: str = ""
+    HELIUS_WEBHOOK_ID: str = ""
+    HELIUS_API_BASE_URL: str = "https://api.helius.xyz/v0"
+    HELIUS_ROSTER_CACHE_SECONDS: float = Field(default=300.0, gt=0.0)
+    HELIUS_AUTH_HEADER: str = ""
+    HELIUS_TRACKED_WALLETS: str = ""
+    WHALE_WALLET_LABELS: dict[str, str] = Field(
+        default_factory=lambda: dict(DEFAULT_WHALE_WALLET_LABELS)
+    )
+    WHALE_SIGNAL_TTL_MINUTES: int = Field(default=30, gt=0)
+    WHALE_MIN_SOL_SPENT: float = Field(default=0.5, ge=0.0)
+
     # Endpoints
     DEXSCREENER_BASE_URL: str = "https://api.dexscreener.com"
     GECKOTERMINAL_BASE_URL: str = "https://api.geckoterminal.com/api/v2"
@@ -116,6 +158,28 @@ class AgentConfig(BaseSettings):
         if self.HUNTING_LANE == "momentum_runners":
             return (self.MIN_MC_USD, self.MAX_MC_USD, self.MIN_AGE_MINUTES * 60.0)
         return (50_000.0, 150_000.0, 0.0)
+
+    def x_list_id_list(self) -> list[str]:
+        """Return parsed comma-separated X_LIST_IDS."""
+        return [item.strip() for item in self.X_LIST_IDS.split(",") if item.strip()]
+
+    def helius_tracked_wallet_set(self) -> set[str]:
+        """Return parsed comma-separated HELIUS_TRACKED_WALLETS."""
+        return {item.strip() for item in self.HELIUS_TRACKED_WALLETS.split(",") if item.strip()}
+
+    def resolve_wallet_label(self, wallet: str) -> str:
+        """Resolve a human-readable Kolscan/custom label or fall back to truncated AbCd...wXyZ."""
+        addr = (wallet or "").strip()
+        if not addr:
+            return "unknown"
+        if addr in self.WHALE_WALLET_LABELS:
+            return self.WHALE_WALLET_LABELS[addr]
+        for key, label in self.WHALE_WALLET_LABELS.items():
+            if key and addr.startswith(key):
+                return label
+        if len(addr) > 10:
+            return f"{addr[:4]}...{addr[-4:]}"
+        return addr
 
 
 def load_config(**overrides) -> AgentConfig:

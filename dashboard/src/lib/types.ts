@@ -71,6 +71,50 @@ export interface DecisionRationale {
   rationale: string;
 }
 
+export interface WhaleSignal {
+  mint: string;
+  buy_count: number;
+  unique_whales: number;
+  total_sol_spent: number;
+  sell_count: number;
+  last_seen_utc: string;
+}
+
+export interface WhaleEvent {
+  signature: string;
+  wallet: string;
+  wallet_label: string;
+  mint: string;
+  side: "BUY" | "SELL" | string;
+  sol_amount: number;
+  token_amount: number;
+  timestamp_utc: string;
+}
+
+export interface WhaleRosterEntry {
+  wallet: string;
+  wallet_label: string;
+  buys_24h: number;
+  sells_24h: number;
+  total_sol_buys: number;
+  total_sol_sells: number;
+  total_sol_volume: number;
+  last_seen_utc: string | null;
+  last_mint: string | null;
+  last_side: string | null;
+}
+
+export interface WhaleDiscoveryPayload {
+  enabled: boolean;
+  tracked_wallet_count: number;
+  active_whale_mints: number;
+  events_today: number;
+  total_sol_volume_today: number;
+  active_signals: WhaleSignal[];
+  recent_events: WhaleEvent[];
+  roster: WhaleRosterEntry[];
+}
+
 export interface TelemetryPayload {
   focus_state: FocusState;
   execution_mode: "paper" | "live";
@@ -78,6 +122,7 @@ export interface TelemetryPayload {
   active_mint: string | null;
   active_symbol: string | null;
   active_watchlist: WatchlistSlot[];
+  whale_discovery?: WhaleDiscoveryPayload;
   live_jupiter_pnl: LiveJupiterPnl | null;
   sol_balance: number;
   daily_pnl_sol: number;
@@ -110,4 +155,25 @@ export function formatShortTime(iso?: string | null): string {
   } catch {
     return iso;
   }
+}
+
+export function formatRelativeTime(iso?: string | null): string {
+  if (!iso) return "—";
+  try {
+    const diffSec = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+    if (diffSec < 60) return `${diffSec}s ago`;
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) return `${diffMin}m ago`;
+    const diffHr = Math.floor(diffMin / 60);
+    if (diffHr < 24) return `${diffHr}h ago`;
+    return `${Math.floor(diffHr / 24)}d ago`;
+  } catch {
+    return iso;
+  }
+}
+
+export function truncateAddress(addr?: string | null): string {
+  if (!addr) return "—";
+  if (addr.length <= 10) return addr;
+  return `${addr.slice(0, 4)}...${addr.slice(-4)}`;
 }
