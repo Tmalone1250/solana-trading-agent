@@ -10,8 +10,9 @@ from typing import Any, Optional
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
+from action_export import render_actions_csv, resolve_export_action_filter
 from config import AgentConfig, load_config
-from db import ACTION_LOG_COLUMNS, AgentDatabase, utc_now
+from db import AgentDatabase, utc_now
 from helius_webhook import (
     fetch_helius_tracked_wallets,
     process_helius_webhook_payload,
@@ -296,29 +297,27 @@ def create_telemetry_app(
             "updated_at": st["updated_at"],
         }
 
+    def _build_csv_export(
+        limit: int,
+        export_type: Optional[str],
+        actions: Optional[str],
+    ) -> Response:
+        action_filter = resolve_export_action_filter(export_type=export_type, actions_param=actions)
+        rows = database.get_action_log(limit=limit, actions=action_filter)
+        return Response(
+            content=render_actions_csv(rows),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="solana_actions.csv"'},
+        )
+
+    @app.get("/api/export/csv")
     @app.get("/api/export/actions.csv")
     def export_actions_csv(
         limit: int = Query(default=1000, ge=1, le=50_000),
+        export_type: Optional[str] = Query(default="all", alias="type"),
         actions: Optional[str] = Query(default=None),
     ) -> Response:
-        action_filter = (
-            [a.strip().upper() for a in actions.split(",") if a.strip()]
-            if actions
-            else None
-        )
-        rows = database.get_action_log(limit=limit, actions=action_filter)
-        buf = io.StringIO()
-        writer = csv.DictWriter(buf, fieldnames=ACTION_LOG_COLUMNS, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({k: ("" if row.get(k) is None else row.get(k)) for k in ACTION_LOG_COLUMNS})
-        return Response(
-            content=buf.getvalue(),
-            media_type="text/csv; charset=utf-8",
-            headers={
-                "Content-Disposition": 'attachment; filename="solana_actions.csv"',
-            },
-        )
+        return _build_csv_export(limit=limit, export_type=export_type, actions=actions)
 
     @app.post("/api/webhooks/helius")
     async def helius_webhook(
@@ -336,6 +335,16 @@ def create_telemetry_app(
     @app.post("/api/webhooks/helius/sync")
     async def helius_webhook_sync() -> dict[str, Any]:
         wallets = await fetch_helius_tracked_wallets(cfg, force_refresh=True)
+        database.log_action(
+            mode=cfg.EXECUTION_MODE,
+            action="WHALE_DISCOVERY",
+            symbol="ROSTER",
+            asset_id="HELIUS_WEBHOOK",
+            qty=float(len(wallets)),
+            strategy="WHALE_DISCOVERY",
+            reason=f"ROSTER_SYNC ({len(wallets)} wallets)",
+            triggering_whales=",".join(cfg.resolve_wallet_label(w) for w in wallets[:10]),
+        )
         return {"synced_count": len(wallets), "wallets": wallets}
 
     return app

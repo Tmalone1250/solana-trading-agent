@@ -332,6 +332,7 @@ async def alpha_node(
                 await client.aclose()
 
     scalper_results: list[ScalperEntryResult] = []
+    soak_minutes_list: list[float] = []
     for cand in safe_candidates:
         added_at_str = cand.get("added_at") or (watchlist_by_mint.get(cand["mint"]) or {}).get("added_at")
         if added_at_str:
@@ -341,6 +342,7 @@ async def alpha_node(
             time_in_slot_min = max(0.0, (now_dt - added_dt).total_seconds() / 60.0)
         else:
             time_in_slot_min = 0.0
+        soak_minutes_list.append(round(time_in_slot_min, 2))
 
         p_addr = str(
             cand.get("pair_address")
@@ -462,6 +464,32 @@ async def alpha_node(
             confidence=dec.action_confidence,
             scores=scores_payload,
             rationale=dec.rationale,
+        )
+        cand_mc = float(cand.get("market_cap_usd") or 0.0) or None
+        cand_liq = float(cand.get("liquidity_usd") or 0.0) or None
+        cand_soak = soak_minutes_list[idx]
+        dec_outcome = (
+            "APPROVE"
+            if approved
+            else (f"BLOCKED: {scalper.rejection_reason}" if decision1_wants_buy else dec.action)
+        )
+        db.log_action(
+            mode=config.EXECUTION_MODE,
+            action="DECISION_1",
+            symbol=dec.symbol,
+            asset_id=dec.mint,
+            strategy="LEG2_ENTRY" if (approved and leg2_fast_track and not standard_approved) else scalper.setup_type,
+            reason=f"{dec.action} -> {dec_outcome}",
+            timestamp_utc=now_iso,
+            mc_usd=cand_mc,
+            liq_usd=cand_liq,
+            soak_minutes=cand_soak,
+            rsi=round(scalper.rsi_5m, 2),
+            leg2_score=round(leg2_score, 2),
+            narrative_score=round(dec.narrative_strength, 2),
+            momentum_score=round(dec.momentum_quality, 2),
+            vamp_score=round(dec.is_copycat_vamp, 3),
+            buy_confidence=round(dec.action_confidence, 3),
         )
 
         if approved:

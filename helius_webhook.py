@@ -365,6 +365,20 @@ def process_helius_webhook_payload(
             st = db.get_state()
             if st.get("focus_state") != "SCANNING":
                 db.upsert_whale_decision(ev["mint"], "SKIPPED", "POSITION_OPEN", updated_at=now_dt.isoformat())
+        db.log_action(
+            mode=config.EXECUTION_MODE,
+            action="WHALE_WEBHOOK",
+            symbol=ev["side"],
+            asset_id=ev["mint"],
+            qty=ev["token_amount"],
+            notional=round(ev["sol_amount"], 6),
+            price_or_value=round(ev["sol_amount"], 6),
+            strategy="WHALE_RADAR",
+            reason=f"WHALE_{ev['side']}",
+            timestamp_utc=ev["timestamp_utc"],
+            triggering_whales=config.resolve_wallet_label(ev["wallet"]),
+            whale_sol_flow=round(ev["sol_amount"] if ev["side"] == "BUY" else -ev["sol_amount"], 6),
+        )
         logger.info(
             "[WhaleWebhook] %s | wallet=%s.. | mint=%s.. | %.3f SOL",
             ev["side"],

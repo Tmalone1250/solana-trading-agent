@@ -93,7 +93,7 @@ async def test_action_ledger_logs_buy_sell_evict_circuit_breaker_and_csv_export(
         amount_atomic=1_000_000,
         reason="TRAILING_TP",
         target_state_after_fill=FocusState.WATCHING_REENTRY,
-        strategy="SWEEP_RECLAIM",
+        # Intentionally leave strategy at default "SCALPER" to verify SELL inherits entry strategy "SWEEP_RECLAIM"
     )
     reentry_order = PendingOrder(
         side="BUY",
@@ -140,19 +140,79 @@ async def test_action_ledger_logs_buy_sell_evict_circuit_breaker_and_csv_export(
             now=now_dt,
         )
 
+    # 5. Whale board events: WHALE_WEBHOOK, WHALE_CONFLUENCE, WHALE_DISCOVERY
+    from helius_webhook import process_helius_webhook_payload
+
+    cfg_wh = AgentConfig(_env_file=None, EXECUTION_MODE="paper", ENABLE_HELIUS_WHALE_WEBHOOK=True)
+    process_helius_webhook_payload(
+        [
+            {
+                "signature": "sig-wh-csv-1",
+                "type": "SWAP",
+                "timestamp": int(now_dt.timestamp()),
+                "feePayer": "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk",
+                "nativeTransfers": [
+                    {
+                        "fromUserAccount": "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk",
+                        "toUserAccount": "Pool111",
+                        "amount": 2_500_000_000,
+                    }
+                ],
+                "tokenTransfers": [
+                    {
+                        "mint": "MintWhaleCsv",
+                        "fromUserAccount": "Pool111",
+                        "toUserAccount": "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk",
+                        "tokenAmount": 500_000.0,
+                    }
+                ],
+            }
+        ],
+        config=cfg_wh,
+        db=db,
+        now=now_dt,
+    )
+    db.log_action(
+        mode="paper",
+        action="WHALE_CONFLUENCE",
+        symbol="WCOIN",
+        asset_id="MintWhaleCsv",
+        notional=0.25,
+        strategy="WHALE_SCALP",
+        reason="WHALE_SCALP_SOLO",
+        mc_usd=120_000.0,
+        liq_usd=45_000.0,
+        triggering_whales="Jijo",
+        whale_sol_flow=2.5,
+    )
+    db.log_action(
+        mode="paper",
+        action="WHALE_DISCOVERY",
+        symbol="ROSTER",
+        asset_id="HELIUS_WEBHOOK",
+        qty=12.0,
+        strategy="WHALE_DISCOVERY",
+        reason="ROSTER_SYNC (12 wallets)",
+        triggering_whales="Jijo",
+    )
+
     all_actions = db.get_action_log(limit=100)
     action_types = [r["action"] for r in all_actions]
     assert action_types.count("EVICT") == 2
+    assert action_types.count("DECISION_1") == 1
     assert action_types.count("BUY") == 1
     assert action_types.count("SELL") == 1
     assert action_types.count("REENTRY_BUY") == 1
     assert action_types.count("CIRCUIT_BREAKER") == 1
+    assert action_types.count("WHALE_WEBHOOK") == 1
+    assert action_types.count("WHALE_CONFLUENCE") == 1
+    assert action_types.count("WHALE_DISCOVERY") == 1
 
-    # 5. Verify GET /api/export/actions.csv (headers, rows, CORS, Content-Disposition, filters)
+    # 6. Verify GET /api/export/csv & /api/export/actions.csv (30 columns + ?type= filters)
     app = create_telemetry_app(config=cfg, db=db)
     tc = TestClient(app)
 
-    resp_all = tc.get("/api/export/actions.csv", headers={"Origin": "http://localhost:3000"})
+    resp_all = tc.get("/api/export/csv", headers={"Origin": "http://localhost:3000"})
     assert resp_all.status_code == 200
     assert resp_all.headers["content-type"].startswith("text/csv")
     assert 'attachment; filename="solana_actions.csv"' in resp_all.headers["content-disposition"]
@@ -160,18 +220,45 @@ async def test_action_ledger_logs_buy_sell_evict_circuit_breaker_and_csv_export(
 
     parsed_all = list(csv.DictReader(io.StringIO(resp_all.text)))
     assert list(parsed_all[0].keys()) == ACTION_LOG_COLUMNS
-    assert len(parsed_all) == 6
+    assert len(ACTION_LOG_COLUMNS) == 30
+    assert len(parsed_all) == 10
     assert all(r["bot"] == "solana_meme" and r["unit"] == "SOL" for r in parsed_all)
+    # Every row has enriched equity & daily realized SOL populated
+    assert all(r["sol_equity"] != "" and r["daily_realized_sol"] != "" for r in parsed_all)
 
-    # Filtered export: ?actions=BUY,SELL&limit=10
+    # ?type=trades returns only BUY / SELL / REENTRY_BUY, and SELL inherits SWEEP_RECLAIM
+    resp_trades = tc.get("/api/export/csv?type=trades")
+    assert resp_trades.status_code == 200
+    parsed_trades = list(csv.DictReader(io.StringIO(resp_trades.text)))
+    assert {r["action"] for r in parsed_trades} == {"BUY", "SELL", "REENTRY_BUY"}
+    sell_row = next(r for r in parsed_trades if r["action"] == "SELL")
+    assert float(sell_row["pnl_amount"]) == pytest.approx(0.075, rel=1e-4)
+    assert float(sell_row["pnl_pct"]) == pytest.approx(15.0, rel=1e-2)
+    assert sell_row["strategy"] == "SWEEP_RECLAIM"
+
+    # ?type=whales returns only WHALE_WEBHOOK / WHALE_CONFLUENCE / WHALE_DISCOVERY
+    resp_whales = tc.get("/api/export/csv?type=whales")
+    assert resp_whales.status_code == 200
+    parsed_whales = list(csv.DictReader(io.StringIO(resp_whales.text)))
+    assert {r["action"] for r in parsed_whales} == {"WHALE_WEBHOOK", "WHALE_CONFLUENCE", "WHALE_DISCOVERY"}
+    wh_row = next(r for r in parsed_whales if r["action"] == "WHALE_WEBHOOK")
+    assert wh_row["triggering_whales"] == "Jijo"
+    assert float(wh_row["whale_sol_flow"]) == pytest.approx(2.5, rel=1e-4)
+
+    # ?type=watchlist returns DECISION_1 / EVICT / CIRCUIT_BREAKER with Decision 1 scores
+    resp_watch = tc.get("/api/export/csv?type=watchlist")
+    assert resp_watch.status_code == 200
+    parsed_watch = list(csv.DictReader(io.StringIO(resp_watch.text)))
+    assert {r["action"] for r in parsed_watch} == {"DECISION_1", "EVICT", "CIRCUIT_BREAKER"}
+    d1_row = next(r for r in parsed_watch if r["action"] == "DECISION_1")
+    assert float(d1_row["narrative_score"]) == pytest.approx(3.0, rel=1e-2)
+    assert float(d1_row["vamp_score"]) == pytest.approx(0.9, rel=1e-2)
+
+    # Legacy alias /api/export/actions.csv?actions=BUY,SELL still works
     resp_filtered = tc.get("/api/export/actions.csv?actions=BUY,SELL&limit=10")
     assert resp_filtered.status_code == 200
     parsed_filtered = list(csv.DictReader(io.StringIO(resp_filtered.text)))
     assert len(parsed_filtered) == 2
     assert {r["action"] for r in parsed_filtered} == {"BUY", "SELL"}
-    sell_row = next(r for r in parsed_filtered if r["action"] == "SELL")
-    assert float(sell_row["pnl_amount"]) == pytest.approx(0.075, rel=1e-4)
-    assert float(sell_row["pnl_pct"]) == pytest.approx(15.0, rel=1e-2)
-    assert sell_row["strategy"] == "SWEEP_RECLAIM"
 
     db.close()

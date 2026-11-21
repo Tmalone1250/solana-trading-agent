@@ -9,24 +9,8 @@ from typing import Any, Optional
 
 import duckdb
 
+from action_export import ACTION_LOG_COLUMNS, ACTION_LOG_MIGRATIONS
 from state import FocusState
-
-ACTION_LOG_COLUMNS = [
-    "timestamp_utc",
-    "bot",
-    "mode",
-    "action",
-    "symbol",
-    "asset_id",
-    "qty",
-    "notional",
-    "unit",
-    "price_or_value",
-    "pnl_amount",
-    "pnl_pct",
-    "strategy",
-    "reason",
-]
 
 
 def utc_now() -> datetime:
@@ -251,6 +235,17 @@ class AgentDatabase:
                 """
             )
             self._migrate_watchlist_columns()
+            self._migrate_action_log_columns()
+
+    def _migrate_action_log_columns(self) -> None:
+        """Ensure enriched full-board telemetry columns exist on pre-existing action_log tables."""
+        existing = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info('action_log')").fetchall()
+        }
+        for col, col_type in ACTION_LOG_MIGRATIONS:
+            if col not in existing:
+                self._conn.execute(f"ALTER TABLE action_log ADD COLUMN {col} {col_type}")
 
     def _migrate_watchlist_columns(self) -> None:
         """Ensure upgraded columns exist on pre-existing DuckDB files."""
@@ -962,6 +957,31 @@ class AgentDatabase:
             for mint, status, reason, updated_at in rows
         }
 
+    def get_latest_buy_strategy(self, mint: str) -> Optional[str]:
+        """Return the most recent non-empty BUY strategy recorded for `mint`."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT strategy FROM trades
+                WHERE mint = ? AND UPPER(side) = 'BUY'
+                  AND strategy IS NOT NULL AND TRIM(strategy) != ''
+                ORDER BY id DESC LIMIT 1
+                """,
+                [mint],
+            ).fetchone()
+            if row and row[0]:
+                return str(row[0])
+            row2 = self._conn.execute(
+                """
+                SELECT strategy FROM action_log
+                WHERE asset_id = ? AND UPPER(action) IN ('BUY', 'REENTRY_BUY')
+                  AND strategy IS NOT NULL AND TRIM(strategy) != ''
+                ORDER BY id DESC LIMIT 1
+                """,
+                [mint],
+            ).fetchone()
+            return str(row2[0]) if row2 and row2[0] else None
+
     def log_action(
         self,
         *,
@@ -979,33 +999,53 @@ class AgentDatabase:
         reason: str = "",
         bot: str = "solana_meme",
         timestamp_utc: Optional[str] = None,
+        sol_equity: Optional[float] = None,
+        daily_realized_sol: Optional[float] = None,
+        circuit_breaker: Optional[bool] = None,
+        mc_usd: Optional[float] = None,
+        liq_usd: Optional[float] = None,
+        soak_minutes: Optional[float] = None,
+        rsi: Optional[float] = None,
+        leg2_score: Optional[float] = None,
+        narrative_score: Optional[float] = None,
+        momentum_score: Optional[float] = None,
+        vamp_score: Optional[float] = None,
+        buy_confidence: Optional[float] = None,
+        peak_pnl_pct: Optional[float] = None,
+        hold_seconds: Optional[float] = None,
+        triggering_whales: Optional[str] = None,
+        whale_sol_flow: Optional[float] = None,
     ) -> None:
-        """Append a real action row to DuckDB action_log (never routine scan ticks)."""
+        """Append a structured board action row to DuckDB action_log."""
         ts = timestamp_utc or utc_now_iso()
         with self._lock:
+            if sol_equity is None or daily_realized_sol is None or circuit_breaker is None:
+                st_row = self._conn.execute(
+                    "SELECT sol_balance, daily_start_sol, daily_pnl_sol FROM agent_state WHERE id = 1"
+                ).fetchone()
+                if st_row:
+                    st_bal, st_start, st_pnl = float(st_row[0]), float(st_row[1]), float(st_row[2])
+                    if sol_equity is None:
+                        sol_equity = round(st_bal, 6)
+                    if daily_realized_sol is None:
+                        daily_realized_sol = round(st_pnl, 6)
+                    if circuit_breaker is None:
+                        circuit_breaker = bool(
+                            action.upper() == "CIRCUIT_BREAKER"
+                            or (st_start > 0 and (-st_pnl / st_start) >= 0.20)
+                        )
+            cols_sql = ", ".join(ACTION_LOG_COLUMNS)
+            placeholders = ", ".join("?" for _ in ACTION_LOG_COLUMNS)
             self._conn.execute(
-                """
-                INSERT INTO action_log (
-                    timestamp_utc, bot, mode, action, symbol, asset_id,
-                    qty, notional, unit, price_or_value, pnl_amount, pnl_pct,
-                    strategy, reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                f"INSERT INTO action_log ({cols_sql}) VALUES ({placeholders})",
                 [
-                    ts,
-                    bot,
-                    mode,
-                    action.upper(),
-                    symbol,
-                    asset_id,
-                    qty,
-                    notional,
-                    unit,
-                    price_or_value,
-                    pnl_amount,
-                    pnl_pct,
-                    strategy,
-                    reason,
+                    ts, bot, mode, action.upper(), symbol, asset_id,
+                    qty, notional, unit, price_or_value, pnl_amount, pnl_pct,
+                    strategy, reason,
+                    sol_equity, daily_realized_sol, circuit_breaker,
+                    mc_usd, liq_usd, soak_minutes, rsi, leg2_score,
+                    narrative_score, momentum_score, vamp_score, buy_confidence,
+                    peak_pnl_pct, hold_seconds, triggering_whales, whale_sol_flow,
                 ],
             )
 

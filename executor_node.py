@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import logging
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
@@ -11,7 +12,7 @@ from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 
 from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
-from db import AgentDatabase, utc_now_iso
+from db import AgentDatabase, utc_now, utc_now_iso
 from state import ActivePosition, AgentGraphState, FocusState, PendingOrder
 
 logger = logging.getLogger(__name__)
@@ -187,6 +188,10 @@ async def executor_node(
             price_or_value=round(spent_sol, 6),
             strategy=pos_strategy,
             reason=order.reason,
+            sol_equity=round(sol_balance, 6),
+            daily_realized_sol=round(daily_pnl_sol, 6),
+            liq_usd=round(order.entry_liquidity_usd, 2) if order.entry_liquidity_usd else None,
+            triggering_whales=",".join(order.triggering_wallets) if order.triggering_wallets else None,
         )
         logger.info(
             "[%s] BUY %s: %.4f SOL -> %d tokens (reason=%s)",
@@ -209,15 +214,20 @@ async def executor_node(
         daily_pnl_sol += pnl_sol
 
         existing_strat = (
-            str(existing_pos_dict.get("strategy") or "")
+            str(existing_pos_dict.get("strategy") or "").strip()
             if isinstance(existing_pos_dict, dict)
             else ""
         )
-        pos_strategy = (
-            order.strategy
-            if order.strategy and order.strategy != "SCALPER"
-            else (existing_strat or "SCALPER")
-        )
+        db_buy_strat = db.get_latest_buy_strategy(order.mint)
+        if order.strategy and order.strategy != "SCALPER":
+            pos_strategy = order.strategy
+        elif existing_strat and existing_strat != "SCALPER":
+            pos_strategy = existing_strat
+        elif db_buy_strat:
+            pos_strategy = db_buy_strat
+        else:
+            pos_strategy = existing_strat or order.strategy or "SCALPER"
+
         pos_trig_wallets = (
             list(existing_pos_dict.get("triggering_wallets") or order.triggering_wallets or [])
             if isinstance(existing_pos_dict, dict)
@@ -227,6 +237,30 @@ async def executor_node(
             existing_pos_dict.get("opened_at")
             if isinstance(existing_pos_dict, dict)
             else None
+        )
+        peak_sol_val = (
+            float(existing_pos_dict.get("peak_sol_value") or 0.0)
+            if isinstance(existing_pos_dict, dict)
+            else 0.0
+        )
+        peak_pnl_pct_val = (
+            round(((peak_sol_val - entry_sol) / entry_sol) * 100.0, 2)
+            if entry_sol > 0 and peak_sol_val > 0
+            else None
+        )
+        hold_sec_val: Optional[float] = None
+        if pos_opened_at:
+            try:
+                o_dt = datetime.fromisoformat(str(pos_opened_at))
+                if o_dt.tzinfo is None:
+                    o_dt = o_dt.replace(tzinfo=timezone.utc)
+                hold_sec_val = round(max(0.0, (utc_now() - o_dt).total_seconds()), 1)
+            except ValueError:
+                hold_sec_val = None
+        pos_liq_usd = (
+            float(existing_pos_dict.get("last_liquidity_usd") or existing_pos_dict.get("entry_liquidity_usd") or 0.0)
+            if isinstance(existing_pos_dict, dict)
+            else 0.0
         )
         db.log_trade(
             mode=config.EXECUTION_MODE,
@@ -257,6 +291,12 @@ async def executor_node(
             pnl_pct=round(pnl_pct * 100.0, 2),
             strategy=pos_strategy,
             reason=order.reason,
+            sol_equity=round(sol_balance, 6),
+            daily_realized_sol=round(daily_pnl_sol, 6),
+            liq_usd=round(pos_liq_usd, 2) if pos_liq_usd else None,
+            peak_pnl_pct=peak_pnl_pct_val,
+            hold_seconds=hold_sec_val,
+            triggering_whales=",".join(pos_trig_wallets) if pos_trig_wallets else None,
         )
 
         if order.target_state_after_fill == FocusState.WATCHING_REENTRY:

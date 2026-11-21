@@ -344,6 +344,20 @@ async def safety_gate_node(
                             f"WHALE_SCALP_{trig_type}",
                             updated_at=now.isoformat() if now else None,
                         )
+                        db.log_action(
+                            mode=config.EXECUTION_MODE,
+                            action="WHALE_CONFLUENCE",
+                            symbol=symbol,
+                            asset_id=mint,
+                            notional=round(config.WHALE_POSITION_SOL, 6),
+                            strategy="WHALE_SCALP",
+                            reason=f"WHALE_SCALP_{trig_type}",
+                            timestamp_utc=now.isoformat() if now else None,
+                            mc_usd=round(mc_usd, 2) if mc_usd else None,
+                            liq_usd=round(liq_usd, 2) if liq_usd else None,
+                            triggering_whales=",".join(config.resolve_wallet_label(w) for w in trig_wallets),
+                            whale_sol_flow=round(float(w_cand.get("whale_total_sol") or 0.0), 6),
+                        )
                     rationale = (
                         f"[WHALE_SCALP FAST-TRACK] {symbol} ({mint[:6]}..): "
                         f"trigger={trig_type} ({len(trig_wallets)} wallets, "

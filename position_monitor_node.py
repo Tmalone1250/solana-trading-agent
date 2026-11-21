@@ -320,6 +320,7 @@ async def position_monitor_node(
                 reason=reason,
                 target_state_after_fill=FocusState.SCANNING,
                 apply_cooldown=True,
+                strategy=pos.strategy or "SCALPER",
                 rationale=f"[MONITOR EXIT] {pos.symbol}: {reason}",
             )
             return {
@@ -338,6 +339,7 @@ async def position_monitor_node(
                 reason=exodus_reason,
                 target_state_after_fill=FocusState.SCANNING,
                 apply_cooldown=True,
+                strategy=pos.strategy or "SCALPER",
                 rationale=f"[MONITOR EXIT] {pos.symbol}: {exodus_reason}",
             )
             return {
@@ -363,6 +365,7 @@ async def position_monitor_node(
                     target_state_after_fill=FocusState.WATCHING_REENTRY,
                     apply_cooldown=False,
                     run_peak_sol=pos.peak_sol_value,
+                    strategy=pos.strategy or "SCALPER",
                     rationale=f"[MONITOR TP] {pos.symbol}: {reason} -> WATCHING_REENTRY",
                 )
                 return {
@@ -385,6 +388,7 @@ async def position_monitor_node(
                 reason=reason,
                 target_state_after_fill=FocusState.SCANNING,
                 apply_cooldown=True,
+                strategy=pos.strategy or "SCALPER",
                 rationale=f"[MONITOR EXIT] {pos.symbol}: {reason}",
             )
             return {
