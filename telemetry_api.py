@@ -159,6 +159,87 @@ def create_telemetry_app(
                 tracked_wallets, window_hours=24, now=now_dt
             )
         ]
+        whale_decisions = database.get_whale_decisions()
+
+        # Enrich active_signals (Confluence) with agent_status & agent_reason
+        open_whale_mint = (
+            pos.get("mint")
+            if isinstance(pos, dict)
+            and st["focus_state"] == "IN_POSITION"
+            and str(pos.get("strategy") or st.get("strategy") or "").upper() == "WHALE_SCALP"
+            else None
+        )
+        enriched_signals: list[dict[str, Any]] = []
+        for sig in active_whales.values():
+            dec_info = whale_decisions.get(sig["mint"])
+            if open_whale_mint and sig["mint"] == open_whale_mint:
+                a_status = "ENTERED"
+                a_reason = "OPEN"
+            elif dec_info:
+                a_status = dec_info["status"]
+                a_reason = dec_info["reason"]
+            else:
+                a_status = None
+                a_reason = None
+            enriched_signals.append(
+                {
+                    **sig,
+                    "agent_status": a_status,
+                    "agent_reason": a_reason,
+                }
+            )
+
+        # Build whale_trades (prepend currently open WHALE_SCALP position if live) + whale_stats
+        closed_whale_trades = [
+            {
+                **t,
+                "triggering_wallets": [
+                    {"wallet": w, "label": cfg.resolve_wallet_label(w)}
+                    for w in (t.get("triggering_wallets") or [])
+                ],
+            }
+            for t in database.get_whale_trades(limit=25)
+        ]
+        total_closed = len(closed_whale_trades)
+        wins = sum(1 for t in closed_whale_trades if float(t.get("pnl_sol") or 0.0) > 0)
+        losses = total_closed - wins
+        win_rate_pct = round((wins / total_closed) * 100.0, 1) if total_closed > 0 else 0.0
+        total_whale_pnl = round(sum(float(t.get("pnl_sol") or 0.0) for t in closed_whale_trades), 6)
+        holds = [float(t["hold_seconds"]) for t in closed_whale_trades if t.get("hold_seconds") is not None]
+        avg_hold_sec = round(sum(holds) / len(holds), 1) if holds else 0.0
+
+        whale_trades_payload: list[dict[str, Any]] = []
+        if open_whale_mint and isinstance(pos, dict) and live_pnl is not None:
+            opened_str = pos.get("opened_at")
+            open_hold: Optional[float] = None
+            if opened_str:
+                try:
+                    o_dt = datetime.fromisoformat(opened_str)
+                    if o_dt.tzinfo is None:
+                        o_dt = o_dt.replace(tzinfo=timezone.utc)
+                    open_hold = round(max(0.0, (now_dt - o_dt).total_seconds()), 1)
+                except ValueError:
+                    open_hold = None
+            whale_trades_payload.append(
+                {
+                    "status": "OPEN",
+                    "symbol": pos.get("symbol") or "UNKNOWN",
+                    "mint": open_whale_mint,
+                    "entry_sol": live_pnl["entry_sol"],
+                    "exit_sol": live_pnl["current_sol_value"],
+                    "pnl_sol": live_pnl["pnl_sol"],
+                    "pnl_pct": live_pnl["pnl_pct"],
+                    "exit_reason": "OPEN",
+                    "opened_at": opened_str,
+                    "closed_at": None,
+                    "hold_seconds": open_hold,
+                    "triggering_wallets": [
+                        {"wallet": w, "label": cfg.resolve_wallet_label(w)}
+                        for w in (live_pnl.get("triggering_wallets") or [])
+                    ],
+                }
+            )
+        whale_trades_payload.extend(closed_whale_trades)
 
         return {
             "focus_state": st["focus_state"],
@@ -180,9 +261,18 @@ def create_telemetry_app(
                 "active_whale_mints": len(active_whales),
                 "events_today": database.count_whale_events_today(now=now_dt),
                 "total_sol_volume_today": database.get_whale_sol_volume_today(now=now_dt),
-                "active_signals": list(active_whales.values()),
+                "active_signals": enriched_signals,
                 "recent_events": recent_whale_events,
                 "roster": whale_roster,
+                "whale_trades": whale_trades_payload,
+                "whale_stats": {
+                    "total_trades": total_closed,
+                    "wins": wins,
+                    "losses": losses,
+                    "win_rate_pct": win_rate_pct,
+                    "total_pnl_sol": total_whale_pnl,
+                    "avg_hold_seconds": avg_hold_sec,
+                },
             },
             "live_jupiter_pnl": live_pnl,
             "sol_balance": round(float(st["sol_balance"]), 6),

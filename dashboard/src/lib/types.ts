@@ -81,6 +81,37 @@ export interface WhaleSignal {
   total_sol_spent: number;
   sell_count: number;
   last_seen_utc: string;
+  agent_status?: string | null;
+  agent_reason?: string | null;
+}
+
+export interface WhaleTradeWallet {
+  wallet: string;
+  label: string;
+}
+
+export interface WhaleTrade {
+  status: "OPEN" | "CLOSED" | string;
+  symbol: string;
+  mint: string;
+  entry_sol: number;
+  exit_sol: number;
+  pnl_sol: number;
+  pnl_pct: number;
+  exit_reason: string;
+  opened_at: string | null;
+  closed_at: string | null;
+  hold_seconds: number | null;
+  triggering_wallets: WhaleTradeWallet[];
+}
+
+export interface WhaleStats {
+  total_trades: number;
+  wins: number;
+  losses: number;
+  win_rate_pct: number;
+  total_pnl_sol: number;
+  avg_hold_seconds: number;
 }
 
 export interface WhaleEvent {
@@ -116,6 +147,8 @@ export interface WhaleDiscoveryPayload {
   active_signals: WhaleSignal[];
   recent_events: WhaleEvent[];
   roster: WhaleRosterEntry[];
+  whale_trades?: WhaleTrade[];
+  whale_stats?: WhaleStats;
 }
 
 export interface TelemetryPayload {

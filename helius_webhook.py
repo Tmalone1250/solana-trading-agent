@@ -329,6 +329,10 @@ def process_helius_webhook_payload(
                     ev["wallet"][:6],
                     ev["mint"][:6],
                 )
+        elif ev["side"] == "BUY":
+            st = db.get_state()
+            if st.get("focus_state") != "SCANNING":
+                db.upsert_whale_decision(ev["mint"], "SKIPPED", "POSITION_OPEN", updated_at=now_dt.isoformat())
         logger.info(
             "[WhaleWebhook] %s | wallet=%s.. | mint=%s.. | %.3f SOL",
             ev["side"],

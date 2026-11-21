@@ -95,7 +95,8 @@ class AgentDatabase:
                     tx_signature VARCHAR,
                     rationale VARCHAR,
                     strategy VARCHAR DEFAULT 'SCALPER',
-                    triggering_wallets_json VARCHAR DEFAULT '[]'
+                    triggering_wallets_json VARCHAR DEFAULT '[]',
+                    opened_at VARCHAR
                 )
                 """
             )
@@ -239,6 +240,16 @@ class AgentDatabase:
                 )
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS whale_decisions (
+                    mint VARCHAR PRIMARY KEY,
+                    status VARCHAR NOT NULL,
+                    reason VARCHAR NOT NULL,
+                    updated_at VARCHAR NOT NULL
+                )
+                """
+            )
             self._migrate_watchlist_columns()
 
     def _migrate_watchlist_columns(self) -> None:
@@ -289,6 +300,7 @@ class AgentDatabase:
         for col, col_type in [
             ("strategy", "VARCHAR DEFAULT 'SCALPER'"),
             ("triggering_wallets_json", "VARCHAR DEFAULT '[]'"),
+            ("opened_at", "VARCHAR"),
         ]:
             if col not in trade_cols:
                 self._conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type}")
@@ -767,6 +779,7 @@ class AgentDatabase:
         rationale: str = "",
         strategy: str = "SCALPER",
         triggering_wallets: Optional[list[str]] = None,
+        opened_at: Optional[str] = None,
     ) -> None:
         with self._lock:
             self._conn.execute(
@@ -774,8 +787,8 @@ class AgentDatabase:
                 INSERT INTO trades (
                     timestamp, mode, side, mint, symbol, in_amount, out_amount,
                     sol_value, pnl_sol, pnl_pct, reason, tx_signature, rationale,
-                    strategy, triggering_wallets_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    strategy, triggering_wallets_json, opened_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     utc_now_iso(),
@@ -793,6 +806,7 @@ class AgentDatabase:
                     rationale,
                     strategy or "SCALPER",
                     json.dumps(triggering_wallets or []),
+                    opened_at,
                 ],
             )
 
@@ -859,6 +873,94 @@ class AgentDatabase:
                 }
             )
         return closed
+
+    def get_whale_trades(self, limit: int = 25) -> list[dict[str, Any]]:
+        """Return closed WHALE_SCALP trades ordered newest-first with hold_seconds & triggering_wallets."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT symbol, mint, sol_value, pnl_sol, pnl_pct, reason, timestamp,
+                       opened_at, triggering_wallets_json
+                FROM trades
+                WHERE UPPER(side) = 'SELL' AND UPPER(strategy) = 'WHALE_SCALP'
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                [int(limit)],
+            ).fetchall()
+
+        trades: list[dict[str, Any]] = []
+        for symbol, mint, exit_sol, pnl_sol, pnl_pct, reason, closed_at, opened_at, trig_json in rows:
+            exit_val = float(exit_sol or 0.0)
+            pnl_val = float(pnl_sol or 0.0)
+            entry_val = max(0.0, exit_val - pnl_val)
+            pct_val = float(pnl_pct or 0.0) * 100.0
+            hold_sec: Optional[float] = None
+            if opened_at and closed_at:
+                try:
+                    o_dt = datetime.fromisoformat(opened_at)
+                    c_dt = datetime.fromisoformat(closed_at)
+                    if o_dt.tzinfo is None:
+                        o_dt = o_dt.replace(tzinfo=timezone.utc)
+                    if c_dt.tzinfo is None:
+                        c_dt = c_dt.replace(tzinfo=timezone.utc)
+                    hold_sec = round(max(0.0, (c_dt - o_dt).total_seconds()), 1)
+                except ValueError:
+                    hold_sec = None
+            trades.append(
+                {
+                    "status": "CLOSED",
+                    "symbol": symbol,
+                    "mint": mint,
+                    "entry_sol": round(entry_val, 6),
+                    "exit_sol": round(exit_val, 6),
+                    "pnl_sol": round(pnl_val, 6),
+                    "pnl_pct": round(pct_val, 2),
+                    "exit_reason": reason,
+                    "opened_at": opened_at,
+                    "closed_at": closed_at,
+                    "hold_seconds": hold_sec,
+                    "triggering_wallets": json.loads(trig_json) if trig_json else [],
+                }
+            )
+        return trades
+
+    def upsert_whale_decision(
+        self,
+        mint: str,
+        status: str,
+        reason: str,
+        updated_at: Optional[str] = None,
+    ) -> None:
+        """Persist latest WHALE_SCALP evaluation decision (ENTERED or SKIPPED + reason) for a mint."""
+        ts = updated_at or utc_now_iso()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO whale_decisions (mint, status, reason, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (mint) DO UPDATE SET
+                    status = excluded.status,
+                    reason = excluded.reason,
+                    updated_at = excluded.updated_at
+                """,
+                [mint, status.upper(), reason, ts],
+            )
+
+    def get_whale_decisions(self) -> dict[str, dict[str, str]]:
+        """Return all persisted whale_decisions keyed by mint."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT mint, status, reason, updated_at FROM whale_decisions"
+            ).fetchall()
+        return {
+            str(mint): {
+                "status": str(status),
+                "reason": str(reason),
+                "updated_at": str(updated_at),
+            }
+            for mint, status, reason, updated_at in rows
+        }
 
     def log_action(
         self,

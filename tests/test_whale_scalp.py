@@ -453,3 +453,116 @@ def test_topup_paper_sol_helper(tmp_path):
     db_check = AgentDatabase(db_path=db_path, starting_sol=0.7)
     assert db_check.get_state()["sol_balance"] == pytest.approx(1.7, rel=1e-4)
     db_check.close()
+
+
+def test_telemetry_whale_trades_stats_and_confluence_agent_reasons(tmp_path):
+    clear_helius_roster_cache()
+    db = AgentDatabase(db_path=str(tmp_path / "whale_vis.duckdb"), starting_sol=1.0)
+    cfg = AgentConfig(_env_file=None, ENABLE_HELIUS_WHALE_WEBHOOK=True)
+    now_dt = datetime.now(timezone.utc)
+    jijo = "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk"
+
+    # Seed two closed WHALE_SCALP trades (1 win +25%, 1 loss -12%)
+    db.log_trade(
+        mode="paper",
+        side="SELL",
+        mint="MintWin1",
+        symbol="WIN1",
+        in_amount=1_000_000,
+        out_amount=312_500_000,
+        sol_value=0.3125,
+        pnl_sol=0.0625,
+        pnl_pct=0.25,
+        reason="WHALE_FRONT_RUN_TP",
+        strategy="WHALE_SCALP",
+        triggering_wallets=[jijo],
+        opened_at=(now_dt - timedelta(seconds=40)).isoformat(),
+    )
+    db.log_trade(
+        mode="paper",
+        side="SELL",
+        mint="MintLoss1",
+        symbol="LOS1",
+        in_amount=1_000_000,
+        out_amount=220_000_000,
+        sol_value=0.22,
+        pnl_sol=-0.03,
+        pnl_pct=-0.12,
+        reason="WHALE_HARD_STOP",
+        strategy="WHALE_SCALP",
+        triggering_wallets=[jijo],
+        opened_at=(now_dt - timedelta(seconds=60)).isoformat(),
+    )
+
+    # Seed a currently open WHALE_SCALP position
+    open_pos = ActivePosition(
+        mint="MintOpen1",
+        symbol="OPENW",
+        entry_sol=0.25,
+        token_amount=1_000_000,
+        strategy="WHALE_SCALP",
+        triggering_wallets=[jijo],
+        opened_at=(now_dt - timedelta(seconds=15)).isoformat(),
+        current_sol_value=0.28,
+        peak_sol_value=0.28,
+    ).model_dump()
+    db.save_state(
+        focus_state=FocusState.IN_POSITION.value,
+        sol_balance=0.75,
+        daily_pnl_sol=0.0325,
+        active_position=open_pos,
+    )
+
+    # Seed two active whale signals: MintOpen1 (ENTERED) and MintSkip1 (SKIPPED: MCAP > $120K)
+    db.record_whale_event(
+        signature="sig-open",
+        wallet=jijo,
+        mint="MintOpen1",
+        side="BUY",
+        sol_amount=2.5,
+        token_amount=500_000.0,
+        timestamp_utc=now_dt.isoformat(),
+    )
+    db.recompute_whale_signal("MintOpen1", ttl_minutes=30, now=now_dt)
+
+    db.record_whale_event(
+        signature="sig-skip",
+        wallet=jijo,
+        mint="MintSkip1",
+        side="BUY",
+        sol_amount=2.2,
+        token_amount=400_000.0,
+        timestamp_utc=now_dt.isoformat(),
+    )
+    db.recompute_whale_signal("MintSkip1", ttl_minutes=30, now=now_dt)
+    db.upsert_whale_decision("MintSkip1", "SKIPPED", "MCAP > $120K", updated_at=now_dt.isoformat())
+
+    tc = TestClient(create_telemetry_app(config=cfg, db=db))
+    resp = tc.get("/api/telemetry")
+    assert resp.status_code == 200
+    wd = resp.json()["whale_discovery"]
+
+    # whale_trades: prepended OPEN trade + 2 closed trades
+    assert len(wd["whale_trades"]) == 3
+    assert wd["whale_trades"][0]["status"] == "OPEN"
+    assert wd["whale_trades"][0]["symbol"] == "OPENW"
+    assert wd["whale_trades"][0]["triggering_wallets"][0]["label"] == "Jijo"
+    assert wd["whale_trades"][1]["status"] == "CLOSED"
+    assert wd["whale_trades"][1]["hold_seconds"] is not None
+
+    # whale_stats
+    ws = wd["whale_stats"]
+    assert ws["total_trades"] == 2
+    assert ws["wins"] == 1
+    assert ws["losses"] == 1
+    assert ws["win_rate_pct"] == 50.0
+    assert ws["total_pnl_sol"] == pytest.approx(0.0325, rel=1e-4)
+    assert ws["avg_hold_seconds"] > 0
+
+    # active_signals carry agent_status & agent_reason
+    sigs_by_mint = {s["mint"]: s for s in wd["active_signals"]}
+    assert sigs_by_mint["MintOpen1"]["agent_status"] == "ENTERED"
+    assert sigs_by_mint["MintOpen1"]["agent_reason"] == "OPEN"
+    assert sigs_by_mint["MintSkip1"]["agent_status"] == "SKIPPED"
+    assert sigs_by_mint["MintSkip1"]["agent_reason"] == "MCAP > $120K"
+    db.close()

@@ -430,8 +430,39 @@ async def scanner_node(
             min_solo_sol=config.WHALE_MIN_SOLO_BUY_SOL,
             now=now_dt,
         ):
-            if not db.is_on_cooldown(trig["mint"], now=now_dt):
+            if db.is_on_cooldown(trig["mint"], now=now_dt):
+                db.upsert_whale_decision(trig["mint"], "SKIPPED", "COOLDOWN", updated_at=now_dt.isoformat())
+            else:
                 whale_fast_triggers[trig["mint"]] = trig
+
+        # Record skip reasons for active whale signals that didn't trigger fast-track
+        for w_mint, sig in active_whales.items():
+            if w_mint in whale_fast_triggers:
+                continue
+            if db.is_on_cooldown(w_mint, now=now_dt):
+                db.upsert_whale_decision(w_mint, "SKIPPED", "COOLDOWN", updated_at=now_dt.isoformat())
+                continue
+            try:
+                seen_dt = datetime.fromisoformat(sig["last_seen_utc"])
+                if seen_dt.tzinfo is None:
+                    seen_dt = seen_dt.replace(tzinfo=timezone.utc)
+                age_sec = max(0.0, (now_dt - seen_dt).total_seconds())
+            except ValueError:
+                age_sec = 999.0
+            if age_sec > config.WHALE_ENTRY_MAX_AGE_SECONDS:
+                db.upsert_whale_decision(
+                    w_mint,
+                    "SKIPPED",
+                    f"STALE > {config.WHALE_ENTRY_MAX_AGE_SECONDS}s",
+                    updated_at=now_dt.isoformat(),
+                )
+            else:
+                db.upsert_whale_decision(
+                    w_mint,
+                    "SKIPPED",
+                    f"< {config.WHALE_MIN_SOLO_BUY_SOL:.1f} SOL",
+                    updated_at=now_dt.isoformat(),
+                )
 
     whale_mints = list(dict.fromkeys(list(whale_fast_triggers.keys()) + list(active_whales.keys())))
 
@@ -496,12 +527,19 @@ async def scanner_node(
             continue
         j_meta = jup_meta_by_mint.get(w_mint)
         if j_meta and j_meta.get("is_sus") is True:
+            db.upsert_whale_decision(w_mint, "SKIPPED", "AUDIT_SUS", updated_at=now_dt.isoformat())
             logger.info(
                 "[Scanner] WHALE_SCALP $%s | REJECTED (Jupiter audit.isSus=True)",
                 cand_obj.symbol,
             )
             continue
         if cand_obj.liquidity_usd < config.WHALE_MIN_LIQUIDITY_USD:
+            db.upsert_whale_decision(
+                w_mint,
+                "SKIPPED",
+                f"LIQ < ${config.WHALE_MIN_LIQUIDITY_USD / 1000:.0f}K",
+                updated_at=now_dt.isoformat(),
+            )
             logger.info(
                 "[Scanner] WHALE_SCALP $%s | REJECTED (liq $%.0f < $%.0f)",
                 cand_obj.symbol,
@@ -510,6 +548,12 @@ async def scanner_node(
             )
             continue
         if not (config.WHALE_MIN_MCAP_USD <= cand_obj.market_cap_usd <= config.WHALE_MAX_MCAP_USD):
+            mc_reason = (
+                f"MCAP < ${config.WHALE_MIN_MCAP_USD / 1000:.0f}K"
+                if cand_obj.market_cap_usd < config.WHALE_MIN_MCAP_USD
+                else f"MCAP > ${config.WHALE_MAX_MCAP_USD / 1000:.0f}K"
+            )
+            db.upsert_whale_decision(w_mint, "SKIPPED", mc_reason, updated_at=now_dt.isoformat())
             logger.info(
                 "[Scanner] WHALE_SCALP $%s | REJECTED (mc $%.0f outside [$%.0f, $%.0f])",
                 cand_obj.symbol,

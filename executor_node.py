@@ -223,6 +223,11 @@ async def executor_node(
             if isinstance(existing_pos_dict, dict)
             else list(order.triggering_wallets or [])
         )
+        pos_opened_at = (
+            existing_pos_dict.get("opened_at")
+            if isinstance(existing_pos_dict, dict)
+            else None
+        )
         db.log_trade(
             mode=config.EXECUTION_MODE,
             side="SELL",
@@ -238,6 +243,7 @@ async def executor_node(
             rationale=order.rationale,
             strategy=pos_strategy,
             triggering_wallets=pos_trig_wallets,
+            opened_at=pos_opened_at,
         )
         db.log_action(
             mode=config.EXECUTION_MODE,
