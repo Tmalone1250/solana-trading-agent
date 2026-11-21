@@ -76,6 +76,14 @@ export interface ClosedTrade {
   closed_at: string;
 }
 
+export interface ClosedTradesSummary {
+  total_trades: number;
+  wins: number;
+  losses: number;
+  win_rate_pct: number;
+  net_pnl_sol: number;
+}
+
 export interface DecisionRationale {
   timestamp: string;
   mint: string;
@@ -178,6 +186,7 @@ export interface TelemetryPayload {
   latest_decision_1_rationale: string;
   decision_1_rationales: DecisionRationale[];
   recent_trades: ClosedTrade[];
+  closed_trades_summary?: ClosedTradesSummary;
   active_cooldowns: Array<{ mint: string; expires_at: string; reason: string }>;
   updated_at: string;
 }

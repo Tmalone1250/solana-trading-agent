@@ -1,29 +1,20 @@
-# Breakout Telemetry Logging & 5-Slot Watchlist Breakout Meter Plan
+# Recent Closed Trades Pagination & Win/Loss Summary Plan
 
-## 1. Backend: Breakout Scoring & Telemetry (`breakout_ignition.py`, `scalper_entry_engine.py`)
-Return a structured `breakout_telemetry` object for every watchlist mint on every tick:
-- **`score` (0–100 integer)** from 5 weighted pillars:
-  1. Coil / Base (20 pts)
-  2. Resistance Break & Body Conviction (25 pts)
-  3. Volume & Flow Spike (25 pts)
-  4. MA / VWAP / RSI Alignment (15 pts)
-  5. HTF 15m Context & Anti-Chase Extension (15 pts)
-- **`state`**: `EXTENDED` (`> 12%` above EMA9/VWAP), `IGNITION` (`>= 75`), `COILING` (`50–74`), `FORMING` (`< 50`).
-- **`timeframe`**: `"5m"` or `"1m_fallback"`.
-- **`vol_ratio`** (float), **`ema_ext_pct`** (float %), **`passed_gates`** (`list[str]`), **`failed_gates`** (`list[str]` with actual vs threshold, e.g., `VOL_SPIKE(1.7x<2.0x)`).
+## 1. Backend (`db.py`, `telemetry_api.py`)
+- Add `AgentDatabase.get_closed_trades_summary()` computing directly from DuckDB `trades` (`side = 'SELL'`):
+  - `total_trades` (`int`)
+  - `wins` (`int`, `pnl_sol > 0`)
+  - `losses` (`int`, `pnl_sol <= 0`)
+  - `win_rate_pct` (`float` rounded to 1 decimal, `0.0` when `total_trades == 0`)
+  - `net_pnl_sol` (`float`)
+- Include `closed_trades_summary` in `GET /api/telemetry` and raise `recent_trades` limit from `15` to `100` (newest-first) for zero-latency client-side pagination over Cloudflare Tunnel.
 
-## 2. DuckDB, CSV Export & Telemetry API (`action_export.py`, `db.py`, `alpha_node.py`, `executor_node.py`, `telemetry_api.py`)
-- Add 6 columns to `ACTION_LOG_COLUMNS` and automatic `ALTER TABLE` migrations:
-  `breakout_score`, `breakout_state`, `breakout_timeframe`, `breakout_vol_ratio`, `breakout_ema_ext_pct`, `breakout_failed_gates`.
-- Populate these 6 columns on `DECISION_1`, `BUY`, and `EVICT` rows in DuckDB and `/api/export/csv`.
-- Include `breakout_telemetry` inside each mint object in `active_watchlist[]` returned by `GET /api/telemetry`.
+## 2. Frontend (`dashboard/`)
+- Add `ClosedTradesSummary` interface to `dashboard/src/lib/types.ts` and pass `telemetry?.closed_trades_summary` from `DashboardClient.tsx` into `RecentTradesTable.tsx`.
+- In `RecentTradesTable.tsx`:
+  - Show live Win/Loss + Win % badge (`9W / 12L • 42.9% WR`) in the card header next to the trade count pill, color-coded emerald (`>= 50%`), amber (`40%–49.9%`), or rose (`< 40%`).
+  - Paginate at `PAGE_SIZE = 7` with compact `Prev` / `Next` buttons and `Page X of Y` footer, preserving the current page across live polling updates and safely clamping if total pages shrink.
 
-## 3. Frontend: 5-Slot Watchlist Breakout Meter (`dashboard/`)
-- Add `BreakoutTelemetry` interface to `dashboard/src/lib/types.ts`.
-- Render a compact **Breakout Meter** in each row of `dashboard/src/components/WatchlistTable.tsx`:
-  - Color-coded 0–100 progress bar (`FORMING` slate, `COILING` amber, `IGNITION` emerald, `EXTENDED` rose) with `score/100 • STATE • tf`.
-  - Compact single-line pillar pill strip (`COIL`, `RES`, `VOL 2.3x`, `EMA`, `EXT +4.1%`) color-coded green (passed) vs rose/muted (failed).
-
-## 4. Verification
-- Add unit tests in `tests/test_breakout_ignition.py` covering `breakout_score` calculation, `failed_gates` formatting, DuckDB/CSV serialization of the 6 new columns, and `/api/telemetry` `active_watchlist[].breakout_telemetry`.
+## 3. Verification
+- Add unit tests covering `closed_trades_summary` (empty 0 trades, all wins, breakeven `0.0` PnL, mixed wins/losses, and 100-trade limit on `/api/telemetry`).
 - Run `./venv/bin/pytest -v` and `cd dashboard && npm run build`.

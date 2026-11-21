@@ -68,7 +68,10 @@ export function DashboardClient() {
         onSynced={fetchTelemetry}
       />
 
-      <RecentTradesTable trades={telemetry?.recent_trades ?? []} />
+      <RecentTradesTable
+        trades={telemetry?.recent_trades ?? []}
+        summary={telemetry?.closed_trades_summary}
+      />
     </main>
   );
 }

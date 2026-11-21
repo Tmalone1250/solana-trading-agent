@@ -1,25 +1,84 @@
 "use client";
 
-import { ExternalLink } from "lucide-react";
-import { ClosedTrade, formatShortTime, formatSol } from "@/lib/types";
+import { useEffect, useState } from "react";
+import { ChevronLeft, ChevronRight, ExternalLink } from "lucide-react";
+import {
+  ClosedTrade,
+  ClosedTradesSummary,
+  formatShortTime,
+  formatSol,
+} from "@/lib/types";
+
+const PAGE_SIZE = 7;
 
 interface Props {
   trades: ClosedTrade[];
+  summary?: ClosedTradesSummary;
 }
 
-export function RecentTradesTable({ trades }: Props) {
+function getWinRateBadgeStyle(winRatePct: number, totalTrades: number): string {
+  if (totalTrades === 0) {
+    return "border-slate-700 bg-slate-900 text-slate-400";
+  }
+  if (winRatePct >= 50) {
+    return "border-emerald-500/40 bg-emerald-500/15 text-emerald-300";
+  }
+  if (winRatePct >= 40) {
+    return "border-amber-500/40 bg-amber-500/15 text-amber-300";
+  }
+  return "border-rose-500/40 bg-rose-500/15 text-rose-300";
+}
+
+export function RecentTradesTable({ trades, summary }: Props) {
+  const [page, setPage] = useState(1);
+
+  const totalPages = Math.max(1, Math.ceil(trades.length / PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+
+  useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages);
+    }
+  }, [page, totalPages]);
+
+  const startIdx = (safePage - 1) * PAGE_SIZE;
+  const pageTrades = trades.slice(startIdx, startIdx + PAGE_SIZE);
+
+  const totalTrades = summary ? summary.total_trades : trades.length;
+  const wins = summary
+    ? summary.wins
+    : trades.filter((t) => t.pnl_sol > 0).length;
+  const losses = summary
+    ? summary.losses
+    : trades.filter((t) => t.pnl_sol <= 0).length;
+  const winRatePct = summary
+    ? summary.win_rate_pct
+    : totalTrades > 0
+      ? Number(((wins / totalTrades) * 100).toFixed(1))
+      : 0.0;
+  const wrStyle = getWinRateBadgeStyle(winRatePct, totalTrades);
+
   return (
     <section className="rounded-2xl border border-slate-800/80 bg-slate-900/60">
-      <div className="flex items-center justify-between border-b border-slate-800/80 px-5 py-3.5">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 px-5 py-3.5">
         <div>
           <h2 className="text-sm font-semibold text-slate-100">
             Recent Closed Trades
           </h2>
-          <p className="text-xs text-slate-400">Last 15 closed positions from DuckDB</p>
+          <p className="text-xs text-slate-400">
+            Session history from DuckDB (up to 100 newest-first)
+          </p>
         </div>
-        <span className="rounded-full border border-slate-700 bg-slate-950 px-2.5 py-0.5 font-mono text-xs text-slate-300">
-          {trades.length} trades
-        </span>
+        <div className="flex flex-wrap items-center gap-2">
+          <span
+            className={`rounded-full border px-2.5 py-0.5 font-mono text-xs font-semibold ${wrStyle}`}
+          >
+            {wins}W / {losses}L • {winRatePct.toFixed(1)}% WR
+          </span>
+          <span className="rounded-full border border-slate-700 bg-slate-950 px-2.5 py-0.5 font-mono text-xs text-slate-300">
+            {totalTrades} trades
+          </span>
+        </div>
       </div>
 
       <div className="overflow-x-auto">
@@ -36,14 +95,17 @@ export function RecentTradesTable({ trades }: Props) {
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-800/60 font-mono">
-            {trades.length === 0 ? (
+            {pageTrades.length === 0 ? (
               <tr>
-                <td colSpan={7} className="px-4 py-8 text-center text-xs text-slate-500">
+                <td
+                  colSpan={7}
+                  className="px-4 py-8 text-center text-xs text-slate-500"
+                >
                   No closed trades recorded yet.
                 </td>
               </tr>
             ) : (
-              trades.map((t, idx) => {
+              pageTrades.map((t, idx) => {
                 const win = t.pnl_sol > 0;
                 const loss = t.pnl_sol < 0;
                 const pnlColor = win
@@ -55,7 +117,10 @@ export function RecentTradesTable({ trades }: Props) {
                 const isWhale = strat === "WHALE_SCALP";
 
                 return (
-                  <tr key={`${t.mint}-${t.closed_at}-${idx}`} className="hover:bg-slate-800/30">
+                  <tr
+                    key={`${t.mint}-${t.closed_at}-${startIdx + idx}`}
+                    className="hover:bg-slate-800/30"
+                  >
                     <td className="px-4 py-3">
                       <a
                         href={`https://dexscreener.com/solana/${t.mint}`}
@@ -69,10 +134,11 @@ export function RecentTradesTable({ trades }: Props) {
                     </td>
                     <td className="px-4 py-3">
                       <span
-                        className={`inline-flex rounded border px-1.5 py-0.5 text-[10px] font-semibold ${isWhale
-                          ? "border-fuchsia-500/50 bg-fuchsia-500/20 text-fuchsia-300"
-                          : "border-slate-700 bg-slate-800/70 text-slate-300"
-                          }`}
+                        className={`inline-flex rounded border px-1.5 py-0.5 text-[10px] font-semibold ${
+                          isWhale
+                            ? "border-fuchsia-500/50 bg-fuchsia-500/20 text-fuchsia-300"
+                            : "border-slate-700 bg-slate-800/70 text-slate-300"
+                        }`}
                       >
                         {strat}
                       </span>
@@ -83,7 +149,9 @@ export function RecentTradesTable({ trades }: Props) {
                     <td className="px-4 py-3 tabular-nums text-slate-200">
                       {formatSol(t.exit_sol)}
                     </td>
-                    <td className={`px-4 py-3 font-semibold tabular-nums ${pnlColor}`}>
+                    <td
+                      className={`px-4 py-3 font-semibold tabular-nums ${pnlColor}`}
+                    >
                       {formatSol(t.pnl_sol, true)}{" "}
                       <span className="text-[11px] font-normal">
                         ({t.pnl_pct > 0 ? "+" : ""}
@@ -105,6 +173,34 @@ export function RecentTradesTable({ trades }: Props) {
           </tbody>
         </table>
       </div>
+
+      {trades.length > 0 && (
+        <div className="flex items-center justify-between border-t border-slate-800/80 px-5 py-2.5 font-mono text-xs text-slate-400">
+          <span>
+            Page {safePage} of {totalPages}
+          </span>
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              disabled={safePage <= 1}
+              className="inline-flex items-center gap-1 rounded-md border border-slate-700 bg-slate-950 px-2.5 py-1 text-[11px] text-slate-200 transition hover:border-slate-500 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <ChevronLeft className="h-3.5 w-3.5" />
+              Prev
+            </button>
+            <button
+              type="button"
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              disabled={safePage >= totalPages}
+              className="inline-flex items-center gap-1 rounded-md border border-slate-700 bg-slate-950 px-2.5 py-1 text-[11px] text-slate-200 transition hover:border-slate-500 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Next
+              <ChevronRight className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
     </section>
   );
 }

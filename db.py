@@ -934,6 +934,33 @@ class AgentDatabase:
             )
         return closed
 
+    def get_closed_trades_summary(self) -> dict[str, Any]:
+        """Aggregate win/loss record, win rate %, and net realized SOL across all SELL rows."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_trades,
+                    COALESCE(SUM(CASE WHEN COALESCE(pnl_sol, 0.0) > 0.0 THEN 1 ELSE 0 END), 0) AS wins,
+                    COALESCE(SUM(CASE WHEN COALESCE(pnl_sol, 0.0) <= 0.0 THEN 1 ELSE 0 END), 0) AS losses,
+                    COALESCE(SUM(COALESCE(pnl_sol, 0.0)), 0.0) AS net_pnl_sol
+                FROM trades
+                WHERE UPPER(side) = 'SELL'
+                """
+            ).fetchone()
+        total = int(row[0] or 0) if row else 0
+        wins = int(row[1] or 0) if row else 0
+        losses = int(row[2] or 0) if row else 0
+        net_pnl = float(row[3] or 0.0) if row else 0.0
+        win_rate = round((wins / total) * 100.0, 1) if total > 0 else 0.0
+        return {
+            "total_trades": total,
+            "wins": wins,
+            "losses": losses,
+            "win_rate_pct": win_rate,
+            "net_pnl_sol": round(net_pnl, 6),
+        }
+
     def get_whale_trades(self, limit: int = 25) -> list[dict[str, Any]]:
         """Return closed WHALE_SCALP trades ordered newest-first with hold_seconds & triggering_wallets."""
         with self._lock:

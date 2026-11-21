@@ -262,3 +262,58 @@ async def test_action_ledger_logs_buy_sell_evict_circuit_breaker_and_csv_export(
     assert {r["action"] for r in parsed_filtered} == {"BUY", "SELL"}
 
     db.close()
+
+
+def test_closed_trades_summary_all_wins_mixed_breakeven_and_empty(tmp_path):
+    db = AgentDatabase(db_path=str(tmp_path / "summary.duckdb"), starting_sol=1.0)
+    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper")
+    tc = TestClient(create_telemetry_app(config=cfg, db=db))
+
+    # 1. Empty (0 trades) -> no division by zero
+    empty = db.get_closed_trades_summary()
+    assert empty == {
+        "total_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate_pct": 0.0,
+        "net_pnl_sol": 0.0,
+    }
+    tel_empty = tc.get("/api/telemetry").json()
+    assert tel_empty["closed_trades_summary"] == empty
+
+    # 2. All wins (2 SELLs with positive PnL; BUY rows ignored)
+    db.log_trade(mode="paper", side="BUY", mint="M1", symbol="T1", in_amount=500, out_amount=100, sol_value=0.5, reason="ENTRY")
+    db.log_trade(mode="paper", side="SELL", mint="M1", symbol="T1", in_amount=100, out_amount=600, sol_value=0.6, pnl_sol=0.10, pnl_pct=0.20, reason="TP")
+    db.log_trade(mode="paper", side="SELL", mint="M2", symbol="T2", in_amount=100, out_amount=550, sol_value=0.55, pnl_sol=0.05, pnl_pct=0.10, reason="TP")
+    all_wins = db.get_closed_trades_summary()
+    assert all_wins["total_trades"] == 2
+    assert all_wins["wins"] == 2
+    assert all_wins["losses"] == 0
+    assert all_wins["win_rate_pct"] == 100.0
+    assert all_wins["net_pnl_sol"] == pytest.approx(0.15, rel=1e-4)
+
+    # 3. Breakeven 0.0 PnL counts as loss (pnl <= 0)
+    db.log_trade(mode="paper", side="SELL", mint="M3", symbol="T3", in_amount=100, out_amount=500, sol_value=0.50, pnl_sol=0.0, pnl_pct=0.0, reason="BE")
+    with_be = db.get_closed_trades_summary()
+    assert with_be["total_trades"] == 3
+    assert with_be["wins"] == 2
+    assert with_be["losses"] == 1
+    assert with_be["win_rate_pct"] == 66.7
+    assert with_be["net_pnl_sol"] == pytest.approx(0.15, rel=1e-4)
+
+    # 4. Mixed wins + losses -> verify /api/telemetry summary & expanded >15 history
+    for i in range(18):
+        db.log_trade(
+            mode="paper", side="SELL", mint=f"ML{i}", symbol=f"L{i}",
+            in_amount=100, out_amount=450, sol_value=0.45, pnl_sol=-0.05, pnl_pct=-0.10, reason="STOP",
+        )
+    tel_mixed = tc.get("/api/telemetry").json()
+    summ = tel_mixed["closed_trades_summary"]
+    assert summ["total_trades"] == 21
+    assert summ["wins"] == 2
+    assert summ["losses"] == 19
+    assert summ["win_rate_pct"] == 9.5
+    assert summ["net_pnl_sol"] == pytest.approx(-0.75, rel=1e-4)
+    # Payload returns up to 100 closed trades (all 21 here, not truncated at 15)
+    assert len(tel_mixed["recent_trades"]) == 21
+    db.close()

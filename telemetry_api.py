@@ -310,7 +310,8 @@ def create_telemetry_app(
                 }
                 for d in recent_decisions
             ],
-            "recent_trades": database.get_recent_closed_trades(limit=15),
+            "recent_trades": database.get_recent_closed_trades(limit=100),
+            "closed_trades_summary": database.get_closed_trades_summary(),
             "active_cooldowns": database.get_active_cooldowns(),
             "updated_at": st["updated_at"],
         }
