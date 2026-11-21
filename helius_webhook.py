@@ -40,6 +40,15 @@ def _extract_account_addresses(webhook_obj: dict[str, Any]) -> list[str]:
     return result
 
 
+def _is_active_webhook(hook: dict[str, Any]) -> bool:
+    if hook.get("active") is False:
+        return False
+    status = str(hook.get("status") or "").strip().lower()
+    if status in {"inactive", "disabled", "paused", "deleted"}:
+        return False
+    return True
+
+
 async def fetch_helius_tracked_wallets(
     config: AgentConfig,
     *,
@@ -63,32 +72,55 @@ async def fetch_helius_tracked_wallets(
         return list(_helius_roster_cache["wallets"]) or fallback
 
     webhook_id = config.HELIUS_WEBHOOK_ID.strip()
+    webhook_url_filter = str(getattr(config, "HELIUS_WEBHOOK_URL", "") or "").strip().lower()
     if webhook_id:
         url = f"{config.HELIUS_API_BASE_URL}/webhooks/{webhook_id}"
     else:
         url = f"{config.HELIUS_API_BASE_URL}/webhooks"
 
     owns_client = http_client is None
-    client = http_client or httpx.AsyncClient()
+    client = http_client or httpx.AsyncClient(follow_redirects=True)
     try:
         resp = await client.get(url, params={"api-key": api_key}, timeout=10.0)
         resp.raise_for_status()
         data = resp.json()
 
-        selected: Optional[dict[str, Any]] = None
+        targets: list[dict[str, Any]] = []
         if isinstance(data, dict):
-            selected = data
+            targets = [data]
         elif isinstance(data, list) and data:
-            for hook in data:
-                if isinstance(hook, dict) and "solana-api.projectkami.net" in str(
-                    hook.get("webhookURL") or ""
-                ).lower():
-                    selected = hook
-                    break
-            if selected is None and isinstance(data[0], dict):
-                selected = data[0]
+            active_hooks = [
+                h for h in data if isinstance(h, dict) and _is_active_webhook(h)
+            ]
+            matched: list[dict[str, Any]] = []
+            url_needle = webhook_url_filter or "solana-api.projectkami.net"
+            for hook in active_hooks:
+                hid = str(hook.get("webhookID") or hook.get("id") or "").strip()
+                hurl = str(hook.get("webhookURL") or "").lower()
+                if (webhook_id and hid == webhook_id) or (url_needle and url_needle in hurl):
+                    matched.append(hook)
+            targets = matched if matched else active_hooks
 
-        wallets = _extract_account_addresses(selected) if selected else []
+        wallets: list[str] = []
+        seen: set[str] = set()
+        for hook in targets:
+            addrs = _extract_account_addresses(hook)
+            if not addrs:
+                hid = str(hook.get("webhookID") or hook.get("id") or "").strip()
+                if hid:
+                    detail_url = f"{config.HELIUS_API_BASE_URL}/webhooks/{hid}"
+                    detail_resp = await client.get(
+                        detail_url, params={"api-key": api_key}, timeout=10.0
+                    )
+                    detail_resp.raise_for_status()
+                    detail_data = detail_resp.json()
+                    if isinstance(detail_data, dict):
+                        addrs = _extract_account_addresses(detail_data)
+            for addr in addrs:
+                if addr not in seen:
+                    seen.add(addr)
+                    wallets.append(addr)
+
         _helius_roster_cache["fetched_at"] = current_ts
         _helius_roster_cache["wallets"] = wallets
         logger.info(

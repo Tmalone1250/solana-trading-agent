@@ -121,6 +121,7 @@ class AgentConfig(BaseSettings):
     ENABLE_HELIUS_WHALE_WEBHOOK: bool = False
     HELIUS_API_KEY: str = ""
     HELIUS_WEBHOOK_ID: str = ""
+    HELIUS_WEBHOOK_URL: str = ""
     HELIUS_API_BASE_URL: str = "https://api.helius.xyz/v0"
     HELIUS_ROSTER_CACHE_SECONDS: float = Field(default=300.0, gt=0.0)
     HELIUS_AUTH_HEADER: str = ""

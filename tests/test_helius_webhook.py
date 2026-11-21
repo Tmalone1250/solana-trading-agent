@@ -457,3 +457,85 @@ async def test_helius_roster_dynamic_sync_5m_cache_and_expanded_telemetry(tmp_pa
 
     db.close()
     clear_helius_roster_cache()
+
+
+@pytest.mark.asyncio
+async def test_helius_roster_hydrates_missing_account_addresses_via_detail_endpoint():
+    clear_helius_roster_cache()
+    cfg = AgentConfig(
+        _env_file=None,
+        ENABLE_HELIUS_WHALE_WEBHOOK=True,
+        HELIUS_API_KEY="test-helius-key",
+        HELIUS_WEBHOOK_ID="",
+        HELIUS_ROSTER_CACHE_SECONDS=300.0,
+    )
+
+    jijo = "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk"
+    shawty = "387FRwow6MKDhSwuMULhKjqeXuxoBY4BbbaSntdk9LaH"
+    other_wallet = "OtherActiveWallet11111111111111111111111111"
+    requested_paths: list[str] = []
+
+    def handler_matching_url(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        assert request.url.params.get("api-key") == "test-helius-key"
+        if request.url.path == "/v0/webhooks":
+            # Summary metadata only — no accountAddresses field
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "webhookID": "inactive-hook",
+                        "webhookURL": "https://solana-api.projectkami.net/old",
+                        "active": False,
+                    },
+                    {
+                        "webhookID": "kami-hook-123",
+                        "webhookURL": "https://solana-api.projectkami.net/api/webhooks/helius",
+                        "active": True,
+                    },
+                ],
+            )
+        if request.url.path == "/v0/webhooks/kami-hook-123":
+            return httpx.Response(
+                200,
+                json={
+                    "webhookID": "kami-hook-123",
+                    "webhookURL": "https://solana-api.projectkami.net/api/webhooks/helius",
+                    "accountAddresses": [jijo, shawty],
+                },
+            )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler_matching_url)) as client:
+        wallets = await fetch_helius_tracked_wallets(cfg, force_refresh=True, http_client=client, now_ts=2000.0)
+
+    assert wallets == [jijo, shawty]
+    assert requested_paths == ["/v0/webhooks", "/v0/webhooks/kami-hook-123"]
+
+    # Fallback: when no filter matches, hydrate all active webhooks and deduplicate
+    requested_paths.clear()
+
+    def handler_fallback_all_active(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        assert request.url.params.get("api-key") == "test-helius-key"
+        if request.url.path == "/v0/webhooks":
+            return httpx.Response(
+                200,
+                json=[
+                    {"webhookID": "hook-a", "webhookURL": "https://custom-a.example.com/hook", "accountAddresses": []},
+                    {"webhookID": "hook-b", "webhookURL": "https://custom-b.example.com/hook"},
+                    {"webhookID": "hook-disabled", "webhookURL": "https://disabled.example.com/hook", "active": False},
+                ],
+            )
+        if request.url.path == "/v0/webhooks/hook-a":
+            return httpx.Response(200, json={"webhookID": "hook-a", "accountAddresses": [jijo]})
+        if request.url.path == "/v0/webhooks/hook-b":
+            return httpx.Response(200, json={"webhookID": "hook-b", "accountAddresses": [jijo, other_wallet]})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler_fallback_all_active)) as client:
+        wallets_all = await fetch_helius_tracked_wallets(cfg, force_refresh=True, http_client=client, now_ts=3000.0)
+
+    assert wallets_all == [jijo, other_wallet]
+    assert requested_paths == ["/v0/webhooks", "/v0/webhooks/hook-a", "/v0/webhooks/hook-b"]
+    clear_helius_roster_cache()

@@ -207,3 +207,47 @@ async def test_safety_gate_deterministic_rejections_and_pass():
     assert [c["mint"] for c in out["safe_candidates"]] == ["MintSafe"]
     rejected_mints = {r["mint"] for r in out["rejected_candidates"]}
     assert rejected_mints == {"MintAuth", "MintFreeze", "MintUnlockedLP", "MintCabalTop10", "MintShieldCrit"}
+
+
+@pytest.mark.asyncio
+async def test_safety_gate_follows_jupiter_shield_307_redirect():
+    cfg = AgentConfig(_env_file=None, JUPITER_API_KEY="test-jup-key")
+    mint = "MintRedirectSafe"
+    shield_hits: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "rugcheck.xyz" in url:
+            return httpx.Response(
+                200,
+                json={
+                    "mint": mint,
+                    "riskScore": 100,
+                    "rugged": False,
+                    "markets": [{"lp": {"lpLockedPct": 100.0}}],
+                    "risks": [],
+                },
+            )
+        if request.url.path == "/ultra/v1/shield":
+            shield_hits.append(url)
+            return httpx.Response(
+                307,
+                headers={"Location": f"https://api.jup.ag/ultra/v2/shield?mints={mint}"},
+            )
+        if request.url.path == "/ultra/v2/shield":
+            shield_hits.append(url)
+            assert request.headers.get("x-api-key") == "test-jup-key"
+            return httpx.Response(200, json={"warnings": {mint: []}})
+        return httpx.Response(404)
+
+    # Deliberately omit follow_redirects=True on the injected client to verify per-request follow_redirects=True
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        out = await safety_gate_node(
+            {"focus_state": FocusState.SCANNING.value, "raw_candidates": [{"mint": mint, "symbol": "REDIR"}]},
+            config=cfg,
+            http_client=client,
+        )
+
+    assert [c["mint"] for c in out["safe_candidates"]] == [mint]
+    assert out["rejected_candidates"] == []
+    assert len(shield_hits) == 2

@@ -204,6 +204,7 @@ async def check_token_safety(
             params={"mints": mint},
             headers=headers,
             timeout=10.0,
+            follow_redirects=True,
         )
         sh_resp.raise_for_status()
         sh_data = sh_resp.json()
@@ -247,7 +248,7 @@ async def safety_gate_node(
     )
 
     owns_client = http_client is None
-    client = http_client or httpx.AsyncClient()
+    client = http_client or httpx.AsyncClient(follow_redirects=True)
     safe: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     fast_track_order: Optional[dict[str, Any]] = None
