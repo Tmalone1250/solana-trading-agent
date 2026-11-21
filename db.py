@@ -416,8 +416,14 @@ class AgentDatabase:
                     active_pos["triggering_wallets"] = trig_wallets
                 if shadow_flag and str(active_pos.get("strategy") or "").upper() == "WHALE_SCALP":
                     active_pos["whale_shadow_exit_flag"] = True
-                if not chart_positions and focus_state == FocusState.IN_POSITION.value and str(active_pos.get("strategy") or "").upper() != "WHALE_SCALP":
-                    chart_positions = [active_pos]
+                if focus_state == FocusState.IN_POSITION.value and str(active_pos.get("strategy") or "").upper() != "WHALE_SCALP":
+                    if not chart_positions:
+                        chart_positions = [active_pos]
+                    else:
+                        for idx, cp in enumerate(chart_positions):
+                            if isinstance(cp, dict) and cp.get("mint") == active_pos.get("mint"):
+                                chart_positions[idx] = {**cp, **active_pos}
+                                break
             if isinstance(whale_pos, dict):
                 if shadow_flag:
                     whale_pos["whale_shadow_exit_flag"] = True
@@ -468,12 +474,30 @@ class AgentDatabase:
                 else False
             )
             trig_json = json.dumps(trig_wallets)
+            curr_row = self._conn.execute("SELECT chart_positions_json FROM agent_state WHERE id = 1").fetchone()
+            chart_list: list[dict[str, Any]] = json.loads(curr_row[0]) if (curr_row and curr_row[0]) else []
+            if isinstance(active_position, dict) and str(active_position.get("strategy") or "").upper() != "WHALE_SCALP":
+                a_mint = active_position.get("mint")
+                if focus_state == FocusState.IN_POSITION.value:
+                    replaced = False
+                    for idx, cp in enumerate(chart_list):
+                        if isinstance(cp, dict) and cp.get("mint") == a_mint:
+                            chart_list[idx] = active_position
+                            replaced = True
+                            break
+                    if not replaced:
+                        chart_list.append(active_position)
+                else:
+                    chart_list = [cp for cp in chart_list if isinstance(cp, dict) and cp.get("mint") != a_mint]
+            elif active_position is None and focus_state == FocusState.SCANNING.value and len(chart_list) <= 1:
+                chart_list = []
+            chart_list_json = json.dumps(chart_list)
             if last_decision_rationale is None:
                 self._conn.execute(
                     """
                     UPDATE agent_state
                     SET focus_state = ?, sol_balance = ?, daily_pnl_sol = ?,
-                        active_position_json = ?, strategy = ?, triggering_wallets_json = ?,
+                        active_position_json = ?, chart_positions_json = ?, strategy = ?, triggering_wallets_json = ?,
                         whale_shadow_exit_requested = ?, updated_at = ?
                     WHERE id = 1
                     """,
@@ -482,6 +506,7 @@ class AgentDatabase:
                         sol_balance,
                         daily_pnl_sol,
                         pos_json,
+                        chart_list_json,
                         strategy,
                         trig_json,
                         shadow_flag,
@@ -493,7 +518,7 @@ class AgentDatabase:
                     """
                     UPDATE agent_state
                     SET focus_state = ?, sol_balance = ?, daily_pnl_sol = ?,
-                        active_position_json = ?, strategy = ?, triggering_wallets_json = ?,
+                        active_position_json = ?, chart_positions_json = ?, strategy = ?, triggering_wallets_json = ?,
                         whale_shadow_exit_requested = ?, last_decision_rationale = ?, updated_at = ?
                     WHERE id = 1
                     """,
@@ -502,6 +527,7 @@ class AgentDatabase:
                         sol_balance,
                         daily_pnl_sol,
                         pos_json,
+                        chart_list_json,
                         strategy,
                         trig_json,
                         shadow_flag,

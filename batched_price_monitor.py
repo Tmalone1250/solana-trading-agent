@@ -78,11 +78,13 @@ async def fetch_batched_sol_prices(
 
     ts = now_ts if now_ts is not None else time.time()
     sol_per_token: dict[str, float] = {}
+    decimals_by_mint: dict[str, int] = {}
     dex_flow: dict[str, dict[str, Any]] = {}
 
-    # 1. Single batched Jupiter Price API v3 call (SOL + all active mints)
+    # 1. Single batched Jupiter Price API v3 call (always includes SOL_MINT + all active mints)
     if not _in_backoff("jup_price_v3", ts):
-        ids_param = ",".join([SOL_MINT, *unique_mints])
+        ids_list = [SOL_MINT] + [m for m in unique_mints if m != SOL_MINT]
+        ids_param = ",".join(ids_list)
         url = f"{config.JUPITER_BASE_URL}/price/v3"
         headers = {"x-api-key": config.JUPITER_API_KEY} if config.JUPITER_API_KEY else {}
         try:
@@ -93,21 +95,35 @@ async def fetch_batched_sol_prices(
                 resp.raise_for_status()
                 _clear_429("jup_price_v3")
                 data = resp.json()
-                # Jupiter /price/v3 returns {mint: {"usdPrice": ...}} (or {"data": {mint: {"price": ...}}})
-                price_map = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+                # Jupiter /price/v3 flat schema: {mint: {"usdPrice": float, "decimals": int, ...}}
+                price_map = (
+                    data["data"]
+                    if isinstance(data, dict)
+                    and SOL_MINT not in data
+                    and isinstance(data.get("data"), dict)
+                    else data
+                )
                 if isinstance(price_map, dict):
-                    sol_entry = price_map.get(SOL_MINT) or {}
-                    sol_usd = float(sol_entry.get("usdPrice") or sol_entry.get("price") or 0.0)
+                    sol_entry = price_map.get(SOL_MINT)
+                    sol_usd = (
+                        float(sol_entry.get("usdPrice") or sol_entry.get("price") or 0.0)
+                        if isinstance(sol_entry, dict)
+                        else 0.0
+                    )
                     if sol_usd > 0:
                         for m in unique_mints:
-                            m_entry = price_map.get(m) or {}
+                            m_entry = price_map.get(m)
+                            if not isinstance(m_entry, dict):
+                                continue
+                            if m_entry.get("decimals") is not None:
+                                decimals_by_mint[m] = int(m_entry["decimals"])
                             tok_usd = float(m_entry.get("usdPrice") or m_entry.get("price") or 0.0)
                             if tok_usd > 0:
                                 sol_per_token[m] = tok_usd / sol_usd
         except Exception as exc:
             logger.warning("[BatchedPrice] Jupiter /price/v3 failed: %s", exc)
 
-    # 2. Single batched DexScreener lookup for 5m flow, liquidity & fallback priceNative
+    # 2. Single batched DexScreener lookup for 5m flow, liquidity & mandatory priceNative fallback
     if not _in_backoff("dex_batch", ts):
         for idx in range(0, len(unique_mints), 30):
             chunk = unique_mints[idx : idx + 30]
@@ -125,7 +141,10 @@ async def fetch_batched_sol_prices(
                 for p in pairs:
                     if not isinstance(p, dict) or str(p.get("chainId") or "").lower() != "solana":
                         continue
-                    m = str((p.get("baseToken") or {}).get("address") or "").strip()
+                    m = str(
+                        (p.get("baseToken") or {}).get("address")
+                        or (chunk[0] if len(chunk) == 1 else "")
+                    ).strip()
                     if not m:
                         continue
                     liq = float((p.get("liquidity") or {}).get("usd") or 0.0)
@@ -134,18 +153,24 @@ async def fetch_batched_sol_prices(
                         best_by_mint[m] = p
                 for m, p in best_by_mint.items():
                     m5 = (p.get("txns") or {}).get("m5") or {}
+                    native_p = float(p.get("priceNative") or 0.0)
                     dex_flow[m] = {
                         "buys_5m": int(m5.get("buys") or 0),
                         "sells_5m": int(m5.get("sells") or 0),
                         "liquidity_usd": float((p.get("liquidity") or {}).get("usd") or 0.0),
+                        "price_native": native_p,
+                        "decimals": decimals_by_mint.get(m),
                         "pair": p,
                     }
-                    if m not in sol_per_token:
-                        native_p = float(p.get("priceNative") or 0.0)
-                        if native_p > 0:
-                            sol_per_token[m] = native_p
+                    # Mandatory meme-coin fallback when Jupiter /price/v3 omits mint or fails
+                    if m not in sol_per_token and native_p > 0:
+                        sol_per_token[m] = native_p
             except Exception as exc:
                 logger.warning("[BatchedPrice] DexScreener batch failed: %s", exc)
+
+    for m, dec in decimals_by_mint.items():
+        if m not in dex_flow:
+            dex_flow[m] = {"decimals": dec}
 
     return sol_per_token, dex_flow
 
@@ -154,13 +179,70 @@ def estimate_position_sol_value(
     pos: ActivePosition,
     sol_per_token: Optional[float],
     *,
-    token_decimals: int = 6,
+    token_decimals: Optional[int] = None,
 ) -> float:
-    """Estimate current SOL value from batched price, falling back to last known value."""
-    if sol_per_token is not None and sol_per_token > 0 and pos.token_amount > 0:
-        # Derive effective scale from entry if reference ratio is known, else standard SPL decimals
-        return (pos.token_amount / (10**token_decimals)) * sol_per_token
+    """Estimate current SOL value: (token_amount / (10 ** decimals)) * sol_per_token."""
+    decimals = int(
+        token_decimals
+        if token_decimals is not None
+        else (getattr(pos, "decimals", None) or 6)
+    )
+    tok_amt = pos.token_amount if pos.token_amount > 0 else pos.reference_token_amount
+    if sol_per_token is not None and sol_per_token > 0 and tok_amt > 0:
+        return (tok_amt / (10**decimals)) * sol_per_token
     return pos.current_sol_value or pos.entry_sol
+
+
+def apply_dex_flow_and_pnl(
+    pos: ActivePosition,
+    *,
+    current_sol_value: float,
+    flow: Optional[dict[str, Any]],
+    lane_label: str = "chart_slot",
+) -> tuple[int, int, float, float]:
+    """Update current/peak SOL, PnL, and DexScreener 5m flow/liquidity in-place and log 1-line status."""
+    buys_5m = 0
+    sells_5m = 0
+    current_liq = float(pos.last_liquidity_usd or pos.entry_liquidity_usd or 0.0)
+    buy_ratio_5m = float(pos.last_5m_buy_ratio or 0.0)
+
+    if isinstance(flow, dict):
+        if flow.get("decimals") is not None:
+            pos.decimals = int(flow["decimals"])
+        if "buys_5m" in flow or "sells_5m" in flow:
+            buys_5m = int(flow.get("buys_5m") or 0)
+            sells_5m = int(flow.get("sells_5m") or 0)
+            total_5m = buys_5m + sells_5m
+            buy_ratio_5m = round(buys_5m / total_5m, 4) if total_5m > 0 else 0.0
+            sell_ratio_5m = round(sells_5m / total_5m, 4) if total_5m > 0 else 0.0
+            pos.last_5m_buy_ratio = buy_ratio_5m
+            pos.last_5m_sell_ratio = sell_ratio_5m
+        if "liquidity_usd" in flow:
+            current_liq = round(float(flow.get("liquidity_usd") or 0.0), 2)
+            pos.last_liquidity_usd = current_liq
+
+    pos.current_sol_value = round(current_sol_value, 6)
+    if current_sol_value > pos.peak_sol_value:
+        pos.peak_sol_value = round(current_sol_value, 6)
+    pnl_sol = (current_sol_value - pos.entry_sol) if pos.entry_sol > 0 else 0.0
+    pnl_pct = ((pnl_sol / pos.entry_sol) * 100.0) if pos.entry_sol > 0 else 0.0
+    pos.pnl_sol = round(pnl_sol, 6)
+    pos.pnl_pct = round(pnl_pct, 2)
+
+    logger.info(
+        "[Monitor] [%s] $%s (%s..): val=%.4f SOL (entry=%.4f, peak=%.4f, PnL=%+.4f SOL / %+.2f%%) | liq=$%.0f | 5m_buy=%.0f%%",
+        lane_label,
+        pos.symbol,
+        pos.mint[:6],
+        pos.current_sol_value,
+        pos.entry_sol,
+        pos.peak_sol_value,
+        pos.pnl_sol,
+        pos.pnl_pct,
+        current_liq,
+        buy_ratio_5m * 100.0,
+    )
+    return buys_5m, sells_5m, buy_ratio_5m, current_liq
 
 
 def needs_exact_jupiter_quote(
@@ -240,16 +322,23 @@ async def resolve_position_sol_value(
     config: AgentConfig,
     client: httpx.AsyncClient,
     now_dt: Optional[datetime] = None,
+    has_batched_price: bool = True,
+    quote_amount: Optional[int] = None,
 ) -> tuple[float, bool]:
     """Return (sol_value, used_exact_quote), calling Jupiter Swap Quote only when near a threshold."""
-    if not needs_exact_jupiter_quote(pos, estimated_sol_value, config, now_dt=now_dt):
+    if has_batched_price and not needs_exact_jupiter_quote(pos, estimated_sol_value, config, now_dt=now_dt):
         return estimated_sol_value, False
-    quote_resp = await fetch_jupiter_order(
-        input_mint=pos.mint,
-        output_mint=SOL_MINT,
-        amount_atomic=max(1, pos.token_amount),
-        config=config,
-        client=client,
-        taker=None,
-    )
-    return int(quote_resp["outAmount"]) / LAMPORTS_PER_SOL, True
+    amt = quote_amount if quote_amount is not None and quote_amount > 0 else max(1, pos.token_amount or pos.reference_token_amount)
+    try:
+        quote_resp = await fetch_jupiter_order(
+            input_mint=pos.mint,
+            output_mint=SOL_MINT,
+            amount_atomic=amt,
+            config=config,
+            client=client,
+            taker=None,
+        )
+        return int(quote_resp["outAmount"]) / LAMPORTS_PER_SOL, True
+    except Exception as exc:
+        logger.warning("[BatchedPrice] On-demand Jupiter quote failed for %s (%s); using batched price %.4f SOL", pos.symbol, exc, estimated_sol_value)
+        return estimated_sol_value, False

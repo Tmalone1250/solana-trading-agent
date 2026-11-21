@@ -105,6 +105,7 @@ class ActivePosition(BaseModel):
     symbol: str
     entry_sol: float
     token_amount: int
+    decimals: int = 6
     strategy: str = "SCALPER"
     triggering_wallets: list[str] = Field(default_factory=list)
     whale_shadow_exit_flag: bool = False
@@ -115,6 +116,8 @@ class ActivePosition(BaseModel):
     breakout_telemetry: Optional[dict[str, Any]] = None
     current_sol_value: float = 0.0
     peak_sol_value: float = 0.0
+    pnl_sol: float = 0.0
+    pnl_pct: float = 0.0
     breakeven_armed: bool = False
     trail_armed: bool = False
     retrace_low_sol: Optional[float] = None

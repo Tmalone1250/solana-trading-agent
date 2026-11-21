@@ -9,6 +9,7 @@ from typing import Any, Optional
 import httpx
 
 from batched_price_monitor import (
+    apply_dex_flow_and_pnl,
     estimate_position_sol_value,
     fetch_batched_sol_prices,
     resolve_position_sol_value,
@@ -193,15 +194,23 @@ async def run_whale_lane_tick(
         # Step 1: Monitor ALL open whale positions via 1 batched price fetch + on-demand quote near thresholds
         if whale_positions:
             open_mints = [str(p["mint"]) for p in whale_positions if isinstance(p, dict) and p.get("mint")]
-            sol_prices, _ = await fetch_batched_sol_prices(open_mints, config, client, now_ts=now_dt.timestamp())
+            sol_prices, dex_flow = await fetch_batched_sol_prices(open_mints, config, client, now_ts=now_dt.timestamp())
             surviving: list[dict[str, Any]] = []
             for raw_p in whale_positions:
                 pos = ActivePosition.model_validate(raw_p)
-                est_val = estimate_position_sol_value(pos, sol_prices.get(pos.mint))
+                flow = dex_flow.get(pos.mint)
+                if isinstance(flow, dict) and flow.get("decimals") is not None:
+                    pos.decimals = int(flow["decimals"])
+                est_val = estimate_position_sol_value(pos, sol_prices.get(pos.mint), token_decimals=pos.decimals)
                 curr_val, _used_q = await resolve_position_sol_value(
-                    pos, estimated_sol_value=est_val, config=config, client=client, now_dt=now_dt
+                    pos,
+                    estimated_sol_value=est_val,
+                    config=config,
+                    client=client,
+                    now_dt=now_dt,
+                    has_batched_price=(pos.mint in sol_prices),
                 )
-                pos.current_sol_value = curr_val
+                apply_dex_flow_and_pnl(pos, current_sol_value=curr_val, flow=flow, lane_label="whale_slot")
                 exit_order, _ev = evaluate_whale_exit_order(
                     pos, current_sol_value=curr_val, config=config, db=db, now_dt=now_dt
                 )

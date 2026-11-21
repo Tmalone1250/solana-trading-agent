@@ -1,24 +1,22 @@
-# Memory Bounding, DuckDB Cap & HTTP/Cache Hardening Plan (Raspberry Pi 4 2GB)
+# Live Batched Position Monitor Fix Plan (Jupiter Price V3 + DexScreener `priceNative` Fallback)
 
-## 1. Cap DuckDB Memory & Prevent Leaked Connections (`db.py`, `memory_guard.py`, `telemetry_api.py`)
-- Immediately on opening any DuckDB connection in `AgentDatabase.__init__`, execute:
-  `SET memory_limit='256MB'; SET threads=2; SET preserve_insertion_order=false;`
-- Remove the eager module-level `app = create_telemetry_app()` instantiation in `telemetry_api.py` (replace with lazy module `__getattr__`) so importing `create_telemetry_app` in `main.py` or tests never opens a second leaked DuckDB connection.
-- Add SQL-level cutoff filtering (`WHERE timestamp_utc >= ?`) and periodic table pruning (`prune_bounded_tables`) for `cooldowns`, `whale_events`, `whale_signals`, `whale_decisions`, `decisions_log`, `social_signals`, and `x_seen_tweets`.
+## 1. Fix Jupiter `/price/v3` Flat Schema Parsing & SOL Conversion (`batched_price_monitor.py`)
+- Always include `SOL_MINT` (`So11111111111111111111111111111111111111112`) in `GET https://api.jup.ag/price/v3?ids=...`.
+- Parse the flat V3 response schema (`resp[mint]["usdPrice"]` and `resp[mint]["decimals"]`) and compute:
+  `current_sol_value = (token_amount / (10 ** decimals)) * (token_usd / sol_usd)`.
 
-## 2. Bound All In-Memory Caches & Buffers (`ohlcv_client.py`, `jupiter_token_client.py`, `safety_gate_node.py`, `helius_webhook.py`, `batched_price_monitor.py`)
-- **OHLCV Cache (`ohlcv_client.py`):** Evict entries older than TTL (`600s`) and cap `_ohlcv_cache` at `MAX_OHLCV_CACHE_ENTRIES = 64` (evicting oldest entries first).
-- **Jupiter Token v2 Cache (`jupiter_token_client.py`):** Cap `_mint_cache` at `MAX_MINT_CACHE_ENTRIES = 256` (TTL `300s`) and `_discovery_cache["tokens"]` at `100` entries.
-- **SafetyGate Cache (`safety_gate_node.py`):** Add bounded `_safety_cache` (`MAX_SAFETY_CACHE_ENTRIES = 128`, TTL `300s`) so repeated safety checks reuse recent verdicts without unbounded growth.
-- **Helius Webhook & Price Backoff (`helius_webhook.py`, `batched_price_monitor.py`):** Bound `_recent_webhook_sigs` ring buffer (`MAX_RECENT_WEBHOOK_SIGS = 500`, TTL `1800s`), cap `_helius_roster_cache["wallets"]` (`100`), and cap `_price_backoff` (`32`).
+## 2. Mandatory DexScreener `priceNative` Fallback & Live Flow Enrichment (`batched_price_monitor.py`, `state.py`)
+- Whenever a mint is omitted from Jupiter `/price/v3` (or `/price/v3` fails), immediately compute `current_sol_value` from the batched DexScreener response using `priceNative` (in SOL) and `token_amount / (10 ** decimals)`.
+- Add `decimals`, `pnl_sol`, and `pnl_pct` to `ActivePosition` in `state.py`.
+- Always write `last_liquidity_usd`, `last_5m_buy_ratio`, `last_5m_sell_ratio`, `current_sol_value`, `peak_sol_value`, `pnl_sol`, and `pnl_pct` directly onto each position object in `chart_positions` and `whale_positions`.
 
-## 3. Reuse HTTP Clients & 60s `[WhaleRoster]` Failure Backoff (`helius_webhook.py`, `telemetry_api.py`, `main.py`, `x_discovery_worker.py`)
-- Add a 60-second failure backoff (`HELIUS_ROSTER_ERROR_BACKOFF_SECONDS = 60.0`) to `fetch_helius_tracked_wallets()` in `helius_webhook.py` so network blips do not trigger retry storms across `/api/telemetry` or webhook hits.
-- Share a single bounded `httpx.AsyncClient` across `main.py`, `telemetry_api.py`, and `x_discovery_worker.py`, closing it cleanly on shutdown.
+## 3. In-Place Persistence & 1-Line `[Monitor]` Logging (`position_monitor_node.py`, `whale_lane.py`, `db.py`)
+- Upgrade `position_monitor_node.py` (keeping it under 500 lines) and `whale_lane.py` to use `fetch_batched_sol_prices()` + `update_position_from_batch()`, persisting updated `chart_positions` and `whale_positions` in-place to DuckDB (`save_lane_positions` and synced `save_state`) so `/api/telemetry` reflects live PnL and order flow on every tick.
+- Log a compact 1-line `[Monitor]` status per position on every monitor tick for `journalctl` visibility.
 
-## 4. Periodic RSS Memory Telemetry (`memory_guard.py`, `main.py`)
-- Log process RSS memory (`[Memory] RSS=... MB`) on startup and every 10 minutes (`600s`) in `main.py` alongside cache and DuckDB pruning so memory stability is tracked in `journalctl`.
-
-## 5. Verification
-- Add unit tests in `tests/test_memory_bounds_and_backoff.py` verifying DuckDB `memory_limit`/`threads`/`preserve_insertion_order` settings, bounded cache eviction (OHLCV, Jupiter, SafetyGate, webhook signatures), 60s `[WhaleRoster]` error backoff, and RSS memory logging.
+## 4. Verification (`tests/test_dual_lane_3x3_and_whale_breakout.py`)
+- Add unit tests covering:
+  1. Flat Jupiter `/price/v3` (`usdPrice` + `decimals`) parsing and SOL value calculation.
+  2. DexScreener `priceNative` fallback when Jupiter `/price/v3` omits a meme coin.
+  3. `/api/telemetry` returning updated `current_sol_value`, `pnl_sol`, `pnl_pct`, `last_liquidity_usd`, and `last_5m_buy_ratio` inside `chart_positions`.
 - Run `./venv/bin/pytest -v`.

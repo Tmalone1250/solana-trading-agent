@@ -21,6 +21,7 @@ from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
 from db import AgentDatabase
 from executor_node import executor_node
 from ohlcv_client import clear_ohlcv_cache
+from position_monitor_node import position_monitor_node
 from state import ActivePosition, FocusState, PendingOrder
 from telemetry_api import create_telemetry_app
 from tests.test_breakout_ignition import _make_breakout_candles
@@ -229,3 +230,104 @@ async def test_whale_breakout_gate_blocks_extended_and_low_score_and_logs_csv(tm
     assert "EXT(" in ext_log["breakout_failed_gates"]
     db.close()
     clear_ohlcv_cache()
+
+
+@pytest.mark.asyncio
+async def test_jupiter_v3_flat_schema_dexscreener_pricenative_fallback_and_telemetry_chart_positions(tmp_path):
+    """Verify (a) Jupiter /price/v3 flat usdPrice+decimals parsing, (b) DexScreener priceNative fallback
+    when Jupiter omits a meme coin, and (c) /api/telemetry returning live updated chart_positions."""
+    clear_price_backoff()
+    db = AgentDatabase(db_path=str(tmp_path / "live_chart_tel.duckdb"), starting_sol=2.0)
+    cfg = AgentConfig(_env_file=None)
+    mint_v3 = "MintJupV3Flat111111111111111111111111111111"
+    mint_meme = "Fn95NtGXWPaJXc4N5y9rVkUq1NwZbjBNJzPVvNRLpump"  # omitted from /price/v3 -> uses priceNative
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/swap/v2/order" in url:
+            # 10,000,000,000 atomic units (10,000 tokens at 6 decimals)
+            return httpx.Response(200, json={"outAmount": "10000000000", "transaction": None})
+        if "/price/v3" in url:
+            ids = request.url.params.get("ids", "")
+            assert SOL_MINT in ids
+            # Flat V3 schema: includes SOL_MINT and mint_v3 (9 decimals), but omits mint_meme
+            return httpx.Response(
+                200,
+                json={
+                    SOL_MINT: {"usdPrice": 200.0, "decimals": 9},
+                    mint_v3: {"usdPrice": 0.11, "decimals": 9},
+                },
+            )
+        if "/tokens/v1/solana/" in url:
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "chainId": "solana",
+                        "baseToken": {"address": mint_v3, "symbol": "V3TOK"},
+                        "priceNative": "0.00050",
+                        "liquidity": {"usd": 95_000.0},
+                        "txns": {"m5": {"buys": 30, "sells": 10}},
+                    },
+                    {
+                        "chainId": "solana",
+                        "baseToken": {"address": mint_meme, "symbol": "SHIT"},
+                        "priceNative": "0.0000535",  # 10,000 tokens * 0.0000535 = 0.535 SOL (+7.0% vs 0.50 entry)
+                        "liquidity": {"usd": 131_250.5},
+                        "txns": {"m5": {"buys": 40, "sells": 10}},
+                    },
+                ],
+            )
+        return httpx.Response(404)
+
+    class _NoopDecisionClient:
+        async def decide(self, **_kwargs):
+            return {}
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        # (a) Direct verification of flat V3 usdPrice + decimals AND (b) priceNative fallback
+        sol_prices, dex_flow = await fetch_batched_sol_prices([mint_v3, mint_meme], cfg, client, now_ts=2000.0)
+        # mint_v3: 0.11 / 200.0 = 0.00055 SOL/token with 9 decimals from V3
+        assert sol_prices[mint_v3] == pytest.approx(0.00055, rel=1e-5)
+        assert dex_flow[mint_v3]["decimals"] == 9
+        # mint_meme omitted by V3 -> falls back to DexScreener priceNative = 0.0000535 SOL/token
+        assert sol_prices[mint_meme] == pytest.approx(0.0000535, rel=1e-5)
+
+        # (c) Open $SHIT in chart_slot via executor_node (entry_sol = 0.50,entry_liq = 124395.86)
+        buy_order = PendingOrder(
+            side="BUY",
+            mint=mint_meme,
+            symbol="SHIT",
+            amount_atomic=int(0.50 * LAMPORTS_PER_SOL),
+            reason="DECISION_1_ENTRY",
+            target_state_after_fill=FocusState.IN_POSITION,
+            entry_liquidity_usd=124_395.86,
+            strategy="DISPLACEMENT_RETEST",
+        )
+        st0 = db.get_state()
+        await executor_node({**st0, "pending_order": buy_order.model_dump()}, config=cfg, db=db, http_client=client)
+
+        # Run position_monitor_node tick -> must update chart_positions in-place using priceNative fallback
+        st1 = db.get_state()
+        mon_out = await position_monitor_node(
+            st1,
+            config=cfg,
+            db=db,
+            decision_client=_NoopDecisionClient(),  # type: ignore[arg-type]
+            http_client=client,
+        )
+        assert mon_out["monitor_event"] == "HOLD_IN_POSITION"
+
+    tc = TestClient(create_telemetry_app(config=cfg, db=db))
+    tel = tc.get("/api/telemetry").json()
+    assert len(tel["chart_positions"]) == 1
+    cp0 = tel["chart_positions"][0]
+    assert cp0["symbol"] == "SHIT"
+    assert cp0["current_sol_value"] == pytest.approx(0.535, rel=1e-4)
+    assert cp0["peak_sol_value"] == pytest.approx(0.535, rel=1e-4)
+    assert cp0["pnl_sol"] == pytest.approx(0.035, rel=1e-4)
+    assert cp0["pnl_pct"] == pytest.approx(7.0, rel=1e-3)
+    assert cp0["last_liquidity_usd"] == pytest.approx(131_250.5, rel=1e-3)
+    assert cp0["last_5m_buy_ratio"] == pytest.approx(0.80, rel=1e-3)
+    assert cp0["last_5m_sell_ratio"] == pytest.approx(0.20, rel=1e-3)
+    db.close()
