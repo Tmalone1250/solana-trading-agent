@@ -12,6 +12,7 @@ from config import load_config
 from db import AgentDatabase
 from decision_client import GeminiDecisionClient
 from graph import build_agent_graph
+from memory_guard import maybe_log_rss_memory
 from state import FocusState
 from telemetry_api import create_telemetry_app
 from whale_lane import run_whale_lane_tick
@@ -24,18 +25,29 @@ logging.basicConfig(
 logger = logging.getLogger("solana-meme-agent")
 
 
-async def run_autonomous_loop(config, db: AgentDatabase) -> None:
+async def run_autonomous_loop(
+    config,
+    db: AgentDatabase,
+    *,
+    http_client: httpx.AsyncClient | None = None,
+) -> None:
     """Continuously tick the compiled LangGraph 3-State Focus Machine."""
     decision_client = GeminiDecisionClient(
         api_key=config.GEMINI_API_KEY,
         model=config.DECISION_MODEL,
     )
-    async with httpx.AsyncClient() as http_client:
+    owns_client = http_client is None
+    client = http_client or httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=15.0,
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+    )
+    try:
         compiled = build_agent_graph(
             config=config,
             db=db,
             decision_client=decision_client,
-            http_client=http_client,
+            http_client=client,
         )
         logger.info(
             "Starting solana-meme-agent | mode=%s | lane=%s | trade_size=%.2f SOL",
@@ -43,7 +55,9 @@ async def run_autonomous_loop(config, db: AgentDatabase) -> None:
             config.HUNTING_LANE,
             config.TRADE_SIZE_SOL,
         )
+        maybe_log_rss_memory(db=db, force=True)
         while True:
+            maybe_log_rss_memory(db=db)
             st = db.get_state()
             initial_state = {
                 "focus_state": st["focus_state"],
@@ -77,19 +91,36 @@ async def run_autonomous_loop(config, db: AgentDatabase) -> None:
             else:
                 sleep_sec = config.MONITOR_POLL_SECONDS
             await asyncio.sleep(sleep_sec)
+    finally:
+        if owns_client:
+            await client.aclose()
 
 
-async def run_whale_lane_loop(config, db: AgentDatabase) -> None:
+async def run_whale_lane_loop(
+    config,
+    db: AgentDatabase,
+    *,
+    http_client: httpx.AsyncClient | None = None,
+) -> None:
     """Whale lane independent loop (up to MAX_WHALE_POSITIONS=3): batched monitor + breakout-gated entry."""
-    async with httpx.AsyncClient(follow_redirects=True) as http_client:
+    owns_client = http_client is None
+    client = http_client or httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=15.0,
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+    )
+    try:
         while True:
             try:
-                res = await run_whale_lane_tick(config=config, db=db, http_client=http_client)
+                res = await run_whale_lane_tick(config=config, db=db, http_client=client)
                 has_open = bool(res.get("whale_positions") or res.get("whale_position"))
             except Exception as exc:
                 logger.exception("Error during Whale Lane tick: %s", exc)
                 has_open = False
             await asyncio.sleep(config.WHALE_MONITOR_POLL_SECONDS if has_open else 5.0)
+    finally:
+        if owns_client:
+            await client.aclose()
 
 
 async def main() -> None:
@@ -98,7 +129,12 @@ async def main() -> None:
         db_path=config.DUCKDB_PATH,
         starting_sol=config.PAPER_STARTING_SOL,
     )
-    app = create_telemetry_app(config=config, db=db)
+    shared_http_client = httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=15.0,
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+    )
+    app = create_telemetry_app(config=config, db=db, http_client=shared_http_client)
 
     uv_config = uvicorn.Config(
         app,
@@ -108,14 +144,14 @@ async def main() -> None:
     )
     server = uvicorn.Server(uv_config)
 
-    agent_task = asyncio.create_task(run_autonomous_loop(config, db))
+    agent_task = asyncio.create_task(run_autonomous_loop(config, db, http_client=shared_http_client))
     whale_task = (
-        asyncio.create_task(run_whale_lane_loop(config, db))
+        asyncio.create_task(run_whale_lane_loop(config, db, http_client=shared_http_client))
         if config.WHALE_STRATEGY_ENABLED
         else None
     )
     x_task = (
-        asyncio.create_task(run_x_discovery_loop(config, db))
+        asyncio.create_task(run_x_discovery_loop(config, db, http_client=shared_http_client))
         if config.ENABLE_X_DISCOVERY
         else None
     )
@@ -127,6 +163,7 @@ async def main() -> None:
             whale_task.cancel()
         if x_task is not None:
             x_task.cancel()
+        await shared_http_client.aclose()
         db.close()
 
 

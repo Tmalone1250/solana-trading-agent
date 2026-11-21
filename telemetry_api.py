@@ -7,6 +7,7 @@ import io
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -23,13 +24,24 @@ from helius_webhook import (
 def create_telemetry_app(
     config: Optional[AgentConfig] = None,
     db: Optional[AgentDatabase] = None,
+    http_client: Optional[httpx.AsyncClient] = None,
 ) -> FastAPI:
-    """Create the FastAPI telemetry application."""
+    """Create the FastAPI telemetry application reusing a shared DB & HTTP client."""
     cfg = config or load_config()
     database = db or AgentDatabase(
         db_path=cfg.DUCKDB_PATH,
         starting_sol=cfg.PAPER_STARTING_SOL,
     )
+    shared_http: dict[str, Optional[httpx.AsyncClient]] = {"client": http_client}
+
+    def _get_http_client() -> httpx.AsyncClient:
+        if shared_http["client"] is None or shared_http["client"].is_closed:
+            shared_http["client"] = httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=10.0,
+                limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            )
+        return shared_http["client"]
 
     app = FastAPI(
         title="solana-meme-agent Telemetry API",
@@ -389,4 +401,14 @@ def create_telemetry_app(
     return app
 
 
-app = create_telemetry_app()
+_lazy_app: Optional[FastAPI] = None
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily instantiate `app` only if accessed directly (prevents leaked DB on import)."""
+    global _lazy_app
+    if name == "app":
+        if _lazy_app is None:
+            _lazy_app = create_telemetry_app()
+        return _lazy_app
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -10,8 +10,13 @@ from typing import Any, Optional
 import httpx
 
 from config import AgentConfig
+from memory_guard import prune_timestamped_cache
 
 logger = logging.getLogger(__name__)
+
+MAX_DISCOVERY_CACHE_TOKENS = 100
+MAX_MINT_CACHE_ENTRIES = 256
+MINT_CACHE_MAX_TTL_SECONDS = 300.0
 
 # Known Solana base, stablecoin, and major LST mints to exclude from memecoin discovery
 IGNORED_MAJOR_MINTS: set[str] = {
@@ -157,6 +162,15 @@ async def fetch_discovery_mints(
             logger.warning("[JupiterV2] Discovery fetch failed (%s): %s", url, exc)
 
     if any_success:
+        if len(discovered) > MAX_DISCOVERY_CACHE_TOKENS:
+            keys = list(discovered.keys())[:MAX_DISCOVERY_CACHE_TOKENS]
+            discovered = {k: discovered[k] for k in keys}
+        prune_timestamped_cache(
+            _mint_cache,
+            now_ts=current_ts,
+            max_entries=MAX_MINT_CACHE_ENTRIES,
+            ttl_seconds=max(MINT_CACHE_MAX_TTL_SECONDS, float(config.JUPITER_POLL_CACHE_SECONDS) * 2.0),
+        )
         _discovery_cache["fetched_at"] = current_ts
         _discovery_cache["backoff_until"] = 0.0
         _discovery_cache["tokens"] = discovered
@@ -222,6 +236,12 @@ async def enrich_mints(
                 _mint_cache[mint] = {"fetched_at": current_ts, "meta": meta}
                 if mint in seen_req:
                     result[mint] = meta
+            prune_timestamped_cache(
+                _mint_cache,
+                now_ts=current_ts,
+                max_entries=MAX_MINT_CACHE_ENTRIES,
+                ttl_seconds=max(MINT_CACHE_MAX_TTL_SECONDS, float(config.JUPITER_POLL_CACHE_SECONDS) * 2.0),
+            )
         except Exception as exc:
             logger.warning("[JupiterV2] Batch /search enrichment failed: %s", exc)
             return result

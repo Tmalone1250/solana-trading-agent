@@ -1,28 +1,24 @@
-# Dual-Lane 3+3 Concurrency, Batched Price Polling & Whale Breakout Integration Plan
+# Memory Bounding, DuckDB Cap & HTTP/Cache Hardening Plan (Raspberry Pi 4 2GB)
 
-## 1. Dual-Lane 3+3 Concurrency (`config.py`, `db.py`, `state.py`, `executor_node.py`, `main.py`)
-- **Configurable Lane Caps (`.env`):** `MAX_CHART_POSITIONS=3`, `MAX_WHALE_POSITIONS=3`, `MAX_OPEN_POSITIONS=6`.
-- **Multi-Position Persistence (`db.py`):** Add `chart_positions_json` and `whale_positions_json` on `agent_state` (with automatic `ALTER TABLE` migration) plus `breakout_telemetry_json` on `whale_decisions`, keeping legacy `active_position` and `whale_position` fields synchronized for backward compatibility.
-- **Continuous Watchlist Scanning:** Allow the 5-Slot Rotating Watchlist to keep scanning whenever `len(chart_positions) < MAX_CHART_POSITIONS` and total open `< MAX_OPEN_POSITIONS`.
-- **Shared Safety Guards:**
-  - **No Duplicate Mint** across all 6 open positions and active `WATCHING_REENTRY` trackers.
-  - **Global Circuit Breaker & SOL Equity:** All 6 positions share `sol_balance`, `daily_pnl_sol`, and `DAILY_MAX_LOSS_PCT`; block entries when free SOL is insufficient.
+## 1. Cap DuckDB Memory & Prevent Leaked Connections (`db.py`, `memory_guard.py`, `telemetry_api.py`)
+- Immediately on opening any DuckDB connection in `AgentDatabase.__init__`, execute:
+  `SET memory_limit='256MB'; SET threads=2; SET preserve_insertion_order=false;`
+- Remove the eager module-level `app = create_telemetry_app()` instantiation in `telemetry_api.py` (replace with lazy module `__getattr__`) so importing `create_telemetry_app` in `main.py` or tests never opens a second leaked DuckDB connection.
+- Add SQL-level cutoff filtering (`WHERE timestamp_utc >= ?`) and periodic table pruning (`prune_bounded_tables`) for `cooldowns`, `whale_events`, `whale_signals`, `whale_decisions`, `decisions_log`, `social_signals`, and `x_seen_tweets`.
 
-## 2. Batched Price Polling (`batched_price_monitor.py`)
-- Replace per-position 5s Jupiter swap quotes with a single batched `GET /price/v3?ids=...` call (with batched DexScreener fallback) every 5s across all open mints (`12 req/min` total) with exponential backoff on HTTP `429`.
-- Fire an individual Jupiter Swap Quote only on entry, sell execution, or when batched unrealized PnL is within `2%` of Hard Stop, Breakeven Shield, Trailing TP, or Whale TP / Shadow Exit / Time Stop.
+## 2. Bound All In-Memory Caches & Buffers (`ohlcv_client.py`, `jupiter_token_client.py`, `safety_gate_node.py`, `helius_webhook.py`, `batched_price_monitor.py`)
+- **OHLCV Cache (`ohlcv_client.py`):** Evict entries older than TTL (`600s`) and cap `_ohlcv_cache` at `MAX_OHLCV_CACHE_ENTRIES = 64` (evicting oldest entries first).
+- **Jupiter Token v2 Cache (`jupiter_token_client.py`):** Cap `_mint_cache` at `MAX_MINT_CACHE_ENTRIES = 256` (TTL `300s`) and `_discovery_cache["tokens"]` at `100` entries.
+- **SafetyGate Cache (`safety_gate_node.py`):** Add bounded `_safety_cache` (`MAX_SAFETY_CACHE_ENTRIES = 128`, TTL `300s`) so repeated safety checks reuse recent verdicts without unbounded growth.
+- **Helius Webhook & Price Backoff (`helius_webhook.py`, `batched_price_monitor.py`):** Bound `_recent_webhook_sigs` ring buffer (`MAX_RECENT_WEBHOOK_SIGS = 500`, TTL `1800s`), cap `_helius_roster_cache["wallets"]` (`100`), and cap `_price_backoff` (`32`).
 
-## 3. Whale Breakout Gate & Telemetry (`whale_lane.py`, `telemetry_api.py`, `executor_node.py`)
-- Add `WHALE_MIN_BREAKOUT_SCORE=50` and `WHALE_BLOCK_EXTENDED=true`.
-- Evaluate active Whale Radar mints and `WHALE_SCALP` triggers through `breakout_telemetry` (with `1m_fallback` when `< 12` 5m candles exist).
-- Reject `WHALE_SCALP` entries when `breakout_state == "EXTENDED"` (if `WHALE_BLOCK_EXTENDED`) or `breakout_score < WHALE_MIN_BREAKOUT_SCORE`, logging exact `breakout_failed_gates` to DuckDB and CSV.
-- Tag `IGNITION` (`score >= 75`) whale entries with reason `WHALE_BREAKOUT_CONFLUENCE`.
-- Populate `breakout_score`, `breakout_state`, `breakout_timeframe`, `breakout_vol_ratio`, `breakout_ema_ext_pct`, and `breakout_failed_gates` on `WHALE_CONFLUENCE`, `WHALE_SCALP` `BUY`, and `WHALE_SCALP` `SELL` CSV rows.
+## 3. Reuse HTTP Clients & 60s `[WhaleRoster]` Failure Backoff (`helius_webhook.py`, `telemetry_api.py`, `main.py`, `x_discovery_worker.py`)
+- Add a 60-second failure backoff (`HELIUS_ROSTER_ERROR_BACKOFF_SECONDS = 60.0`) to `fetch_helius_tracked_wallets()` in `helius_webhook.py` so network blips do not trigger retry storms across `/api/telemetry` or webhook hits.
+- Share a single bounded `httpx.AsyncClient` across `main.py`, `telemetry_api.py`, and `x_discovery_worker.py`, closing it cleanly on shutdown.
 
-## 4. Frontend Updates (`dashboard/`)
-- Extract shared `BreakoutMeter.tsx` and render it in both `WatchlistTable.tsx` and `WhaleListCard.tsx` (Confluence tab).
-- Upgrade `ActivePositionHero.tsx` to render grouped **Chart Positions (`X / 3`)** and **Whale Positions (`Y / 3`)** cards with strategy badges, entry/exit SOL, unrealized PnL, and Risk Gauges while remaining backward-compatible.
+## 4. Periodic RSS Memory Telemetry (`memory_guard.py`, `main.py`)
+- Log process RSS memory (`[Memory] RSS=... MB`) on startup and every 10 minutes (`600s`) in `main.py` alongside cache and DuckDB pruning so memory stability is tracked in `journalctl`.
 
 ## 5. Verification
-- Add `tests/test_dual_lane_3x3_and_whale_breakout.py` covering 3+3 lane caps, duplicate-mint rejection across lanes, batched price polling + on-demand quote trigger near stop/TP, and `WHALE_SCALP` `EXTENDED` / low-score rejection + CSV columns.
-- Run `./venv/bin/pytest -v` and `cd dashboard && npm run build`.
+- Add unit tests in `tests/test_memory_bounds_and_backoff.py` verifying DuckDB `memory_limit`/`threads`/`preserve_insertion_order` settings, bounded cache eviction (OHLCV, Jupiter, SafetyGate, webhook signatures), 60s `[WhaleRoster]` error backoff, and RSS memory logging.
+- Run `./venv/bin/pytest -v`.

@@ -10,6 +10,7 @@ from typing import Any, Optional
 import duckdb
 
 from action_export import ACTION_LOG_COLUMNS, ACTION_LOG_MIGRATIONS
+from memory_guard import configure_duckdb_connection, prune_duckdb_tables
 from state import FocusState
 
 
@@ -29,8 +30,22 @@ class AgentDatabase:
         self.starting_sol = starting_sol
         self._lock = threading.RLock()
         self._conn = duckdb.connect(db_path)
+        configure_duckdb_connection(self._conn)
         self._init_schema()
         self._ensure_initial_state()
+
+    def prune_bounded_tables(self, now: Optional[datetime] = None) -> None:
+        """Prune expired cooldowns and bound high-frequency tables."""
+        prune_duckdb_tables(self._conn, self._lock, now_dt=now)
+
+    def get_duckdb_setting(self, name: str) -> str:
+        """Query current value of a DuckDB configuration setting."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM duckdb_settings() WHERE name = ?",
+                [name],
+            ).fetchone()
+        return str(row[0]) if row else ""
 
     def close(self) -> None:
         with self._lock:

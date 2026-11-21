@@ -259,7 +259,12 @@ async def poll_x_once(
     }
 
 
-async def run_x_discovery_loop(config: AgentConfig, db: AgentDatabase) -> None:
+async def run_x_discovery_loop(
+    config: AgentConfig,
+    db: AgentDatabase,
+    *,
+    http_client: Optional[httpx.AsyncClient] = None,
+) -> None:
     """Long-running background asyncio task polling TwitterAPI.io on X_POLL_INTERVAL_MINUTES."""
     logger.info(
         "[XDiscovery] Background worker started | interval=%dm | daily_cap=%d | ttl=%dm",
@@ -267,9 +272,19 @@ async def run_x_discovery_loop(config: AgentConfig, db: AgentDatabase) -> None:
         config.X_DAILY_TWEET_CAP,
         config.X_SIGNAL_TTL_MINUTES,
     )
-    while True:
-        try:
-            await poll_x_once(config, db)
-        except Exception as exc:
-            logger.exception("[XDiscovery] Unexpected worker error: %s", exc)
-        await asyncio.sleep(config.X_POLL_INTERVAL_MINUTES * 60)
+    owns_client = http_client is None
+    client = http_client or httpx.AsyncClient(
+        follow_redirects=False,
+        timeout=15.0,
+        limits=httpx.Limits(max_connections=5, max_keepalive_connections=2),
+    )
+    try:
+        while True:
+            try:
+                await poll_x_once(config, db, http_client=client)
+            except Exception as exc:
+                logger.exception("[XDiscovery] Unexpected worker error: %s", exc)
+            await asyncio.sleep(config.X_POLL_INTERVAL_MINUTES * 60)
+    finally:
+        if owns_client:
+            await client.aclose()

@@ -16,6 +16,7 @@ from state import ActivePosition
 
 logger = logging.getLogger(__name__)
 EPS = 1e-9
+MAX_PRICE_BACKOFF_ENTRIES = 32
 
 # Per-endpoint backoff state on HTTP 429 (never hard-evicts tokens)
 _price_backoff: dict[str, dict[str, float]] = {}
@@ -26,11 +27,22 @@ def clear_price_backoff() -> None:
     _price_backoff.clear()
 
 
+def _prune_price_backoff(now_ts: float) -> None:
+    expired = [k for k, v in list(_price_backoff.items()) if now_ts >= float(v.get("until") or 0.0)]
+    for k in expired:
+        _price_backoff.pop(k, None)
+    if len(_price_backoff) > MAX_PRICE_BACKOFF_ENTRIES:
+        oldest = sorted(_price_backoff.keys(), key=lambda k: float(_price_backoff[k].get("until") or 0.0))
+        for k in oldest[: len(_price_backoff) - MAX_PRICE_BACKOFF_ENTRIES]:
+            _price_backoff.pop(k, None)
+
+
 def _record_429(key: str, now_ts: float) -> float:
     st = _price_backoff.get(key) or {"errors": 0.0, "until": 0.0}
     errors = int(st["errors"]) + 1
     delay = min(120.0, 5.0 * (2 ** (errors - 1)))
     _price_backoff[key] = {"errors": float(errors), "until": now_ts + delay}
+    _prune_price_backoff(now_ts)
     logger.warning("[BatchedPrice] HTTP 429 on %s — backing off %.0fs", key, delay)
     return delay
 
@@ -41,7 +53,12 @@ def _clear_429(key: str) -> None:
 
 def _in_backoff(key: str, now_ts: float) -> bool:
     st = _price_backoff.get(key)
-    return st is not None and now_ts < float(st.get("until") or 0.0)
+    if st is None:
+        return False
+    if now_ts >= float(st.get("until") or 0.0):
+        _price_backoff.pop(key, None)
+        return False
+    return True
 
 
 async def fetch_batched_sol_prices(

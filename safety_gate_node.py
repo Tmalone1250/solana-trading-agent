@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from datetime import datetime
 from typing import Any, Optional
 
@@ -11,9 +12,46 @@ import httpx
 
 from config import LAMPORTS_PER_SOL, AgentConfig
 from db import AgentDatabase
+from memory_guard import prune_timestamped_cache
 from state import AgentGraphState, FocusState, PendingOrder, SafetyReport
 
 logger = logging.getLogger(__name__)
+
+MAX_SAFETY_CACHE_ENTRIES = 128
+SAFETY_CACHE_TTL_SECONDS = 300.0
+_safety_cache: dict[str, dict[str, Any]] = {}
+
+
+def clear_safety_cache() -> None:
+    """Clear the bounded in-memory SafetyGate verdict cache."""
+    _safety_cache.clear()
+
+
+def cache_safety_report(mint: str, report: SafetyReport, *, now_ts: Optional[float] = None) -> None:
+    """Store a SafetyReport in the bounded in-memory cache with TTL & max-size eviction."""
+    ts = now_ts if now_ts is not None else time.time()
+    _safety_cache[mint] = {"fetched_at": ts, "report": report}
+    prune_timestamped_cache(
+        _safety_cache,
+        now_ts=ts,
+        max_entries=MAX_SAFETY_CACHE_ENTRIES,
+        ttl_seconds=SAFETY_CACHE_TTL_SECONDS,
+    )
+
+
+def get_cached_safety_report(mint: str, *, now_ts: Optional[float] = None) -> Optional[SafetyReport]:
+    """Retrieve a non-expired SafetyReport from the bounded in-memory cache."""
+    ts = now_ts if now_ts is not None else time.time()
+    prune_timestamped_cache(
+        _safety_cache,
+        now_ts=ts,
+        max_entries=MAX_SAFETY_CACHE_ENTRIES,
+        ttl_seconds=SAFETY_CACHE_TTL_SECONDS,
+    )
+    entry = _safety_cache.get(mint)
+    if entry and isinstance(entry.get("report"), SafetyReport):
+        return entry["report"]
+    return None
 
 SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
 CRITICAL_SHIELD_TYPES = {
@@ -263,21 +301,11 @@ async def safety_gate_node(
             if whale_pos:
                 if db is not None:
                     for w_cand in whale_fast_candidates:
-                        db.upsert_whale_decision(
-                            w_cand["mint"],
-                            "SKIPPED",
-                            "POSITION_OPEN",
-                            updated_at=now.isoformat() if now else None,
-                        )
+                        db.upsert_whale_decision(w_cand["mint"], "SKIPPED", "POSITION_OPEN", updated_at=now.isoformat() if now else None)
             elif sol_balance < config.WHALE_POSITION_SOL:
                 if db is not None:
                     for w_cand in whale_fast_candidates:
-                        db.upsert_whale_decision(
-                            w_cand["mint"],
-                            "SKIPPED",
-                            "LOW_SOL_BALANCE",
-                            updated_at=now.isoformat() if now else None,
-                        )
+                        db.upsert_whale_decision(w_cand["mint"], "SKIPPED", "LOW_SOL_BALANCE", updated_at=now.isoformat() if now else None)
             else:
                 for w_cand in whale_fast_candidates:
                     mint = w_cand["mint"]
@@ -300,46 +328,25 @@ async def safety_gate_node(
                         continue
                     if liq_usd < min_whale_liq:
                         if db is not None:
-                            db.upsert_whale_decision(
-                                mint,
-                                "SKIPPED",
-                                f"LIQ < ${min_whale_liq / 1000:.0f}K",
-                                updated_at=now.isoformat() if now else None,
-                            )
+                            db.upsert_whale_decision(mint, "SKIPPED", f"LIQ < ${min_whale_liq / 1000:.0f}K", updated_at=now.isoformat() if now else None)
                         rejected.append({"mint": mint, "symbol": symbol, "reasons": [f"Liquidity ${liq_usd:,.0f} < ${min_whale_liq:,.0f}"]})
                         continue
                     if not (config.WHALE_MIN_MCAP_USD <= mc_usd <= config.WHALE_MAX_MCAP_USD):
                         def _fmt_usd(v: float) -> str:
                             return f"${v / 1_000_000:.0f}M" if v >= 1_000_000 else f"${v / 1_000:.0f}K"
-                        mc_reason = (
-                            f"MCAP < {_fmt_usd(config.WHALE_MIN_MCAP_USD)}"
-                            if mc_usd < config.WHALE_MIN_MCAP_USD
-                            else f"MCAP > {_fmt_usd(config.WHALE_MAX_MCAP_USD)}"
-                        )
+                        mc_reason = f"MCAP < {_fmt_usd(config.WHALE_MIN_MCAP_USD)}" if mc_usd < config.WHALE_MIN_MCAP_USD else f"MCAP > {_fmt_usd(config.WHALE_MAX_MCAP_USD)}"
                         if db is not None:
                             db.upsert_whale_decision(mint, "SKIPPED", mc_reason, updated_at=now.isoformat() if now else None)
-                        rejected.append(
-                            {
-                                "mint": mint,
-                                "symbol": symbol,
-                                "reasons": [
-                                    f"MCAP ${mc_usd:,.0f} outside [${config.WHALE_MIN_MCAP_USD:,.0f}, ${config.WHALE_MAX_MCAP_USD:,.0f}]"
-                                ],
-                            }
-                        )
+                        rejected.append({"mint": mint, "symbol": symbol, "reasons": [f"MCAP ${mc_usd:,.0f} outside [${config.WHALE_MIN_MCAP_USD:,.0f}, ${config.WHALE_MAX_MCAP_USD:,.0f}]"]})
                         continue
 
-                    report = await check_token_safety(mint, config, client)
+                    report = get_cached_safety_report(mint) or await check_token_safety(mint, config, client)
+                    cache_safety_report(mint, report)
                     if not report.passed:
                         reason_str = "; ".join(report.reasons)
                         if db is not None:
                             db.upsert_whale_decision(mint, "SKIPPED", "SAFETY_REJECT", updated_at=now.isoformat() if now else None)
-                            db.set_cooldown_minutes(
-                                mint,
-                                minutes=config.SAFETY_REJECT_COOLDOWN_MINUTES,
-                                reason=f"WHALE_SAFETY_REJECT: {reason_str}",
-                                now=now,
-                            )
+                            db.set_cooldown_minutes(mint, minutes=config.SAFETY_REJECT_COOLDOWN_MINUTES, reason=f"WHALE_SAFETY_REJECT: {reason_str}", now=now)
                         logger.info("[SafetyGate] WHALE_SCALP $%s | REJECTED (%s)", symbol, reason_str)
                         rejected.append({"mint": mint, "symbol": symbol, "reasons": report.reasons})
                         continue
@@ -347,22 +354,11 @@ async def safety_gate_node(
                     trig_wallets = list(w_cand.get("triggering_wallets") or [])
                     trig_type = str(w_cand.get("whale_trigger_type") or "WHALE")
                     if db is not None:
-                        db.upsert_whale_decision(
-                            mint,
-                            "ENTERED",
-                            f"WHALE_SCALP_{trig_type}",
-                            updated_at=now.isoformat() if now else None,
-                        )
+                        db.upsert_whale_decision(mint, "ENTERED", f"WHALE_SCALP_{trig_type}", updated_at=now.isoformat() if now else None)
                         db.log_action(
-                            mode=config.EXECUTION_MODE,
-                            action="WHALE_CONFLUENCE",
-                            symbol=symbol,
-                            asset_id=mint,
-                            notional=round(config.WHALE_POSITION_SOL, 6),
-                            strategy="WHALE_SCALP",
-                            reason=f"WHALE_SCALP_{trig_type}",
-                            timestamp_utc=now.isoformat() if now else None,
-                            mc_usd=round(mc_usd, 2) if mc_usd else None,
+                            mode=config.EXECUTION_MODE, action="WHALE_CONFLUENCE", symbol=symbol, asset_id=mint,
+                            notional=round(config.WHALE_POSITION_SOL, 6), strategy="WHALE_SCALP", reason=f"WHALE_SCALP_{trig_type}",
+                            timestamp_utc=now.isoformat() if now else None, mc_usd=round(mc_usd, 2) if mc_usd else None,
                             liq_usd=round(liq_usd, 2) if liq_usd else None,
                             triggering_whales=",".join(config.resolve_wallet_label(w) for w in trig_wallets),
                             whale_sol_flow=round(float(w_cand.get("whale_total_sol") or 0.0), 6),
@@ -373,27 +369,16 @@ async def safety_gate_node(
                         f"{float(w_cand.get('whale_total_sol') or 0.0):.2f} SOL) -> APPROVED"
                     )
                     order = PendingOrder(
-                        side="BUY",
-                        mint=mint,
-                        symbol=symbol,
+                        side="BUY", mint=mint, symbol=symbol,
                         amount_atomic=int(round(config.WHALE_POSITION_SOL * LAMPORTS_PER_SOL)),
-                        reason=f"WHALE_SCALP_{trig_type}",
-                        target_state_after_fill=FocusState.IN_POSITION,
-                        apply_cooldown=False,
-                        entry_liquidity_usd=liq_usd,
+                        reason=f"WHALE_SCALP_{trig_type}", target_state_after_fill=FocusState.IN_POSITION,
+                        apply_cooldown=False, entry_liquidity_usd=liq_usd,
                         entry_mc_usd=round(mc_usd, 2) if mc_usd else None,
                         whale_sol_flow=round(float(w_cand.get("whale_total_sol") or 0.0), 6),
-                        strategy="WHALE_SCALP",
-                        triggering_wallets=trig_wallets,
-                        rationale=rationale,
+                        strategy="WHALE_SCALP", triggering_wallets=trig_wallets, rationale=rationale,
                     )
                     fast_track_order = order.model_dump()
-                    logger.info(
-                        "[SafetyGate] WHALE_SCALP $%s | INSTANT PASS -> entering %.2f SOL (%s)",
-                        symbol,
-                        config.WHALE_POSITION_SOL,
-                        trig_type,
-                    )
+                    logger.info("[SafetyGate] WHALE_SCALP $%s | INSTANT PASS -> entering %.2f SOL (%s)", symbol, config.WHALE_POSITION_SOL, trig_type)
                     break
 
         for cand in raw_candidates:
@@ -408,34 +393,19 @@ async def safety_gate_node(
                 reason_str = "Jupiter Token v2: audit.isSus=True"
                 if db is not None:
                     db.remove_from_watchlist(mint)
-                    db.set_cooldown_minutes(
-                        mint,
-                        minutes=config.SAFETY_REJECT_COOLDOWN_MINUTES,
-                        reason=f"SAFETY_REJECT: {reason_str}",
-                        now=now,
-                    )
+                    db.set_cooldown_minutes(mint, minutes=config.SAFETY_REJECT_COOLDOWN_MINUTES, reason=f"SAFETY_REJECT: {reason_str}", now=now)
                     db.log_action(
-                        mode=config.EXECUTION_MODE,
-                        action="EVICT",
-                        symbol=symbol,
-                        asset_id=mint,
-                        strategy="SAFETY_GATE",
-                        reason=f"SAFETY_REJECT: {reason_str}",
+                        mode=config.EXECUTION_MODE, action="EVICT", symbol=symbol, asset_id=mint,
+                        strategy="SAFETY_GATE", reason=f"SAFETY_REJECT: {reason_str}",
                         timestamp_utc=now.isoformat() if now else None,
                     )
-                logger.info(
-                    "[SafetyGate] $%s | REJECTED (%s) -> EVICTED (%dm cooldown)",
-                    symbol,
-                    reason_str,
-                    config.SAFETY_REJECT_COOLDOWN_MINUTES,
-                )
-                rejected.append(
-                    {"mint": mint, "symbol": symbol, "reasons": [reason_str]}
-                )
+                logger.info("[SafetyGate] $%s | REJECTED (%s) -> EVICTED (%dm cooldown)", symbol, reason_str, config.SAFETY_REJECT_COOLDOWN_MINUTES)
+                rejected.append({"mint": mint, "symbol": symbol, "reasons": [reason_str]})
                 continue
 
-            # Cache hit: skip RugCheck + Jupiter Shield on retained active_watchlist slots
-            if cand.get("safety_passed") is True or watchlist_safety.get(mint) is True:
+            # Cache hit: skip RugCheck + Jupiter Shield on retained active_watchlist slots or recent safety cache
+            cached_rep = get_cached_safety_report(mint)
+            if cand.get("safety_passed") is True or watchlist_safety.get(mint) is True or (cached_rep and cached_rep.passed):
                 enriched = dict(cand)
                 enriched["safety_passed"] = True
                 enriched["safety_report"] = {"mint": mint, "passed": True, "cached": True, "reasons": []}
@@ -443,7 +413,8 @@ async def safety_gate_node(
                 logger.info("[SafetyGate] $%s | CACHED PASS (skipped redundant API calls)", symbol)
                 continue
 
-            report = await check_token_safety(mint, config, client)
+            report = cached_rep or await check_token_safety(mint, config, client)
+            cache_safety_report(mint, report)
             if report.passed:
                 if db is not None:
                     db.mark_watchlist_safety_passed(mint, True)
@@ -455,34 +426,14 @@ async def safety_gate_node(
                 reason_str = "; ".join(report.reasons)
                 if db is not None:
                     db.remove_from_watchlist(mint)
-                    db.set_cooldown_minutes(
-                        mint,
-                        minutes=config.SAFETY_REJECT_COOLDOWN_MINUTES,
-                        reason=f"SAFETY_REJECT: {reason_str}",
-                        now=now,
-                    )
+                    db.set_cooldown_minutes(mint, minutes=config.SAFETY_REJECT_COOLDOWN_MINUTES, reason=f"SAFETY_REJECT: {reason_str}", now=now)
                     db.log_action(
-                        mode=config.EXECUTION_MODE,
-                        action="EVICT",
-                        symbol=symbol,
-                        asset_id=mint,
-                        strategy="SAFETY_GATE",
-                        reason=f"SAFETY_REJECT: {reason_str}",
+                        mode=config.EXECUTION_MODE, action="EVICT", symbol=symbol, asset_id=mint,
+                        strategy="SAFETY_GATE", reason=f"SAFETY_REJECT: {reason_str}",
                         timestamp_utc=now.isoformat() if now else None,
                     )
-                logger.info(
-                    "[SafetyGate] $%s | REJECTED (%s) -> EVICTED (%dm cooldown)",
-                    symbol,
-                    reason_str,
-                    config.SAFETY_REJECT_COOLDOWN_MINUTES,
-                )
-                rejected.append(
-                    {
-                        "mint": mint,
-                        "symbol": symbol,
-                        "reasons": report.reasons,
-                    }
-                )
+                logger.info("[SafetyGate] $%s | REJECTED (%s) -> EVICTED (%dm cooldown)", symbol, reason_str, config.SAFETY_REJECT_COOLDOWN_MINUTES)
+                rejected.append({"mint": mint, "symbol": symbol, "reasons": report.reasons})
     finally:
         if owns_client:
             await client.aclose()

@@ -10,8 +10,12 @@ from typing import Any, Optional
 import httpx
 
 from config import AgentConfig
+from memory_guard import prune_timestamped_cache
 
 logger = logging.getLogger(__name__)
+
+MAX_OHLCV_CACHE_ENTRIES = 64
+OHLCV_CACHE_MAX_TTL_SECONDS = 600.0
 
 # Per-pair_address cache:
 # pair_address -> {"fetched_at": float, "candles": list[dict], "backoff_until": float, "errors": int}
@@ -21,6 +25,16 @@ _ohlcv_cache: dict[str, dict[str, Any]] = {}
 def clear_ohlcv_cache() -> None:
     """Clear the in-memory OHLCV cache (useful for tests)."""
     _ohlcv_cache.clear()
+
+
+def _prune_ohlcv_cache(now_ts: float, config: AgentConfig) -> None:
+    ttl = max(OHLCV_CACHE_MAX_TTL_SECONDS, float(config.OHLCV_CACHE_SECONDS) * 2.0)
+    prune_timestamped_cache(
+        _ohlcv_cache,
+        now_ts=now_ts,
+        max_entries=MAX_OHLCV_CACHE_ENTRIES,
+        ttl_seconds=ttl,
+    )
 
 
 def parse_geckoterminal_ohlcv(payload: dict[str, Any]) -> list[dict[str, float]]:
@@ -88,11 +102,12 @@ async def _fetch_ohlcv_interval(
             errors = prev_errors + 1
             backoff = min(300.0, 30.0 * (2 ** (errors - 1)))
             _ohlcv_cache[cache_key] = {
-                "fetched_at": (entry or {}).get("fetched_at"),
+                "fetched_at": (entry or {}).get("fetched_at") or current_ts,
                 "candles": prev_candles,
                 "backoff_until": current_ts + backoff,
                 "errors": errors,
             }
+            _prune_ohlcv_cache(current_ts, config)
             logger.warning(
                 "[OHLCV] GeckoTerminal 429 (%sm) for pool %s..; backing off %.0fs (cached=%d candles)",
                 aggregate,
@@ -110,16 +125,18 @@ async def _fetch_ohlcv_interval(
             "backoff_until": 0.0,
             "errors": 0,
         }
+        _prune_ohlcv_cache(current_ts, config)
         return list(candles), True
     except Exception as exc:
         errors = prev_errors + 1
         backoff = min(300.0, 15.0 * (2 ** (errors - 1)))
         _ohlcv_cache[cache_key] = {
-            "fetched_at": (entry or {}).get("fetched_at"),
+            "fetched_at": (entry or {}).get("fetched_at") or current_ts,
             "candles": prev_candles,
             "backoff_until": current_ts + backoff,
             "errors": errors,
         }
+        _prune_ohlcv_cache(current_ts, config)
         logger.warning(
             "[OHLCV] Fetch failed (%sm) for pool %s.. (%s); backing off %.0fs (cached=%d candles)",
             aggregate,

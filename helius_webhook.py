@@ -12,20 +12,45 @@ import httpx
 
 from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
 from db import AgentDatabase, utc_now
+from memory_guard import prune_timestamped_cache
 
 logger = logging.getLogger(__name__)
+
+HELIUS_ROSTER_ERROR_BACKOFF_SECONDS = 60.0
+MAX_ROSTER_WALLETS = 100
+MAX_RECENT_WEBHOOK_SIGS = 500
+WEBHOOK_SIG_TTL_SECONDS = 1800.0
+MAX_WEBHOOK_BATCH_ITEMS = 100
 
 # In-memory cache for dynamically synced Helius webhook accountAddresses
 _helius_roster_cache: dict[str, Any] = {
     "fetched_at": None,
+    "backoff_until": 0.0,
     "wallets": [],
 }
 
+# Bounded in-memory ring cache of recently processed webhook signatures
+_recent_webhook_sigs: dict[str, dict[str, float]] = {}
+_shared_roster_http_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_shared_roster_client() -> httpx.AsyncClient:
+    global _shared_roster_http_client
+    if _shared_roster_http_client is None or _shared_roster_http_client.is_closed:
+        _shared_roster_http_client = httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=10.0,
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+        )
+    return _shared_roster_http_client
+
 
 def clear_helius_roster_cache() -> None:
-    """Clear the in-memory Helius tracked wallet roster cache (useful for tests)."""
+    """Clear the in-memory Helius tracked wallet roster & webhook sig caches (useful for tests)."""
     _helius_roster_cache["fetched_at"] = None
+    _helius_roster_cache["backoff_until"] = 0.0
     _helius_roster_cache["wallets"] = []
+    _recent_webhook_sigs.clear()
 
 
 def _extract_account_addresses(webhook_obj: dict[str, Any]) -> list[str]:
@@ -56,8 +81,14 @@ async def fetch_helius_tracked_wallets(
     http_client: Optional[httpx.AsyncClient] = None,
     now_ts: Optional[float] = None,
 ) -> list[str]:
-    """Dynamically fetch accountAddresses from Helius Webhooks API with 5-minute cache."""
+    """Dynamically fetch accountAddresses from Helius Webhooks API with 5m cache & 60s error backoff."""
     current_ts = now_ts if now_ts is not None else time.time()
+    backoff_until = float(_helius_roster_cache.get("backoff_until") or 0.0)
+    if not force_refresh and current_ts < backoff_until:
+        if _helius_roster_cache["wallets"]:
+            return list(_helius_roster_cache["wallets"])
+        return sorted(config.helius_tracked_wallet_set())
+
     cached_at = _helius_roster_cache.get("fetched_at")
     if (
         not force_refresh
@@ -78,8 +109,7 @@ async def fetch_helius_tracked_wallets(
     else:
         url = f"{config.HELIUS_API_BASE_URL}/webhooks"
 
-    owns_client = http_client is None
-    client = http_client or httpx.AsyncClient(follow_redirects=True)
+    client = http_client or _get_shared_roster_client()
     try:
         resp = await client.get(url, params={"api-key": api_key}, timeout=10.0)
         resp.raise_for_status()
@@ -121,7 +151,9 @@ async def fetch_helius_tracked_wallets(
                     seen.add(addr)
                     wallets.append(addr)
 
+        wallets = wallets[:MAX_ROSTER_WALLETS]
         _helius_roster_cache["fetched_at"] = current_ts
+        _helius_roster_cache["backoff_until"] = 0.0
         _helius_roster_cache["wallets"] = wallets
         logger.info(
             "[WhaleRoster] Synced %d tracked wallets from Helius Webhooks API",
@@ -129,16 +161,15 @@ async def fetch_helius_tracked_wallets(
         )
         return list(wallets)
     except Exception as exc:
+        _helius_roster_cache["backoff_until"] = current_ts + HELIUS_ROSTER_ERROR_BACKOFF_SECONDS
         logger.warning(
-            "[WhaleRoster] Helius webhook roster sync failed (%s); using cached/fallback wallets.",
+            "[WhaleRoster] Helius webhook roster sync failed (%s); backing off %.0fs and using cached/fallback wallets.",
             exc,
+            HELIUS_ROSTER_ERROR_BACKOFF_SECONDS,
         )
         if _helius_roster_cache["wallets"]:
             return list(_helius_roster_cache["wallets"])
         return sorted(config.helius_tracked_wallet_set())
-    finally:
-        if owns_client:
-            await client.aclose()
 
 IGNORED_BASE_MINTS: set[str] = {
     SOL_MINT,  # Wrapped SOL
@@ -334,7 +365,15 @@ def process_helius_webhook_payload(
 ) -> dict[str, Any]:
     """Ingest a Helius Enhanced Webhook JSON array payload idempotently into DuckDB."""
     now_dt = now or utc_now()
-    items = payload if isinstance(payload, list) else ([payload] if isinstance(payload, dict) else [])
+    now_ts = now_dt.timestamp()
+    raw_items = payload if isinstance(payload, list) else ([payload] if isinstance(payload, dict) else [])
+    items = raw_items[:MAX_WEBHOOK_BATCH_ITEMS]
+    prune_timestamped_cache(
+        _recent_webhook_sigs,
+        now_ts=now_ts,
+        max_entries=MAX_RECENT_WEBHOOK_SIGS,
+        ttl_seconds=WEBHOOK_SIG_TTL_SECONDS,
+    )
     if active_roster is not None:
         tracked_wallets = {w.strip() for w in active_roster if w and w.strip()}
     else:
@@ -358,6 +397,10 @@ def process_helius_webhook_payload(
             ignored += 1
             continue
 
+        if ev["signature"] in _recent_webhook_sigs:
+            duplicates += 1
+            continue
+
         inserted = db.record_whale_event(
             signature=ev["signature"],
             wallet=ev["wallet"],
@@ -366,6 +409,13 @@ def process_helius_webhook_payload(
             sol_amount=ev["sol_amount"],
             token_amount=ev["token_amount"],
             timestamp_utc=ev["timestamp_utc"],
+        )
+        _recent_webhook_sigs[ev["signature"]] = {"fetched_at": now_ts}
+        prune_timestamped_cache(
+            _recent_webhook_sigs,
+            now_ts=now_ts,
+            max_entries=MAX_RECENT_WEBHOOK_SIGS,
+            ttl_seconds=WEBHOOK_SIG_TTL_SECONDS,
         )
         if not inserted:
             duplicates += 1
