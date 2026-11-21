@@ -154,16 +154,16 @@ export function WhaleListCard({ whale, agentUrl, onSynced }: Props) {
 
       {/* Tab 1: Confluence */}
       {tab === "confluence" && (
-        <div className="overflow-x-auto">
+        <div className="terminal-scroll max-h-[336px] overflow-x-auto overflow-y-auto">
           <table className="w-full border-collapse text-left text-xs">
-            <thead>
-              <tr className="border-b border-slate-800/80 bg-slate-950/50 font-mono text-[10px] uppercase tracking-wider text-slate-400">
-                <th className="px-4 py-3">Mint</th>
-                <th className="px-4 py-3">Unique Whales</th>
-                <th className="px-4 py-3">Buys / Sells</th>
-                <th className="px-4 py-3">SOL Spent</th>
-                <th className="px-4 py-3">Net Status</th>
-                <th className="px-4 py-3 text-right">Last Seen</th>
+            <thead className="sticky top-0 z-10 bg-slate-950 shadow-[0_1px_0_0_rgba(30,41,59,0.9)]">
+              <tr className="font-mono text-[10px] uppercase tracking-wider text-slate-400">
+                <th className="px-4 py-2.5">Mint</th>
+                <th className="px-4 py-2.5">Unique Whales</th>
+                <th className="px-4 py-2.5">Buys / Sells</th>
+                <th className="px-4 py-2.5">SOL Spent</th>
+                <th className="px-4 py-2.5">Net Status</th>
+                <th className="px-4 py-2.5 text-right">Last Seen</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/60 font-mono">
@@ -260,16 +260,16 @@ export function WhaleListCard({ whale, agentUrl, onSynced }: Props) {
 
       {/* Tab 2: Live Tape */}
       {tab === "tape" && (
-        <div className="overflow-x-auto">
+        <div className="terminal-scroll max-h-[336px] overflow-x-auto overflow-y-auto">
           <table className="w-full border-collapse text-left text-xs">
-            <thead>
-              <tr className="border-b border-slate-800/80 bg-slate-950/50 font-mono text-[10px] uppercase tracking-wider text-slate-400">
-                <th className="px-4 py-3">Time</th>
-                <th className="px-4 py-3">Wallet</th>
-                <th className="px-4 py-3">Side</th>
-                <th className="px-4 py-3">SOL Size</th>
-                <th className="px-4 py-3">Mint</th>
-                <th className="px-4 py-3 text-right">TX</th>
+            <thead className="sticky top-0 z-10 bg-slate-950 shadow-[0_1px_0_0_rgba(30,41,59,0.9)]">
+              <tr className="font-mono text-[10px] uppercase tracking-wider text-slate-400">
+                <th className="px-4 py-2.5">Time</th>
+                <th className="px-4 py-2.5">Wallet</th>
+                <th className="px-4 py-2.5">Side</th>
+                <th className="px-4 py-2.5">SOL Size</th>
+                <th className="px-4 py-2.5">Mint</th>
+                <th className="px-4 py-2.5 text-right">TX</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/60 font-mono">
@@ -344,15 +344,15 @@ export function WhaleListCard({ whale, agentUrl, onSynced }: Props) {
 
       {/* Tab 3: Roster */}
       {tab === "roster" && (
-        <div className="overflow-x-auto">
+        <div className="terminal-scroll max-h-[336px] overflow-x-auto overflow-y-auto">
           <table className="w-full border-collapse text-left text-xs">
-            <thead>
-              <tr className="border-b border-slate-800/80 bg-slate-950/50 font-mono text-[10px] uppercase tracking-wider text-slate-400">
-                <th className="px-4 py-3">Wallet</th>
-                <th className="px-4 py-3">24h Buys / Sells</th>
-                <th className="px-4 py-3">24h SOL Volume</th>
-                <th className="px-4 py-3">Last Action</th>
-                <th className="px-4 py-3 text-right">Last Active</th>
+            <thead className="sticky top-0 z-10 bg-slate-950 shadow-[0_1px_0_0_rgba(30,41,59,0.9)]">
+              <tr className="font-mono text-[10px] uppercase tracking-wider text-slate-400">
+                <th className="px-4 py-2.5">Wallet</th>
+                <th className="px-4 py-2.5">24h Buys / Sells</th>
+                <th className="px-4 py-2.5">24h SOL Volume</th>
+                <th className="px-4 py-2.5">Last Action</th>
+                <th className="px-4 py-2.5 text-right">Last Active</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/60 font-mono">
