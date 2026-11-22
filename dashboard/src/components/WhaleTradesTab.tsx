@@ -46,13 +46,12 @@ export function WhaleTradesTab({ whaleTrades, whaleStats, formatRelativeTime }: 
         <div className="flex items-center gap-1.5 text-[11px]">
           <span className="text-slate-500">Whale PnL:</span>
           <span
-            className={`font-semibold tabular-nums ${
-              (whaleStats?.total_pnl_sol ?? 0) > 0
-                ? "text-emerald-400"
-                : (whaleStats?.total_pnl_sol ?? 0) < 0
-                  ? "text-rose-400"
-                  : "text-slate-300"
-            }`}
+            className={`font-semibold tabular-nums ${(whaleStats?.total_pnl_sol ?? 0) > 0
+              ? "text-emerald-400"
+              : (whaleStats?.total_pnl_sol ?? 0) < 0
+                ? "text-rose-400"
+                : "text-slate-300"
+              }`}
           >
             {formatSol(whaleStats?.total_pnl_sol ?? 0, true)}
           </span>

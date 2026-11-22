@@ -19,6 +19,7 @@ from helius_webhook import (
     process_helius_webhook_payload,
     verify_helius_auth,
 )
+from insider_scanner import InsiderScanRequest, run_insider_scan
 
 
 def create_telemetry_app(
@@ -441,6 +442,13 @@ def create_telemetry_app(
             triggering_whales=",".join(cfg.resolve_wallet_label(w) for w in wallets[:10]),
         )
         return {"synced_count": len(wallets), "wallets": wallets}
+
+    @app.post("/api/insider-scan")
+    async def insider_scan(req: InsiderScanRequest) -> dict[str, Any]:
+        try:
+            return await run_insider_scan(req, config=cfg, http_client=_get_http_client())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return app
 

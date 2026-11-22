@@ -1,8 +1,9 @@
 "use client";
 
 import { useState } from "react";
-import { Check, Copy, ExternalLink, Radar, RefreshCw } from "lucide-react";
+import { Check, Copy, ExternalLink, Radar, RefreshCw, Search } from "lucide-react";
 import { BreakoutMeter } from "@/components/BreakoutMeter";
+import { InsiderScannerModal } from "@/components/InsiderScannerModal";
 import { WhaleTradesTab } from "@/components/WhaleTradesTab";
 import {
   WhaleDiscoveryPayload,
@@ -24,6 +25,7 @@ export function WhaleListCard({ whale, agentUrl, onSynced }: Props) {
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [scannerOpen, setScannerOpen] = useState(false);
 
   const enabled = whale?.enabled ?? false;
   const trackedCount = whale?.tracked_wallet_count ?? 0;
@@ -103,6 +105,14 @@ export function WhaleListCard({ whale, agentUrl, onSynced }: Props) {
           >
             <RefreshCw className={`h-3 w-3 text-cyan-400 ${syncing ? "animate-spin" : ""}`} />
             {syncing ? "Syncing..." : "Sync Helius ↻"}
+          </button>
+          <button
+            type="button"
+            onClick={() => setScannerOpen(true)}
+            className="inline-flex cursor-pointer items-center gap-1.5 rounded-full border border-fuchsia-500/40 bg-fuchsia-500/15 px-2.5 py-1 font-mono text-[11px] font-semibold text-fuchsia-200 transition hover:border-fuchsia-400 hover:bg-fuchsia-500/25"
+          >
+            <Search className="h-3 w-3 text-fuchsia-300" />
+            Scan Insiders
           </button>
           {syncMsg && (
             <span className="font-mono text-[11px] text-cyan-300">{syncMsg}</span>
@@ -471,6 +481,11 @@ export function WhaleListCard({ whale, agentUrl, onSynced }: Props) {
           formatRelativeTime={formatRelativeTime}
         />
       )}
+      <InsiderScannerModal
+        isOpen={scannerOpen}
+        onClose={() => setScannerOpen(false)}
+        agentUrl={agentUrl}
+      />
     </section>
   );
 }
