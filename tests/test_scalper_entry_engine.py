@@ -363,3 +363,106 @@ async def test_alpha_blocks_unsoaked_spike_logs_reason_and_exposes_telemetry(tmp
     assert slot["setup_type"] == "NONE"
     assert slot["scalper_eligible"] is False
     db.close()
+
+
+@pytest.mark.asyncio
+async def test_ohlcv_no_1m_fallback_on_429_global_backoff_and_whale_radar_cached_meter(tmp_path):
+    """Verify:
+    (a) A 5m 429 does NOT trigger a 1m fallback call (while a 200 OK with < 12 bars does).
+    (b) A 429 on Pool A activates global backoff for Pool B and serves stale cached candles.
+    (c) Whale Radar confluence rows include breakout_telemetry from the shared cache even when COOLDOWN or STALE > 60s.
+    """
+    from ohlcv_client import (
+        cache_breakout_telemetry,
+        fetch_ohlcv_1m_batch,
+        get_global_backoff_until,
+        should_fetch_1m_fallback,
+    )
+
+    clear_ohlcv_cache()
+    cfg = AgentConfig(_env_file=None, OHLCV_CACHE_SECONDS=90.0, OHLCV_PACING_DELAY_SECONDS=0.0)
+    req_log: list[tuple[str, str]] = []
+    mode = {"pool_a": "200", "pool_b": "200"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        agg = request.url.params.get("aggregate") or ""
+        pool = "PoolA" if "PoolA" in url else ("PoolB" if "PoolB" in url else "PoolFresh")
+        req_log.append((pool, agg))
+        if pool == "PoolA" and mode["pool_a"] == "429":
+            return httpx.Response(429, json={"error": "rate limit"})
+        if pool == "PoolFresh":
+            # 200 OK with only 4 x 5m candles (< 12) -> SHOULD trigger 1m fallback
+            return httpx.Response(
+                200,
+                json={"data": {"attributes": {"ohlcv_list": [[1700000000 + i * 300, 1.0, 1.1, 0.9, 1.05, 500.0] for i in range(4)]}}},
+            )
+        return httpx.Response(
+            200,
+            json={"data": {"attributes": {"ohlcv_list": [[1700000000 + i * 300, 1.0, 1.1, 0.9, 1.05, 500.0] for i in range(6)]}}},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        # Warm cache for PoolB so stale-while-revalidate has cached candles to serve during global backoff
+        c_b0, did_b0 = await fetch_ohlcv_5m("PoolB", cfg, client, now_ts=1000.0)
+        assert did_b0 is True and len(c_b0) == 6
+
+        # (a) PoolA returns 429 on 5m -> MUST NOT trigger 1m fallback!
+        mode["pool_a"] = "429"
+        req_log.clear()
+        ohlcv_5m = await fetch_ohlcv_batch(["PoolA", "PoolB"], cfg, client, now_ts=1200.0)
+        assert ("PoolA", "5") in req_log
+        # (b) PoolB was paused by global 429 backoff from PoolA and served its 6 cached candles!
+        assert ("PoolB", "5") not in req_log
+        assert len(ohlcv_5m["PoolB"]) == 6
+        assert get_global_backoff_until() == pytest.approx(1230.0)
+
+        # Calling fetch_ohlcv_1m_batch after PoolA's 5m 429 MUST make zero 1m calls!
+        assert should_fetch_1m_fallback("PoolA", ohlcv_5m["PoolA"], now_ts=1200.0) is False
+        ohlcv_1m = await fetch_ohlcv_1m_batch(["PoolA"], cfg, client, now_ts=1200.0)
+        assert ("PoolA", "1") not in req_log
+        assert ohlcv_1m["PoolA"] == []
+
+        # After global backoff expires (T=1235 > 1230), PoolFresh 5m returns 200 OK with 4 bars -> 1m fallback DOES run
+        req_log.clear()
+        fresh_5m = await fetch_ohlcv_batch(["PoolFresh"], cfg, client, now_ts=1235.0)
+        assert should_fetch_1m_fallback("PoolFresh", fresh_5m["PoolFresh"], now_ts=1235.0) is True
+        fresh_1m = await fetch_ohlcv_1m_batch(["PoolFresh"], cfg, client, now_ts=1235.0)
+        assert req_log == [("PoolFresh", "5"), ("PoolFresh", "1")]
+        assert len(fresh_1m["PoolFresh"]) == 4
+
+    # (c) Whale Radar confluence rows include breakout_telemetry from shared cache even when COOLDOWN or STALE > 60s
+    db = AgentDatabase(db_path=str(tmp_path / "whale_meter_cache.duckdb"), starting_sol=1.0)
+    now_dt = datetime.now(timezone.utc)
+    mint_stale = "MintWhaleStaleMeter111111111111111111111111"
+    db.record_whale_event(
+        signature="sig-stale-1",
+        wallet="4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk",
+        mint=mint_stale,
+        side="BUY",
+        sol_amount=2.5,
+        token_amount=100_000.0,
+        timestamp_utc=(now_dt - timedelta(seconds=120)).isoformat(),
+    )
+    db.recompute_whale_signal(mint_stale, ttl_minutes=30, now=now_dt)
+    db.upsert_whale_decision(mint_stale, "SKIPPED", "STALE > 60s", updated_at=now_dt.isoformat())
+
+    cached_meter = {
+        "score": 82,
+        "state": "IGNITION",
+        "timeframe": "5m",
+        "vol_ratio": 2.1,
+        "ema_ext_pct": 3.4,
+        "passed_gates": ["COIL", "RES", "VOL_SPIKE"],
+        "failed_gates": [],
+    }
+    cache_breakout_telemetry(mint_stale, cached_meter, now_ts=now_dt.timestamp())
+
+    tc = TestClient(create_telemetry_app(config=cfg, db=db))
+    tel = tc.get("/api/telemetry").json()
+    sigs = {s["mint"]: s for s in tel["whale_discovery"]["active_signals"]}
+    assert sigs[mint_stale]["agent_reason"] == "STALE > 60s"
+    assert sigs[mint_stale]["breakout_telemetry"]["score"] == 82
+    assert sigs[mint_stale]["breakout_telemetry"]["state"] == "IGNITION"
+    db.close()
+    clear_ohlcv_cache()

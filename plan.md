@@ -1,21 +1,25 @@
-# Unconditional HARD_STOP_LOSS Enforcement Plan
+# GeckoTerminal OHLCV Global Rate-Limit Discipline & Whale Radar Breakout Telemetry Plan
 
-## 1. Root Cause & Batched Price Monitor Audit (`batched_price_monitor.py`, `position_monitor_node.py`, `whale_lane.py`, `executor_node.py`, `graph.py`)
-- **Audit Findings**:
-  1. In `position_monitor_node.py`, multi-slot chart positions in `all_chart_dicts[1:]` (or any open chart position when `focus_state` was `WATCHING_REENTRY` / `SCANNING`) had their PnL logged by `apply_dex_flow_and_pnl` (`[Monitor] [chart_slot] $MAYA ... PnL=-11.75%, -16.80%, -21.54%, -42.72%`) without executing exit rules.
-  2. In `position_monitor_node.py`, Step 1 Partial TP ran before `HARD_STOP_LOSS`, and `HARD_STOP_LOSS` only emitted a `pending_order` without executing immediately or falling back if Jupiter `/swap/v2/order` failed during a rapid dump.
-- **Fixes**:
-  1. **`batched_price_monitor.py`**:
-     - Evaluate `active_cost_basis_sol(pos)` unconditionally against `remaining_cost_basis_sol` (when `> 0`, else `entry_sol`).
-     - Add `hard_stop_limit_pct_100(pos, config)` and `is_hard_stop_hit(pos, current_sol_value, config)` returning `True` unconditionally whenever `pos.token_amount > 0` and `pnl_pct <= -HARD_STOP_LOSS_PCT` (`-10.0%`), regardless of `partial_tp_taken`, `breakeven_armed`, `trail_armed`, `LEG_2_REENTRY` (`LEG2_ENTRY`), or any other flag.
-     - Put the `HARD_STOP_LOSS` check at the very top of `needs_exact_jupiter_quote` so `resolve_position_sol_value` always fetches an exact Jupiter `swap/v2/order` exit quote (and falls back to the live price quote if Jupiter fails).
-     - Add `enforce_hard_stop_if_hit` and `monitor_and_enforce_hard_stops` in `batched_price_monitor.py` to immediately fetch the exact Jupiter `swap/v2/order` exit quote (with live price fallback) and execute a 100% `SELL` (`reason="HARD_STOP_LOSS"`) via `executor_node`, removing the position from `chart_positions` / `whale_positions`.
-  2. **`executor_node.py`**:
-     - Add a fallback in `executor_node` when `fetch_jupiter_order` (`swap/v2/order`) fails on a `SELL` so `HARD_STOP_LOSS` always executes 100% using the live `current_sol_value` quote and removes the position from `chart_positions` / `whale_positions`.
-     - Promote any remaining open `chart_positions[0]` when one chart slot closes so multi-slot chart positions continue to be monitored.
-  3. **`position_monitor_node.py` & `whale_lane.py` & `graph.py`**:
-     - Enforce `HARD_STOP_LOSS` across all open `chart_positions` (including `LEG_2_REENTRY` and secondary chart slots) and `whale_positions` as an unconditional top-priority exit.
+## 1. Fix `ohlcv_client.py` Rate-Limit Discipline (`ohlcv_client.py`, `config.py`, `.env.example`)
+- **No `1m` Fallback on `429` or Network Error**:
+  - Track `last_ok: bool` and `last_status: int` per pool in `_ohlcv_cache`.
+  - Add `should_fetch_1m_fallback(pair_address, candles_5m, now_ts)` returning `True` **only** when not in global backoff, the `5m` request succeeded (`200 OK`), and `len(candles_5m) < 12`.
+  - Enforce this guard in `fetch_ohlcv_1m_batch`, `alpha_node.py`, and `whale_lane.py` so a `429` or network error on `5m` never fires a `1m` request.
+- **Global GeckoTerminal Pacing & Backoff**:
+  - Default `OHLCV_PACING_DELAY_SECONDS=6.5` in `config.py` and `.env.example` (~9.2 req/min max, safely under GeckoTerminal's ~10 req/min keyless limit).
+  - Add a shared async rate-limiter lock across all GeckoTerminal OHLCV calls enforcing minimum `6.5s` spacing globally.
+  - Replace per-pool-only `429` backoff with a **global** `429` cooldown (`30s`, doubling up to `120s`) so a `429` on Pool A immediately pauses requests for Pool B and all other pools.
+- **Stale-While-Revalidate Cache**:
+  - When global backoff is active, serve the last cached candles for each pool without making network calls.
+  - Add bounded shared `breakout_telemetry` cache (`cache_breakout_telemetry` / `get_cached_breakout_telemetry`) keyed by `mint`.
 
-## 2. Verification
-- Add regression unit test `test_unconditional_hard_stop_loss_on_leg2_reentry_chart_and_whale_positions` in `tests/test_dual_lane_3x3_and_whale_breakout.py` where a `LEG_2_REENTRY` chart position and a `WHALE_SCALP` position drop to `-11.75%` and assert that `HARD_STOP_LOSS` immediately fetches `swap/v2/order` (and falls back cleanly if Jupiter errors), executes a 100% `SELL`, and removes both positions from `chart_positions` and `whale_positions`.
+## 2. Ensure Whale Radar Populates `breakout_telemetry` (`whale_lane.py`, `alpha_node.py`, `telemetry_api.py`)
+- Share `_ohlcv_cache` and the bounded `breakout_telemetry` cache between watchlist evaluation (`alpha_node.py`) and Whale Radar (`whale_lane.py`).
+- Preserve/attach cached `breakout_telemetry` on Whale Radar confluence rows even when `COOLDOWN`, `STALE > 60s`, or `PENDING` in `whale_lane.py` and `telemetry_api.py`.
+
+## 3. Verification
+- Add unit tests in `tests/test_scalper_entry_engine.py` verifying:
+  1. A `5m` `429` does NOT trigger a `1m` fallback call (while a `200 OK` with `< 12` candles does).
+  2. A `429` on Pool A activates global backoff for Pool B and serves stale cached candles while in backoff.
+  3. Whale Radar confluence rows include `breakout_telemetry` from the shared cache even when `COOLDOWN` or `STALE > 60s`.
 - Run `./venv/bin/pytest -v`.

@@ -12,7 +12,12 @@ from config import LAMPORTS_PER_SOL, AgentConfig
 from db import AgentDatabase, utc_now
 from decision_client import GeminiDecisionClient
 from leg2_predictor import Leg2Result, compute_leg2_score
-from ohlcv_client import fetch_ohlcv_1m_batch, fetch_ohlcv_batch
+from ohlcv_client import (
+    cache_breakout_telemetry,
+    fetch_ohlcv_1m_batch,
+    fetch_ohlcv_batch,
+    should_fetch_1m_fallback,
+)
 from scalper_entry_engine import ScalperEntryResult, evaluate_scalper_entry
 from state import (
     AgentGraphState,
@@ -333,7 +338,11 @@ async def alpha_node(
             ohlcv_by_pair = await fetch_ohlcv_batch(
                 pairs_to_fetch, config, client, now_ts=now_dt.timestamp()
             )
-            short_pairs = [p for p in pairs_to_fetch if len(ohlcv_by_pair.get(p) or []) < 12]
+            short_pairs = [
+                p
+                for p in pairs_to_fetch
+                if should_fetch_1m_fallback(p, ohlcv_by_pair.get(p) or [], now_ts=now_dt.timestamp())
+            ]
             if short_pairs:
                 ohlcv_1m_by_pair = await fetch_ohlcv_1m_batch(
                     short_pairs, config, client, now_ts=now_dt.timestamp()
@@ -367,15 +376,16 @@ async def alpha_node(
         if candles_1m is None and len(candles_5m) < 12:
             candles_1m = ohlcv_1m_by_pair.get(p_addr, [])
 
-        scalper_results.append(
-            evaluate_scalper_entry(
-                candles_5m,
-                cand,
-                time_in_slot_min,
-                config=config,
-                candles_1m=candles_1m,
-            )
+        sc_entry = evaluate_scalper_entry(
+            candles_5m,
+            cand,
+            time_in_slot_min,
+            config=config,
+            candles_1m=candles_1m,
         )
+        if (candles_5m or candles_1m) and sc_entry.breakout_telemetry:
+            cache_breakout_telemetry(cand["mint"], sc_entry.breakout_telemetry, now_ts=now_dt.timestamp())
+        scalper_results.append(sc_entry)
 
     active_social = db.get_active_social_signals(
         ttl_minutes=config.X_SIGNAL_TTL_MINUTES,

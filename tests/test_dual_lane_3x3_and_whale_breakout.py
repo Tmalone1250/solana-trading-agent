@@ -167,6 +167,7 @@ async def test_whale_breakout_gate_blocks_extended_and_low_score_and_logs_csv(tm
         WHALE_MIN_BREAKOUT_SCORE=50,
         WHALE_BLOCK_EXTENDED=True,
         ENABLE_JUPITER_DISCOVERY=False,
+        OHLCV_PACING_DELAY_SECONDS=0.0,
     )
     now_dt = datetime.now(timezone.utc)
     ext_mint = "MintWhaleExt1111111111111111111111111111111"

@@ -1,4 +1,4 @@
-"""Rate-limit-safe GeckoTerminal 5m OHLCV fetcher with 90s per-pool cache & backoff."""
+"""Rate-limit-safe GeckoTerminal OHLCV fetcher with global pacing, global 429 backoff & shared cache."""
 
 from __future__ import annotations
 
@@ -16,15 +16,122 @@ logger = logging.getLogger(__name__)
 
 MAX_OHLCV_CACHE_ENTRIES = 64
 OHLCV_CACHE_MAX_TTL_SECONDS = 600.0
+GLOBAL_429_BASE_SECONDS = 30.0
+GLOBAL_429_MAX_SECONDS = 120.0
+GLOBAL_MIN_SPACING_SECONDS = 6.5
+MAX_BREAKOUT_CACHE_ENTRIES = 64
+BREAKOUT_CACHE_TTL_SECONDS = 1800.0
 
 # Per-pair_address cache:
-# pair_address -> {"fetched_at": float, "candles": list[dict], "backoff_until": float, "errors": int}
+# cache_key -> {"fetched_at": float, "candles": list[dict], "last_ok": bool, "last_status": int}
 _ohlcv_cache: dict[str, dict[str, Any]] = {}
+
+# Shared mint -> {"fetched_at": float, "telemetry": dict} cache for Watchlist & Whale Radar
+_breakout_telemetry_cache: dict[str, dict[str, Any]] = {}
+
+# Global GeckoTerminal rate-limit & backoff state shared across all pools and callers
+_global_backoff_until: float = 0.0
+_global_429_errors: int = 0
+_last_gecko_request_ts: float = 0.0
+_loop_locks: dict[int, asyncio.Lock] = {}
+
+
+def _get_gecko_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lid = id(loop)
+    lock = _loop_locks.get(lid)
+    if lock is None:
+        if len(_loop_locks) > 8:
+            _loop_locks.clear()
+        lock = asyncio.Lock()
+        _loop_locks[lid] = lock
+    return lock
 
 
 def clear_ohlcv_cache() -> None:
-    """Clear the in-memory OHLCV cache (useful for tests)."""
+    """Clear the in-memory OHLCV cache, global backoff, pacing clock, and breakout cache (for tests)."""
+    global _global_backoff_until, _global_429_errors, _last_gecko_request_ts
     _ohlcv_cache.clear()
+    _breakout_telemetry_cache.clear()
+    _global_backoff_until = 0.0
+    _global_429_errors = 0
+    _last_gecko_request_ts = 0.0
+
+
+def get_global_backoff_until() -> float:
+    """Return the Unix timestamp until which all GeckoTerminal OHLCV requests are paused."""
+    return _global_backoff_until
+
+
+def cache_breakout_telemetry(
+    mint: str,
+    telemetry: Optional[dict[str, Any]],
+    *,
+    now_ts: Optional[float] = None,
+) -> None:
+    """Store latest non-empty breakout_telemetry for a mint in the shared bounded cache."""
+    m = (mint or "").strip()
+    if not m or not isinstance(telemetry, dict) or telemetry.get("score") is None:
+        return
+    ts = now_ts if now_ts is not None else time.time()
+    _breakout_telemetry_cache[m] = {"fetched_at": ts, "telemetry": dict(telemetry)}
+    prune_timestamped_cache(
+        _breakout_telemetry_cache,
+        now_ts=ts,
+        max_entries=MAX_BREAKOUT_CACHE_ENTRIES,
+        ttl_seconds=BREAKOUT_CACHE_TTL_SECONDS,
+    )
+
+
+def get_cached_breakout_telemetry(
+    mint: str,
+    *,
+    now_ts: Optional[float] = None,
+) -> Optional[dict[str, Any]]:
+    """Return cached breakout_telemetry for a mint if fresh within TTL, else None."""
+    m = (mint or "").strip()
+    if not m:
+        return None
+    ts = now_ts if now_ts is not None else time.time()
+    prune_timestamped_cache(
+        _breakout_telemetry_cache,
+        now_ts=ts,
+        max_entries=MAX_BREAKOUT_CACHE_ENTRIES,
+        ttl_seconds=BREAKOUT_CACHE_TTL_SECONDS,
+    )
+    entry = _breakout_telemetry_cache.get(m)
+    if entry and isinstance(entry.get("telemetry"), dict):
+        return dict(entry["telemetry"])
+    return None
+
+
+def get_cached_ohlcv_for_pool(pair_address: str) -> tuple[list[dict[str, float]], list[dict[str, float]]]:
+    """Return (cached_5m_candles, cached_1m_candles) for a pool without making any network call."""
+    addr = (pair_address or "").strip()
+    if not addr:
+        return [], []
+    e5 = _ohlcv_cache.get(addr) or {}
+    e1 = _ohlcv_cache.get(f"{addr}:1m") or {}
+    return list(e5.get("candles") or []), list(e1.get("candles") or [])
+
+
+def should_fetch_1m_fallback(
+    pair_address: str,
+    candles_5m: list[dict[str, float]],
+    *,
+    now_ts: Optional[float] = None,
+) -> bool:
+    """Return True ONLY when 5m succeeded (200 OK) with < 12 candles and global backoff is not active."""
+    addr = (pair_address or "").strip()
+    if not addr or len(candles_5m) >= 12:
+        return False
+    current_ts = now_ts if now_ts is not None else time.time()
+    if current_ts < _global_backoff_until:
+        return False
+    entry_5m = _ohlcv_cache.get(addr)
+    if not isinstance(entry_5m, dict):
+        return False
+    return bool(entry_5m.get("last_ok")) and int(entry_5m.get("last_status") or 0) == 200
 
 
 def _prune_ohlcv_cache(now_ts: float, config: AgentConfig) -> None:
@@ -71,7 +178,9 @@ async def _fetch_ohlcv_interval(
     cache_suffix: str,
     now_ts: Optional[float] = None,
 ) -> tuple[list[dict[str, float]], bool]:
-    """Fetch GeckoTerminal minute OHLCV bars with 90s cache and 429 exponential backoff."""
+    """Fetch GeckoTerminal minute OHLCV bars with global spacing, global 429 backoff & stale-while-revalidate."""
+    global _global_backoff_until, _global_429_errors, _last_gecko_request_ts
+
     addr = (pair_address or "").strip()
     if not addr:
         return [], False
@@ -79,73 +188,104 @@ async def _fetch_ohlcv_interval(
     cache_key = f"{addr}{cache_suffix}"
     current_ts = now_ts if now_ts is not None else time.time()
     entry = _ohlcv_cache.get(cache_key)
+    prev_candles = list((entry or {}).get("candles") or [])
+
+    # 1. Global 429 Backoff Check (stale-while-revalidate: serve cached candles without hitting API)
+    if current_ts < _global_backoff_until:
+        logger.debug(
+            "[OHLCV] Global GeckoTerminal backoff active (%.0fs remaining) — serving %d cached candles for %s..",
+            _global_backoff_until - current_ts,
+            len(prev_candles),
+            addr[:8],
+        )
+        return prev_candles, False
+
+    # 2. Fresh Cache Hit Check
     if entry is not None:
-        if current_ts < float(entry.get("backoff_until") or 0.0):
-            return list(entry.get("candles") or []), False
         fetched_at = entry.get("fetched_at")
-        if fetched_at is not None and (current_ts - float(fetched_at)) < config.OHLCV_CACHE_SECONDS:
-            return list(entry.get("candles") or []), False
+        if (
+            entry.get("last_ok")
+            and fetched_at is not None
+            and (current_ts - float(fetched_at)) < config.OHLCV_CACHE_SECONDS
+        ):
+            return prev_candles, False
 
     url = f"{config.GECKOTERMINAL_BASE_URL}/networks/solana/pools/{addr}/ohlcv/minute"
     params = {"aggregate": aggregate, "limit": limit, "currency": "usd"}
-    prev_candles = list((entry or {}).get("candles") or [])
-    prev_errors = int((entry or {}).get("errors") or 0)
+    min_spacing = float(config.OHLCV_PACING_DELAY_SECONDS)
 
-    try:
-        resp = await client.get(
-            url,
-            params=params,
-            headers={"Accept": "application/json"},
-            timeout=10.0,
-        )
-        if resp.status_code == 429:
-            errors = prev_errors + 1
-            backoff = min(300.0, 30.0 * (2 ** (errors - 1)))
+    async with _get_gecko_lock():
+        # Re-check global backoff inside the lock in case another coroutine just hit 429
+        check_ts = now_ts if now_ts is not None else time.time()
+        if check_ts < _global_backoff_until:
+            return prev_candles, False
+
+        # Global minimum spacing across all GeckoTerminal requests (default 6.5s)
+        if min_spacing > 0 and _last_gecko_request_ts > 0:
+            elapsed = check_ts - _last_gecko_request_ts
+            if 0.0 <= elapsed < min_spacing:
+                await asyncio.sleep(min_spacing - elapsed)
+                check_ts = now_ts if now_ts is not None else time.time()
+
+        _last_gecko_request_ts = check_ts
+        try:
+            resp = await client.get(
+                url,
+                params=params,
+                headers={"Accept": "application/json"},
+                timeout=10.0,
+            )
+            if resp.status_code == 429:
+                _global_429_errors += 1
+                backoff = min(
+                    GLOBAL_429_MAX_SECONDS,
+                    GLOBAL_429_BASE_SECONDS * (2 ** (_global_429_errors - 1)),
+                )
+                _global_backoff_until = check_ts + backoff
+                _ohlcv_cache[cache_key] = {
+                    "fetched_at": (entry or {}).get("fetched_at") or check_ts,
+                    "candles": prev_candles,
+                    "last_ok": False,
+                    "last_status": 429,
+                }
+                _prune_ohlcv_cache(check_ts, config)
+                logger.warning(
+                    "[OHLCV] GeckoTerminal 429 (%sm) on pool %s..; GLOBAL backoff %.0fs (cached=%d candles)",
+                    aggregate,
+                    addr[:8],
+                    backoff,
+                    len(prev_candles),
+                )
+                return prev_candles, True
+
+            resp.raise_for_status()
+            candles = parse_geckoterminal_ohlcv(resp.json())
+            _global_429_errors = 0
+            _global_backoff_until = 0.0
             _ohlcv_cache[cache_key] = {
-                "fetched_at": (entry or {}).get("fetched_at") or current_ts,
-                "candles": prev_candles,
-                "backoff_until": current_ts + backoff,
-                "errors": errors,
+                "fetched_at": check_ts,
+                "candles": candles,
+                "last_ok": True,
+                "last_status": 200,
             }
-            _prune_ohlcv_cache(current_ts, config)
+            _prune_ohlcv_cache(check_ts, config)
+            return list(candles), True
+        except Exception as exc:
+            _ohlcv_cache[cache_key] = {
+                "fetched_at": (entry or {}).get("fetched_at") or check_ts,
+                "candles": prev_candles,
+                "last_ok": False,
+                "last_status": 0,
+            }
+            _prune_ohlcv_cache(check_ts, config)
             logger.warning(
-                "[OHLCV] GeckoTerminal 429 (%sm) for pool %s..; backing off %.0fs (cached=%d candles)",
+                "[OHLCV] Fetch failed (%sm) for pool %s.. (%s); serving %d cached candles",
                 aggregate,
                 addr[:8],
-                backoff,
+                exc,
                 len(prev_candles),
             )
             return prev_candles, True
-
-        resp.raise_for_status()
-        candles = parse_geckoterminal_ohlcv(resp.json())
-        _ohlcv_cache[cache_key] = {
-            "fetched_at": current_ts,
-            "candles": candles,
-            "backoff_until": 0.0,
-            "errors": 0,
-        }
-        _prune_ohlcv_cache(current_ts, config)
-        return list(candles), True
-    except Exception as exc:
-        errors = prev_errors + 1
-        backoff = min(300.0, 15.0 * (2 ** (errors - 1)))
-        _ohlcv_cache[cache_key] = {
-            "fetched_at": (entry or {}).get("fetched_at") or current_ts,
-            "candles": prev_candles,
-            "backoff_until": current_ts + backoff,
-            "errors": errors,
-        }
-        _prune_ohlcv_cache(current_ts, config)
-        logger.warning(
-            "[OHLCV] Fetch failed (%sm) for pool %s.. (%s); backing off %.0fs (cached=%d candles)",
-            aggregate,
-            addr[:8],
-            exc,
-            backoff,
-            len(prev_candles),
-        )
-        return prev_candles, True
 
 
 async def fetch_ohlcv_5m(
@@ -181,20 +321,13 @@ async def fetch_ohlcv_batch(
     *,
     now_ts: Optional[float] = None,
 ) -> dict[str, list[dict[str, float]]]:
-    """Fetch 5m OHLCV for up to MAX_WATCH_BATCH pools, pacing network calls cleanly."""
+    """Fetch 5m OHLCV for up to MAX_WATCH_BATCH pools using global spacing and global 429 backoff."""
     results: dict[str, list[dict[str, float]]] = {}
-    network_calls = 0
-
     for addr in pair_addresses:
         if not addr or addr in results:
             continue
-        if network_calls > 0 and config.OHLCV_PACING_DELAY_SECONDS > 0:
-            await asyncio.sleep(config.OHLCV_PACING_DELAY_SECONDS)
-        candles, did_net = await fetch_ohlcv_5m(addr, config, client, now_ts=now_ts)
+        candles, _did_net = await fetch_ohlcv_5m(addr, config, client, now_ts=now_ts)
         results[addr] = candles
-        if did_net:
-            network_calls += 1
-
     return results
 
 
@@ -205,18 +338,15 @@ async def fetch_ohlcv_1m_batch(
     *,
     now_ts: Optional[float] = None,
 ) -> dict[str, list[dict[str, float]]]:
-    """Fetch 1m OHLCV fallback for pools with fewer than 12 x 5m candles."""
+    """Fetch 1m OHLCV fallback ONLY for pools whose 5m request succeeded (200 OK) with < 12 candles."""
     results: dict[str, list[dict[str, float]]] = {}
-    network_calls = 0
-
     for addr in pair_addresses:
         if not addr or addr in results:
             continue
-        if network_calls > 0 and config.OHLCV_PACING_DELAY_SECONDS > 0:
-            await asyncio.sleep(config.OHLCV_PACING_DELAY_SECONDS)
-        candles, did_net = await fetch_ohlcv_1m(addr, config, client, now_ts=now_ts)
+        c5_cached, c1_cached = get_cached_ohlcv_for_pool(addr)
+        if not should_fetch_1m_fallback(addr, c5_cached, now_ts=now_ts):
+            results[addr] = c1_cached
+            continue
+        candles, _did_net = await fetch_ohlcv_1m(addr, config, client, now_ts=now_ts)
         results[addr] = candles
-        if did_net:
-            network_calls += 1
-
     return results

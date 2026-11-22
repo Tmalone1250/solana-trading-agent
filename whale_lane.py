@@ -21,7 +21,13 @@ from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
 from db import AgentDatabase, utc_now
 from executor_node import executor_node
 from jupiter_token_client import enrich_mints
-from ohlcv_client import fetch_ohlcv_1m_batch, fetch_ohlcv_batch
+from ohlcv_client import (
+    cache_breakout_telemetry,
+    fetch_ohlcv_1m_batch,
+    fetch_ohlcv_batch,
+    get_cached_breakout_telemetry,
+    should_fetch_1m_fallback,
+)
 from safety_gate_node import check_token_safety
 from scalper_entry_engine import evaluate_scalper_entry
 from state import ActivePosition, FocusState, PendingOrder
@@ -314,20 +320,24 @@ async def run_whale_lane_tick(
             if config.ENABLE_JUPITER_DISCOVERY
             else {}
         )
-        # Fetch 5m OHLCV (+ 1m fallback when < 12 5m bars) for Breakout Meter & Whale Breakout Gate
+        # Fetch 5m OHLCV (+ 1m fallback ONLY when 5m succeeded 200 OK with < 12 bars) using shared cache
         pair_addrs = [str(p.get("pairAddress") or "") for p in pairs_by_mint.values() if p.get("pairAddress")]
         ohlcv_5m = await fetch_ohlcv_batch(pair_addrs, config, client, now_ts=now_dt.timestamp()) if pair_addrs else {}
-        short_addrs = [a for a in pair_addrs if len(ohlcv_5m.get(a) or []) < 12]
+        short_addrs = [
+            a for a in pair_addrs
+            if should_fetch_1m_fallback(a, ohlcv_5m.get(a) or [], now_ts=now_dt.timestamp())
+        ]
         ohlcv_1m = await fetch_ohlcv_1m_batch(short_addrs, config, client, now_ts=now_dt.timestamp()) if short_addrs else {}
 
         open_mints = db.get_all_open_mints()
         for trig in triggers:
             mint = trig["mint"]
+            cached_bt = get_cached_breakout_telemetry(mint, now_ts=now_dt.timestamp())
             if db.is_on_cooldown(mint, now=now_dt):
-                db.upsert_whale_decision(mint, "SKIPPED", "COOLDOWN", updated_at=now_dt.isoformat())
+                db.upsert_whale_decision(mint, "SKIPPED", "COOLDOWN", updated_at=now_dt.isoformat(), breakout_telemetry=cached_bt)
                 continue
             if mint in open_mints:
-                db.upsert_whale_decision(mint, "SKIPPED", "DUPLICATE_MINT_IN_CHART_SLOT", updated_at=now_dt.isoformat())
+                db.upsert_whale_decision(mint, "SKIPPED", "DUPLICATE_MINT_IN_CHART_SLOT", updated_at=now_dt.isoformat(), breakout_telemetry=cached_bt)
                 continue
 
             pair = pairs_by_mint.get(mint)
@@ -338,11 +348,14 @@ async def run_whale_lane_tick(
             mc_usd = float(pair.get("marketCap") or pair.get("fdv") or 0.0)
             p_addr = str(pair.get("pairAddress") or "")
 
-            # Compute shared breakout_telemetry (5m or 1m_fallback) for every Whale Radar candidate
+            # Compute shared breakout_telemetry (5m or 1m_fallback) or preserve cached meter during backoff
             c5 = pair.get("candles_5m") if isinstance(pair.get("candles_5m"), list) else ohlcv_5m.get(p_addr, [])
             c1 = pair.get("candles_1m") if isinstance(pair.get("candles_1m"), list) else ohlcv_1m.get(p_addr, [])
+            has_ohlcv = bool(c5 or c1)
             sc_res = evaluate_scalper_entry(c5, pair, time_in_slot_min=5.0, config=config, candles_1m=c1)
-            bt = sc_res.breakout_telemetry or {}
+            bt = sc_res.breakout_telemetry if (has_ohlcv and sc_res.breakout_telemetry) else (cached_bt or sc_res.breakout_telemetry or {})
+            if has_ohlcv and sc_res.breakout_telemetry:
+                cache_breakout_telemetry(mint, sc_res.breakout_telemetry, now_ts=now_dt.timestamp())
             bt_score = int(bt.get("score") or 0)
             bt_state = str(bt.get("state") or "FORMING")
             bt_failed_str = "; ".join(bt.get("failed_gates") or []) if bt else ""

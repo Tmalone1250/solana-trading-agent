@@ -101,7 +101,7 @@ class AgentConfig(BaseSettings):
 
     # Scalper Expert Entry Engine, BREAKOUT_IGNITION & OHLCV Cache
     OHLCV_CACHE_SECONDS: float = Field(default=90.0, gt=0.0)
-    OHLCV_PACING_DELAY_SECONDS: float = Field(default=0.35, ge=0.0)
+    OHLCV_PACING_DELAY_SECONDS: float = Field(default=6.5, ge=0.0)
     ANTI_CHASE_HIGH_BUFFER_PCT: float = Field(default=0.05, ge=0.0, lt=1.0)
     SCALPER_MAX_RSI_5M: float = Field(default=70.0, gt=0.0, le=100.0)
     SCALPER_MIN_BUY_RATIO_5M: float = Field(default=0.58, ge=0.0, le=1.0)

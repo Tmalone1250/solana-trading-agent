@@ -80,7 +80,7 @@ async def test_bounded_in_memory_caches_evict_ttl_and_max_size(tmp_path: Path):
     clear_helius_roster_cache()
     clear_price_backoff()
 
-    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper")
+    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", OHLCV_PACING_DELAY_SECONDS=0.0)
     base_ts = 1_700_000_000.0
 
     # 1. OHLCV cache capped at MAX_OHLCV_CACHE_ENTRIES (64)

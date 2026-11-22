@@ -20,6 +20,7 @@ from helius_webhook import (
     verify_helius_auth,
 )
 from insider_scanner import InsiderScanRequest, run_insider_scan
+from ohlcv_client import get_cached_breakout_telemetry
 
 
 def create_telemetry_app(
@@ -214,6 +215,11 @@ def create_telemetry_app(
         )
         open_whale_mint = open_whale_pos.get("mint") if isinstance(open_whale_pos, dict) else None
         open_whale_pnl = whale_live_pnl or live_pnl
+        watchlist_bt_by_mint = {
+            w["mint"]: w["breakout_telemetry"]
+            for w in active_watchlist_payload
+            if w.get("breakout_telemetry")
+        }
         enriched_signals: list[dict[str, Any]] = []
         for sig in active_whales.values():
             dec_info = whale_decisions.get(sig["mint"])
@@ -226,12 +232,17 @@ def create_telemetry_app(
             else:
                 a_status = None
                 a_reason = None
+            resolved_bt = (
+                (dec_info.get("breakout_telemetry") if dec_info else None)
+                or watchlist_bt_by_mint.get(sig["mint"])
+                or get_cached_breakout_telemetry(sig["mint"], now_ts=now_dt.timestamp())
+            )
             enriched_signals.append(
                 {
                     **sig,
                     "agent_status": a_status,
                     "agent_reason": a_reason,
-                    "breakout_telemetry": dec_info.get("breakout_telemetry") if dec_info else None,
+                    "breakout_telemetry": resolved_bt,
                 }
             )
 
