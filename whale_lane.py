@@ -11,8 +11,10 @@ import httpx
 from batched_price_monitor import (
     active_cost_basis_sol,
     apply_dex_flow_and_pnl,
+    enforce_hard_stop_if_hit,
     estimate_position_sol_value,
     fetch_batched_sol_prices,
+    is_hard_stop_hit,
     resolve_position_sol_value,
 )
 from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
@@ -84,7 +86,15 @@ def evaluate_whale_exit_order(
             f"[WHALE_SCALP EXIT] {pos.symbol}: WHALE_SHADOW_EXIT (triggering whale sold)",
         )
 
-    # 2. Step 1 Scale-Out at +15% (WHALE_PARTIAL_TP_TRIGGER_PCT): sell 50%, arm +2% BE & -10% runner trail
+    # 2. Unconditional Hard Stop (-10% against remaining_cost_basis_sol) — never suppressed by any flag
+    hs_hit, _, hs_limit_100 = is_hard_stop_hit(pos, current_sol_value, config)
+    if hs_hit or pnl_pct_100 <= config.WHALE_HARD_STOP_PCT + EPS:
+        return _sell(
+            "WHALE_HARD_STOP",
+            f"[WHALE_SCALP STOP] {pos.symbol}: WHALE_HARD_STOP ({pnl_pct_100:+.2f}% <= {hs_limit_100:.0f}%)",
+        )
+
+    # 3. Step 1 Scale-Out at +15% (WHALE_PARTIAL_TP_TRIGGER_PCT): sell 50%, arm +2% BE & -10% runner trail
     whale_tp_trigger = float(config.WHALE_PARTIAL_TP_TRIGGER_PCT or config.PARTIAL_TP_TRIGGER_PCT)
     whale_sell_frac = float(config.WHALE_PARTIAL_TP_SELL_FRACTION or config.PARTIAL_TP_SELL_FRACTION)
     if not pos.partial_tp_taken and pos.token_amount >= 2 and pnl_pct_100 + EPS >= whale_tp_trigger:
@@ -235,6 +245,13 @@ async def run_whale_lane_tick(
                     has_batched_price=(pos.mint in sol_prices),
                 )
                 apply_dex_flow_and_pnl(pos, current_sol_value=curr_val, flow=flow, lane_label="whale_slot")
+                hs_whale = await enforce_hard_stop_if_hit(
+                    pos, current_sol_value=curr_val, config=config, db=db, client=client, lane="whale"
+                )
+                if hs_whale is not None:
+                    sol_balance = float(hs_whale.get("sol_balance", sol_balance))
+                    daily_pnl = float(hs_whale.get("daily_pnl_sol", daily_pnl))
+                    continue
                 exit_order, _ev = evaluate_whale_exit_order(
                     pos, current_sol_value=curr_val, config=config, db=db, now_dt=now_dt
                 )

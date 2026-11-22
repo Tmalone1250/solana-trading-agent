@@ -11,8 +11,8 @@ import httpx
 
 from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
 from db import AgentDatabase, utc_now
-from executor_node import fetch_jupiter_order
-from state import ActivePosition
+from executor_node import executor_node, fetch_jupiter_order
+from state import ActivePosition, FocusState, PendingOrder
 
 logger = logging.getLogger(__name__)
 EPS = 1e-9
@@ -194,10 +194,38 @@ def estimate_position_sol_value(
 
 
 def active_cost_basis_sol(pos: ActivePosition) -> float:
-    """Return remaining_cost_basis_sol once partial TP is taken, otherwise initial entry_sol."""
-    if getattr(pos, "partial_tp_taken", False) and float(getattr(pos, "remaining_cost_basis_sol", 0.0) or 0.0) > 0:
-        return float(pos.remaining_cost_basis_sol)
+    """Return remaining_cost_basis_sol (when > 0), otherwise initial entry_sol."""
+    rem = float(getattr(pos, "remaining_cost_basis_sol", 0.0) or 0.0)
+    if rem > 0.0:
+        return rem
     return float(pos.entry_sol)
+
+
+def hard_stop_limit_pct_100(pos: ActivePosition, config: AgentConfig) -> float:
+    """Return the negative hard stop threshold in percent (e.g., -10.0) for Chart or Whale position."""
+    if str(pos.strategy or "").upper() == "WHALE_SCALP":
+        raw_w = abs(float(config.WHALE_HARD_STOP_PCT))
+        return -(raw_w * 100.0 if 0.0 < raw_w < 1.0 else raw_w)
+    raw_c = abs(float(config.HARD_STOP_LOSS_PCT))
+    return -(raw_c * 100.0 if 0.0 < raw_c < 1.0 else raw_c)
+
+
+def is_hard_stop_hit(
+    pos: ActivePosition,
+    current_sol_value: float,
+    config: AgentConfig,
+) -> tuple[bool, float, float]:
+    """Unconditionally evaluate HARD_STOP_LOSS against remaining_cost_basis_sol.
+
+    Returns (is_hit, pnl_pct_100, stop_limit_pct_100). Never suppressed by partial_tp_taken,
+    breakeven_armed, trail_armed, LEG_2_REENTRY, or any other flag.
+    """
+    basis = active_cost_basis_sol(pos)
+    stop_limit_100 = hard_stop_limit_pct_100(pos, config)
+    if pos.token_amount <= 0 or basis <= 0.0:
+        return False, 0.0, stop_limit_100
+    pnl_pct_100 = ((current_sol_value - basis) / basis) * 100.0
+    return (pnl_pct_100 <= stop_limit_100 + 1e-6, pnl_pct_100, stop_limit_100)
 
 
 def apply_dex_flow_and_pnl(
@@ -261,19 +289,23 @@ def needs_exact_jupiter_quote(
     now_dt: Optional[datetime] = None,
     proximity_pct: float = 2.0,
 ) -> bool:
-    """Return True only when estimated PnL is within 2% of Hard Stop, BE Shield, Partial TP, Trailing TP, or Whale exit."""
+    """Return True when estimated PnL is at/below HARD_STOP_LOSS or within 2% of any exit threshold."""
     basis = active_cost_basis_sol(pos)
     if basis <= 0:
         return True
     pnl_pct_100 = ((estimated_sol_value - basis) / basis) * 100.0
+    stop_limit_100 = hard_stop_limit_pct_100(pos, config)
+
+    # Unconditional Hard Stop Gate: ALWAYS fetch exact Jupiter exit quote near or below -HARD_STOP_LOSS_PCT
+    if pnl_pct_100 <= stop_limit_100 + max(0.0, proximity_pct) + EPS:
+        return True
+
     peak_sol = max(pos.peak_sol_value, estimated_sol_value)
     peak_pct_100 = ((peak_sol - basis) / basis) * 100.0
     is_whale = str(pos.strategy or "").upper() == "WHALE_SCALP"
 
     if is_whale:
         if pos.whale_shadow_exit_flag:
-            return True
-        if pnl_pct_100 <= config.WHALE_HARD_STOP_PCT + proximity_pct:
             return True
         whale_tp_pct = float(config.WHALE_PARTIAL_TP_TRIGGER_PCT or config.PARTIAL_TP_TRIGGER_PCT)
         if not pos.partial_tp_taken and pnl_pct_100 >= whale_tp_pct - proximity_pct:
@@ -317,9 +349,6 @@ def needs_exact_jupiter_quote(
     # Regular Chart position thresholds (+15% Partial TP & -10% Runner Trail)
     if not pos.partial_tp_taken and pnl_pct_100 >= config.PARTIAL_TP_TRIGGER_PCT - proximity_pct:
         return True
-    hard_stop_100 = -config.HARD_STOP_LOSS_PCT * 100.0
-    if pnl_pct_100 <= hard_stop_100 + proximity_pct:
-        return True
     be_floor_100 = config.BREAKEVEN_FLOOR_PCT * 100.0
     be_arm_100 = config.BREAKEVEN_ARM_PCT * 100.0
     if (pos.breakeven_armed or peak_pct_100 >= be_arm_100) and pnl_pct_100 <= be_floor_100 + proximity_pct:
@@ -345,8 +374,13 @@ async def resolve_position_sol_value(
     has_batched_price: bool = True,
     quote_amount: Optional[int] = None,
 ) -> tuple[float, bool]:
-    """Return (sol_value, used_exact_quote), calling Jupiter Swap Quote only when near a threshold."""
-    if has_batched_price and not needs_exact_jupiter_quote(pos, estimated_sol_value, config, now_dt=now_dt):
+    """Return (sol_value, used_exact_quote), calling Jupiter Swap Quote when near/below a threshold."""
+    force_hard_stop_quote, _, _ = is_hard_stop_hit(pos, estimated_sol_value, config)
+    if (
+        has_batched_price
+        and not force_hard_stop_quote
+        and not needs_exact_jupiter_quote(pos, estimated_sol_value, config, now_dt=now_dt)
+    ):
         return estimated_sol_value, False
     amt = quote_amount if quote_amount is not None and quote_amount > 0 else max(1, pos.token_amount or pos.reference_token_amount)
     try:
@@ -358,7 +392,104 @@ async def resolve_position_sol_value(
             client=client,
             taker=None,
         )
-        return int(quote_resp["outAmount"]) / LAMPORTS_PER_SOL, True
+        quoted_sol = int(quote_resp["outAmount"]) / LAMPORTS_PER_SOL
+        if quoted_sol > 0:
+            return quoted_sol, True
+        return estimated_sol_value, False
     except Exception as exc:
         logger.warning("[BatchedPrice] On-demand Jupiter quote failed for %s (%s); using batched price %.4f SOL", pos.symbol, exc, estimated_sol_value)
         return estimated_sol_value, False
+
+
+async def enforce_hard_stop_if_hit(
+    pos: ActivePosition,
+    *,
+    current_sol_value: float,
+    config: AgentConfig,
+    db: AgentDatabase,
+    client: httpx.AsyncClient,
+    lane: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Unconditionally execute a 100% HARD_STOP_LOSS SELL if pnl_pct <= -HARD_STOP_LOSS_PCT."""
+    hit, pnl_pct_100, stop_limit_100 = is_hard_stop_hit(pos, current_sol_value, config)
+    if not hit:
+        return None
+
+    is_whale = (lane == "whale") or (str(pos.strategy or "").upper() == "WHALE_SCALP")
+    pos.current_sol_value = round(current_sol_value, 6)
+    reason = f"HARD_STOP_LOSS ({pnl_pct_100:+.2f}% <= {stop_limit_100:.0f}%)"
+    order = PendingOrder(
+        side="SELL",
+        mint=pos.mint,
+        symbol=pos.symbol,
+        amount_atomic=pos.token_amount,
+        reason=reason,
+        target_state_after_fill=FocusState.SCANNING,
+        apply_cooldown=True,
+        strategy=pos.strategy or ("WHALE_SCALP" if is_whale else "SCALPER"),
+        triggering_wallets=list(pos.triggering_wallets),
+        entry_mc_usd=pos.entry_mc_usd,
+        whale_sol_flow=pos.whale_sol_flow,
+        breakout_telemetry=pos.breakout_telemetry,
+        rationale=f"[HARD STOP LOSS] {pos.symbol}: {reason}",
+    )
+    st = db.get_state()
+    exec_state: dict[str, Any] = {
+        "focus_state": st["focus_state"],
+        "sol_balance": float(st["sol_balance"]),
+        "daily_pnl_sol": float(st["daily_pnl_sol"]),
+        "active_position": st["active_position"] if not is_whale else pos.model_dump(),
+        "chart_positions": list(st.get("chart_positions") or []),
+        "whale_position": pos.model_dump() if is_whale else st.get("whale_position"),
+        "whale_positions": list(st.get("whale_positions") or []),
+        "pending_order": order.model_dump(),
+        "slot": "whale_slot" if is_whale else "chart_slot",
+    }
+    if not is_whale:
+        exec_state["active_position"] = pos.model_dump()
+    out = await executor_node(exec_state, config=config, db=db, http_client=client)
+    return {**out, "pending_order": order.model_dump(), "monitor_event": reason, "_hard_stop_already_executed": True}
+
+
+async def monitor_and_enforce_hard_stops(
+    *,
+    config: AgentConfig,
+    db: AgentDatabase,
+    client: httpx.AsyncClient,
+    now_dt: Optional[datetime] = None,
+) -> list[dict[str, Any]]:
+    """Poll all active chart_positions and whale_positions and immediately execute HARD_STOP_LOSS on any <= -10%."""
+    dt = now_dt or utc_now()
+    st = db.get_state()
+    chart_list = [p for p in (st.get("chart_positions") or []) if isinstance(p, dict) and p.get("mint")]
+    whale_list = [p for p in (st.get("whale_positions") or []) if isinstance(p, dict) and p.get("mint")]
+    all_mints = [str(p["mint"]) for p in chart_list + whale_list]
+    if not all_mints:
+        return []
+
+    sol_prices, dex_flow = await fetch_batched_sol_prices(all_mints, config, client, now_ts=dt.timestamp())
+    executed: list[dict[str, Any]] = []
+
+    for lane_name, raw_list in (("chart", chart_list), ("whale", whale_list)):
+        lane_label = "whale_slot" if lane_name == "whale" else "chart_slot"
+        for raw_p in raw_list:
+            pos = ActivePosition.model_validate(raw_p)
+            flow = dex_flow.get(pos.mint)
+            if isinstance(flow, dict) and flow.get("decimals") is not None:
+                pos.decimals = int(flow["decimals"])
+            est_val = estimate_position_sol_value(pos, sol_prices.get(pos.mint), token_decimals=pos.decimals)
+            curr_val, _ = await resolve_position_sol_value(
+                pos,
+                estimated_sol_value=est_val,
+                config=config,
+                client=client,
+                now_dt=dt,
+                has_batched_price=(pos.mint in sol_prices),
+            )
+            apply_dex_flow_and_pnl(pos, current_sol_value=curr_val, flow=flow, lane_label=lane_label)
+            hs_out = await enforce_hard_stop_if_hit(
+                pos, current_sol_value=curr_val, config=config, db=db, client=client, lane=lane_name
+            )
+            if hs_out is not None:
+                executed.append(hs_out)
+    return executed

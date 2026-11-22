@@ -83,6 +83,20 @@ async def executor_node(
     if not raw_order:
         return {"pending_order": None}
 
+    if state.get("_hard_stop_already_executed"):
+        st_done = db.get_state()
+        return {
+            "focus_state": st_done["focus_state"],
+            "sol_balance": float(st_done["sol_balance"]),
+            "daily_pnl_sol": float(st_done["daily_pnl_sol"]),
+            "active_position": st_done["active_position"],
+            "chart_positions": st_done["chart_positions"],
+            "whale_position": st_done["whale_position"],
+            "whale_positions": st_done["whale_positions"],
+            "pending_order": None,
+            "last_execution": state.get("last_execution"),
+        }
+
     order = PendingOrder.model_validate(raw_order)
     side_up = order.side.upper()
     is_buy = side_up == "BUY"
@@ -136,17 +150,32 @@ async def executor_node(
 
     owns_client = http_client is None
     client = http_client or httpx.AsyncClient()
+    existing_for_fallback = (
+        state.get("whale_position") if is_whale_slot else state.get("active_position")
+    ) or state.get("active_position")
     try:
-        order_resp = await fetch_jupiter_order(
-            input_mint=input_mint,
-            output_mint=output_mint,
-            amount_atomic=order.amount_atomic,
-            config=config,
-            client=client,
-            taker=taker,
-        )
-
-        out_amount = int(order_resp["outAmount"])
+        try:
+            order_resp = await fetch_jupiter_order(
+                input_mint=input_mint,
+                output_mint=output_mint,
+                amount_atomic=order.amount_atomic,
+                config=config,
+                client=client,
+                taker=taker,
+            )
+            out_amount = int(order_resp["outAmount"])
+        except Exception as exc:
+            if not is_buy and config.EXECUTION_MODE != "live":
+                fb_sol = (
+                    float(existing_for_fallback.get("current_sol_value") or existing_for_fallback.get("entry_sol") or 0.0)
+                    if isinstance(existing_for_fallback, dict)
+                    else 0.0
+                )
+                logger.warning("[Executor] Jupiter quote failed on %s %s (%s); falling back to live SOL quote %.4f", order.side, order.symbol, exc, fb_sol)
+                order_resp = {"outAmount": str(max(1, int(round(fb_sol * LAMPORTS_PER_SOL)))), "transaction": None}
+                out_amount = int(order_resp["outAmount"])
+            else:
+                raise
         tx_signature: Optional[str] = None
 
         if config.EXECUTION_MODE == "live":
@@ -395,6 +424,9 @@ async def executor_node(
     updated_charts = [p for p in chart_positions if isinstance(p, dict) and p.get("mint") != order.mint]
     if (is_buy or is_partial_sell) and new_pos_dict is not None:
         updated_charts.append(new_pos_dict)
+    elif new_pos_dict is None and updated_charts and next_state == FocusState.SCANNING.value:
+        new_pos_dict = updated_charts[0]
+        next_state = FocusState.IN_POSITION.value
     db.save_lane_positions(
         lane="chart", positions=updated_charts, sol_balance=sol_balance, daily_pnl_sol=daily_pnl_sol,
         focus_state=next_state, active_position=new_pos_dict,

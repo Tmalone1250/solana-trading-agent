@@ -12,8 +12,10 @@ from alpha_node import evaluate_leg2_reentry
 from batched_price_monitor import (
     active_cost_basis_sol,
     apply_dex_flow_and_pnl,
+    enforce_hard_stop_if_hit,
     estimate_position_sol_value,
     fetch_batched_sol_prices,
+    is_hard_stop_hit,
     resolve_position_sol_value,
 )
 from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
@@ -67,16 +69,17 @@ async def position_monitor_node(
 ) -> dict[str, Any]:
     """LangGraph node: monitors single active mint in IN_POSITION or WATCHING_REENTRY."""
     focus_state = state.get("focus_state")
-    if focus_state not in (FocusState.IN_POSITION.value, FocusState.WATCHING_REENTRY.value):
+    raw_chart_list = list(state.get("chart_positions") or [])
+    if focus_state not in (FocusState.IN_POSITION.value, FocusState.WATCHING_REENTRY.value) and not raw_chart_list:
         return {"pending_order": None}
 
-    raw_chart_list = list(state.get("chart_positions") or [])
     raw_pos = state.get("active_position") or (raw_chart_list[0] if raw_chart_list else None)
     if not raw_pos:
         return {"focus_state": FocusState.SCANNING.value, "active_position": None, "chart_positions": [], "pending_order": None}
 
     pos = ActivePosition.model_validate(raw_pos)
-    quote_amount = pos.token_amount if focus_state == FocusState.IN_POSITION.value else pos.reference_token_amount
+    is_holding_tokens = pos.token_amount > 0 or focus_state == FocusState.IN_POSITION.value
+    quote_amount = pos.token_amount if pos.token_amount > 0 else pos.reference_token_amount
     if quote_amount <= 0:
         quote_amount = 1_000_000
 
@@ -102,7 +105,7 @@ async def position_monitor_node(
             pos, estimated_sol_value=est_sol, config=config, client=client,
             now_dt=now_dt, has_batched_price=(pos.mint in sol_prices), quote_amount=quote_amount,
         )
-        # Also refresh any additional open chart positions (slots 2 & 3) in-place
+        # Also refresh any additional open chart positions (slots 2 & 3) and enforce HARD_STOP_LOSS
         updated_extra_charts: list[dict[str, Any]] = []
         for extra_d in all_chart_dicts[1:]:
             ep = ActivePosition.model_validate(extra_d)
@@ -115,13 +118,18 @@ async def position_monitor_node(
                 now_dt=now_dt, has_batched_price=(ep.mint in sol_prices),
             )
             apply_dex_flow_and_pnl(ep, current_sol_value=e_curr, flow=ef, lane_label="chart_slot")
-            updated_extra_charts.append(ep.model_dump())
+            hs_extra = await enforce_hard_stop_if_hit(
+                ep, current_sol_value=e_curr, config=config, db=db, client=client, lane="chart"
+            )
+            if hs_extra is None:
+                updated_extra_charts.append(ep.model_dump())
     finally:
         if owns_client:
             await client.aclose()
 
     buys_5m, sells_5m, buy_ratio_5m, current_liq = apply_dex_flow_and_pnl(
-        pos, current_sol_value=current_sol_value, flow=flow, lane_label="chart_slot"
+        pos, current_sol_value=current_sol_value, flow=flow,
+        lane_label="chart_slot" if is_holding_tokens else "watch_reentry",
     )
     total_5m = buys_5m + sells_5m
 
@@ -131,18 +139,19 @@ async def position_monitor_node(
     )
     pos.last_5m_sell_ratio = sell_ratio_5m
 
-    sol_balance = float(state.get("sol_balance") or 0.0)
-    daily_pnl_sol = float(state.get("daily_pnl_sol") or 0.0)
+    st_latest = db.get_state()
+    sol_balance = float(state.get("sol_balance") if "sol_balance" in state else st_latest.get("sol_balance") or 0.0)
+    daily_pnl_sol = float(state.get("daily_pnl_sol") if "daily_pnl_sol" in state else st_latest.get("daily_pnl_sol") or 0.0)
 
     def _sync_chart_list(primary: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
-        if primary is not None and focus_state == FocusState.IN_POSITION.value:
+        if primary is not None and is_holding_tokens:
             return [primary, *updated_extra_charts]
         return list(updated_extra_charts)
 
     # =========================================================================
-    # STATE 2: IN_POSITION
+    # STATE 2: IN_POSITION (or any active position holding tokens > 0)
     # =========================================================================
-    if focus_state == FocusState.IN_POSITION.value:
+    if is_holding_tokens:
         if current_sol_value > pos.peak_sol_value:
             pos.peak_sol_value = current_sol_value
 
@@ -164,6 +173,43 @@ async def position_monitor_node(
             pos_dict = pos.model_dump()
             db.save_state(focus_state=FocusState.IN_POSITION.value, sol_balance=sol_balance, daily_pnl_sol=daily_pnl_sol, active_position=pos_dict)
             return {"active_position": pos_dict, "pending_order": None, "monitor_event": monitor_event}
+
+        # 0. Unconditional Hard Stop (-10% against remaining_cost_basis_sol) -> immediate 100% SELL -> SCANNING + cooldown
+        hs_hit, hs_pnl_100, hs_limit_100 = is_hard_stop_hit(pos, current_sol_value, config)
+        if hs_hit or pnl_pct <= -config.HARD_STOP_LOSS_PCT + EPS:
+            hs_reason = f"HARD_STOP_LOSS ({hs_pnl_100:+.2f}% <= {hs_limit_100:.0f}%)"
+            hs_order = PendingOrder(
+                side="SELL", mint=pos.mint, symbol=pos.symbol, amount_atomic=pos.token_amount,
+                reason=hs_reason, target_state_after_fill=FocusState.SCANNING, apply_cooldown=True,
+                strategy=pos.strategy or "SCALPER",
+                rationale=f"[MONITOR EXIT] {pos.symbol}: {hs_reason}",
+            )
+            hs_owns = http_client is None
+            hs_client = http_client or httpx.AsyncClient()
+            try:
+                hs_out = await executor_node(
+                    {
+                        "focus_state": FocusState.IN_POSITION.value, "sol_balance": sol_balance,
+                        "daily_pnl_sol": daily_pnl_sol, "active_position": pos.model_dump(),
+                        "chart_positions": _sync_chart_list(pos.model_dump()),
+                        "pending_order": hs_order.model_dump(),
+                    },
+                    config=config, db=db, http_client=hs_client,
+                )
+            finally:
+                if hs_owns:
+                    await hs_client.aclose()
+            return {
+                "focus_state": hs_out["focus_state"],
+                "sol_balance": hs_out["sol_balance"],
+                "daily_pnl_sol": hs_out["daily_pnl_sol"],
+                "active_position": hs_out["active_position"],
+                "chart_positions": hs_out["chart_positions"],
+                "pending_order": hs_order.model_dump(),
+                "monitor_event": hs_reason,
+                "last_execution": hs_out.get("last_execution"),
+                "_hard_stop_already_executed": True,
+            }
 
         if peak_pnl_pct + EPS >= config.BREAKEVEN_ARM_PCT:
             pos.breakeven_armed = True

@@ -254,3 +254,182 @@ async def test_insider_scanner_enforces_5_page_pagination_cap():
     assert len(res["candidates"]) == 5
     assert page_counter["cursors"] == [None, "sig-page-1", "sig-page-2", "sig-page-3", "sig-page-4"]
     clear_helius_roster_cache()
+
+
+@pytest.mark.asyncio
+async def test_unconditional_hard_stop_loss_on_leg2_reentry_chart_and_whale_positions_at_minus_11_75_pct(tmp_path):
+    """Regression test for $MAYA:
+    Verify that when a LEG_2_REENTRY chart position (basis=0.5000 SOL) and a WHALE_SCALP position
+    (basis=0.2500 SOL) drop to -11.75% on batched_price_monitor (even with partial_tp_taken,
+    breakeven_armed, trail_armed, or when Jupiter swap/v2/order fails), HARD_STOP_LOSS immediately
+    fetches swap/v2/order (with live price fallback), executes a 100% SELL with reason='HARD_STOP_LOSS',
+    and removes both positions from chart_positions and whale_positions.
+    """
+    from batched_price_monitor import (
+        clear_price_backoff,
+        monitor_and_enforce_hard_stops,
+        needs_exact_jupiter_quote,
+    )
+    from position_monitor_node import position_monitor_node
+    from state import ActivePosition, FocusState
+    from whale_lane import run_whale_lane_tick
+
+    clear_price_backoff()
+    db = AgentDatabase(db_path=str(tmp_path / "maya_hard_stop.duckdb"), starting_sol=2.0)
+    cfg = AgentConfig(_env_file=None, HARD_STOP_LOSS_PCT=0.10, WHALE_HARD_STOP_PCT=-10.0)
+
+    maya_mint = "MayaLeg2Reentry1111111111111111111111111111"
+    whale_mint = "WhaleHardStop111111111111111111111111111111"
+
+    # $MAYA after LEG_2_REENTRY (basis=0.5000 SOL, 1,000,000 atomic units = 1.0 token at 6 decimals)
+    maya_pos = ActivePosition(
+        mint=maya_mint,
+        symbol="MAYA",
+        entry_sol=0.50,
+        initial_entry_sol=0.50,
+        remaining_cost_basis_sol=0.50,
+        token_amount=1_000_000,
+        strategy="LEG2_ENTRY",
+        reentry_count=1,
+        breakeven_armed=True,
+        trail_armed=True,
+        current_sol_value=0.50,
+        peak_sol_value=0.55,
+    )
+    # WHALE_SCALP position (basis=0.2500 SOL, 1,000,000 atomic units = 1.0 token at 6 decimals)
+    whale_pos = ActivePosition(
+        mint=whale_mint,
+        symbol="WSTOP",
+        entry_sol=0.25,
+        initial_entry_sol=0.25,
+        remaining_cost_basis_sol=0.25,
+        token_amount=1_000_000,
+        strategy="WHALE_SCALP",
+        triggering_wallets=["4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk"],
+        breakeven_armed=True,
+        trail_armed=True,
+        current_sol_value=0.25,
+        peak_sol_value=0.27,
+    )
+
+    # -11.75% on 0.5000 SOL = 0.44125 SOL; -11.75% on 0.2500 SOL = 0.220625 SOL
+    assert needs_exact_jupiter_quote(maya_pos, 0.44125, cfg) is True
+    assert needs_exact_jupiter_quote(whale_pos, 0.220625, cfg) is True
+
+    db.save_lane_positions(
+        lane="chart",
+        positions=[maya_pos.model_dump()],
+        sol_balance=1.25,
+        daily_pnl_sol=0.0,
+        focus_state=FocusState.IN_POSITION.value,
+        active_position=maya_pos.model_dump(),
+    )
+    db.save_lane_positions(
+        lane="whale",
+        positions=[whale_pos.model_dump()],
+        sol_balance=1.25,
+        daily_pnl_sol=0.0,
+    )
+
+    swap_quote_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/price/v3" in url:
+            return httpx.Response(200, json={"So11111111111111111111111111111111111111112": {"usdPrice": 200.0, "decimals": 9}})
+        if "/tokens/v1/solana/" in url:
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "chainId": "solana",
+                        "baseToken": {"address": maya_mint, "symbol": "MAYA"},
+                        "priceNative": "0.44125",  # -11.75% vs 0.5000 SOL basis
+                        "liquidity": {"usd": 65_000.0},
+                        "txns": {"m5": {"buys": 18, "sells": 22}},
+                    },
+                    {
+                        "chainId": "solana",
+                        "baseToken": {"address": whale_mint, "symbol": "WSTOP"},
+                        "priceNative": "0.220625",  # -11.75% vs 0.2500 SOL basis
+                        "liquidity": {"usd": 75_000.0},
+                        "txns": {"m5": {"buys": 15, "sells": 25}},
+                    },
+                ],
+            )
+        if "/swap/v2/order" in url:
+            in_mint = request.url.params.get("inputMint") or ""
+            swap_quote_calls.append(in_mint)
+            out_sol = 0.44125 if in_mint == maya_mint else 0.220625
+            return httpx.Response(
+                200,
+                json={"outAmount": str(int(round(out_sol * LAMPORTS_PER_SOL))), "transaction": None},
+            )
+        return httpx.Response(404)
+
+    class _NoopDecisionClient:
+        async def decide(self, **_kwargs):
+            return {}
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        # 1. Run position_monitor_node on $MAYA (LEG_2_REENTRY chart position at -11.75%)
+        st_before = db.get_state()
+        mon_chart = await position_monitor_node(
+            st_before,
+            config=cfg,
+            db=db,
+            decision_client=_NoopDecisionClient(),  # type: ignore[arg-type]
+            http_client=client,
+        )
+        assert "HARD_STOP_LOSS" in mon_chart["monitor_event"]
+        assert mon_chart["chart_positions"] == []
+        assert db.get_state()["chart_positions"] == []
+        assert maya_mint in swap_quote_calls
+        assert db.is_on_cooldown(maya_mint)
+
+        # 2. Run whale lane tick on $WSTOP (WHALE_SCALP position at -11.75%)
+        await run_whale_lane_tick(config=cfg, db=db, http_client=client)
+        assert db.get_state()["whale_positions"] == []
+        assert whale_mint in swap_quote_calls
+        assert db.is_on_cooldown(whale_mint)
+
+        # 3. Also verify direct monitor_and_enforce_hard_stops on batched_price_monitor when Jupiter /swap/v2/order fails (fallback to live price quote)
+        maya_fallback = maya_pos.model_copy(update={"mint": "MayaFallback1111111111111111111111111111111", "symbol": "MAYAFB"})
+        db.save_lane_positions(
+            lane="chart",
+            positions=[maya_fallback.model_dump()],
+            sol_balance=1.0,
+            daily_pnl_sol=0.0,
+            focus_state=FocusState.IN_POSITION.value,
+            active_position=maya_fallback.model_dump(),
+        )
+
+        def fail_jup_handler(req: httpx.Request) -> httpx.Response:
+            u = str(req.url)
+            if "/swap/v2/order" in u:
+                return httpx.Response(503, json={"error": "Jupiter unavailable"})
+            if "/tokens/v1/solana/" in u:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "chainId": "solana",
+                            "baseToken": {"address": maya_fallback.mint, "symbol": "MAYAFB"},
+                            "priceNative": "0.44125",
+                            "liquidity": {"usd": 50_000.0},
+                            "txns": {"m5": {"buys": 10, "sells": 20}},
+                        }
+                    ],
+                )
+            return httpx.Response(200, json={})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(fail_jup_handler)) as fail_client:
+            stops = await monitor_and_enforce_hard_stops(config=cfg, db=db, client=fail_client)
+            assert len(stops) == 1
+            assert "HARD_STOP_LOSS" in stops[0]["monitor_event"]
+            assert db.get_state()["chart_positions"] == []
+
+    sell_rows = db.get_action_log(actions=["SELL"], limit=10)
+    assert len(sell_rows) == 3
+    assert all("HARD_STOP_LOSS" in r["reason"] for r in sell_rows)
+    db.close()

@@ -20,7 +20,7 @@ from state import AgentGraphState, FocusState
 
 
 def _route_entry(state: AgentGraphState) -> str:
-    if state.get("focus_state") == FocusState.SCANNING.value:
+    if state.get("focus_state") == FocusState.SCANNING.value and not state.get("chart_positions"):
         return "scanner"
     return "position_monitor"
 
