@@ -352,6 +352,7 @@ async def test_whale_scalp_two_step_partial_tp_runner_trail_and_shadow_exit_on_r
         WHALE_PARTIAL_TP_TRIGGER_PCT=15.0,
         WHALE_PARTIAL_TP_SELL_FRACTION=0.50,
         WHALE_RUNNER_TRAIL_PULLBACK_PCT=10.0,
+        PAPER_TX_FEE_SOL=0.0,
     )
     now_dt = datetime.now(timezone.utc)
     mint_a = "MintWhalePartialA111111111111111111111111111"

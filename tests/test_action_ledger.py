@@ -32,7 +32,7 @@ class StubDecisionClient:
 @pytest.mark.asyncio
 async def test_action_ledger_logs_buy_sell_evict_circuit_breaker_and_csv_export(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "action_ledger.duckdb"), starting_sol=0.7)
-    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper")
+    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.0)
     now_dt = datetime(2026, 11, 19, 20, 0, 0, tzinfo=timezone.utc)
 
     # 1. Safety Gate EVICT

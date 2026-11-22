@@ -41,6 +41,7 @@ class AgentConfig(BaseSettings):
 
     # Narrowed Risk Parameters & Dual-Lane 3+3 Concurrency
     PAPER_STARTING_SOL: float = Field(default=0.7, gt=0.0)
+    PAPER_TX_FEE_SOL: float = Field(default=0.001, ge=0.0)
     TRADE_SIZE_SOL: float = Field(default=0.5, gt=0.0)
     MAX_CHART_POSITIONS: int = Field(default=3, ge=1)
     MAX_WHALE_POSITIONS: int = Field(default=3, ge=1)

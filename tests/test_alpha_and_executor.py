@@ -106,7 +106,7 @@ async def test_alpha_node_single_batched_decision_1_call(tmp_path):
 @pytest.mark.asyncio
 async def test_executor_paper_mode_omits_taker_and_logs_out_amount(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "exec_paper.duckdb"), starting_sol=0.7)
-    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", JUPITER_API_KEY="jup-secret")
+    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", JUPITER_API_KEY="jup-secret", PAPER_TX_FEE_SOL=0.0)
 
     seen_params = {}
 

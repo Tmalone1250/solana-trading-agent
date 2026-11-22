@@ -31,6 +31,7 @@ async def test_concurrent_chart_and_whale_slots_and_duplicate_mint_guard(tmp_pat
         WHALE_MIN_UNIQUE_WALLETS=2,
         WHALE_MIN_LIQ_USD=40_000.0,
         ENABLE_JUPITER_DISCOVERY=False,
+        PAPER_TX_FEE_SOL=0.0,
     )
     now_dt = datetime.now(timezone.utc)
     chart_mint = "MintChartOpen111111111111111111111111111111"

@@ -11,6 +11,7 @@ import duckdb
 
 from action_export import ACTION_LOG_COLUMNS, ACTION_LOG_MIGRATIONS
 from memory_guard import configure_duckdb_connection, prune_duckdb_tables
+from outcome_tracker import ensure_outcomes_table
 from state import FocusState
 
 
@@ -53,6 +54,7 @@ class AgentDatabase:
 
     def _init_schema(self) -> None:
         with self._lock:
+            ensure_outcomes_table(self._conn)
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS agent_state (

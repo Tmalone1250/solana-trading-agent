@@ -18,6 +18,7 @@ from ohlcv_client import (
     fetch_ohlcv_batch,
     should_fetch_1m_fallback,
 )
+from outcome_tracker import record_outcome_snapshot
 from scalper_entry_engine import ScalperEntryResult, evaluate_scalper_entry
 from state import (
     AgentGraphState,
@@ -550,6 +551,14 @@ async def alpha_node(
             vamp_score=round(dec.is_copycat_vamp, 3),
             buy_confidence=round(dec.action_confidence, 3),
             **bt_log_kwargs,
+        )
+        out_decision = "ENTERED" if approved else ("BLOCKED" if (dec.action == "BUY" or decision1_wants_buy) else ("WATCH" if dec.action == "WATCH" else "REJECTED"))
+        record_outcome_snapshot(
+            db, mint=dec.mint, symbol=dec.symbol, source="CHART_ALPHA", decision=out_decision,
+            decision_reason=dec_reason, strategy="LEG2_ENTRY" if (approved and leg2_fast_track and not standard_approved) else scalper.setup_type,
+            entry_price_usd=float(cand.get("price_usd") or 0.0) or None, entry_mc_usd=cand_mc, entry_liq_usd=cand_liq,
+            breakout_score=bt.get("score"), breakout_state=bt.get("state"), leg2_score=leg2_score,
+            vamp_score=dec.is_copycat_vamp, rsi=scalper.rsi_5m, now=now_dt,
         )
 
         if approved:

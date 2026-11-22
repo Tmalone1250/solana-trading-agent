@@ -141,7 +141,7 @@ async def test_breakeven_shield_arms_at_plus_8_and_exits_at_plus_2(tmp_path):
 @pytest.mark.asyncio
 async def test_trailing_tp_plus_12_minus_6_transitions_to_watching_and_leg2_reentry(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "trail_leg2.duckdb"), starting_sol=0.7)
-    cfg = AgentConfig(_env_file=None)
+    cfg = AgentConfig(_env_file=None, PAPER_TX_FEE_SOL=0.0)
     leg2_approve = StubDecisionClient(
         {
             "leg_2_momentum": {"type": "score", "score": 4.1, "confidence": 0.90},
@@ -285,7 +285,7 @@ async def test_langgraph_end_to_end_and_telemetry_api(tmp_path):
     clear_geckoterminal_cache()
     clear_ohlcv_cache()
     db = AgentDatabase(db_path=str(tmp_path / "e2e.duckdb"), starting_sol=0.7)
-    cfg = AgentConfig(_env_file=None, HUNTING_LANE="graduations", OHLCV_PACING_DELAY_SECONDS=0.0)
+    cfg = AgentConfig(_env_file=None, HUNTING_LANE="graduations", OHLCV_PACING_DELAY_SECONDS=0.0, PAPER_TX_FEE_SOL=0.0)
     # Pre-seed MintGrad in active_watchlist soaked for 5m so the Scalper Entry Engine allows entry
     db.upsert_watchlist_entry(
         mint="MintGrad11111111111111111111111111111111111",
@@ -526,6 +526,7 @@ async def test_two_step_partial_tp_scale_out_and_runner_trail_and_breakeven(tmp_
         PARTIAL_TP_TRIGGER_PCT=15.0,
         PARTIAL_TP_SELL_FRACTION=0.50,
         RUNNER_TRAIL_PULLBACK_PCT=10.0,
+        PAPER_TX_FEE_SOL=0.0,
     )
     dec = StubDecisionClient({})
     mint = "MintPartialTP1111111111111111111111111111111"

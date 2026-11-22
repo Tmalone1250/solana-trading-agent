@@ -13,6 +13,7 @@ from db import AgentDatabase
 from decision_client import GeminiDecisionClient
 from graph import build_agent_graph
 from memory_guard import maybe_log_rss_memory
+from outcome_tracker import run_outcome_tracker_loop
 from state import FocusState
 from telemetry_api import create_telemetry_app
 from whale_lane import run_whale_lane_tick
@@ -155,10 +156,12 @@ async def main() -> None:
         if config.ENABLE_X_DISCOVERY
         else None
     )
+    outcome_task = asyncio.create_task(run_outcome_tracker_loop(config, db, http_client=shared_http_client))
     try:
         await server.serve()
     finally:
         agent_task.cancel()
+        outcome_task.cancel()
         if whale_task is not None:
             whale_task.cancel()
         if x_task is not None:

@@ -13,6 +13,7 @@ import httpx
 from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
 from db import AgentDatabase, utc_now
 from memory_guard import prune_timestamped_cache
+from outcome_tracker import record_outcome_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -435,6 +436,11 @@ def process_helius_webhook_payload(
             st = db.get_state()
             if st.get("whale_position") is not None:
                 db.upsert_whale_decision(ev["mint"], "SKIPPED", "POSITION_OPEN", updated_at=now_dt.isoformat())
+            record_outcome_snapshot(
+                db, mint=ev["mint"], symbol=ev["token_symbol"], source="WHALE_WEBHOOK", decision="WHALE_BUY",
+                decision_reason="WHALE_BUY", strategy="WHALE_SCALP", whale_sol_flow=ev["sol_amount"],
+                triggering_wallet=config.resolve_wallet_label(ev["wallet"]), now=now_dt,
+            )
         db.log_action(
             mode=config.EXECUTION_MODE,
             action="WHALE_WEBHOOK",

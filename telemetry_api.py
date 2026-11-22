@@ -21,6 +21,7 @@ from helius_webhook import (
 )
 from insider_scanner import InsiderScanRequest, run_insider_scan
 from ohlcv_client import get_cached_breakout_telemetry
+from outcome_tracker import render_outcomes_csv
 
 
 def create_telemetry_app(
@@ -418,6 +419,14 @@ def create_telemetry_app(
         actions: Optional[str] = Query(default=None),
     ) -> Response:
         return _build_csv_export(limit=limit, export_type=export_type, actions=actions)
+
+    @app.get("/api/export/outcomes-csv")
+    def export_outcomes_csv(limit: int = Query(default=2000, ge=1, le=20_000)) -> Response:
+        return Response(
+            content=render_outcomes_csv(database, limit=limit),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="candidate_outcomes.csv"'},
+        )
 
     @app.post("/api/webhooks/helius")
     async def helius_webhook(

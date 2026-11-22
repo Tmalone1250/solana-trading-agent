@@ -201,6 +201,7 @@ async def executor_node(
 
     sol_balance = float(state.get("sol_balance") or 0.0)
     daily_pnl_sol = float(state.get("daily_pnl_sol") or 0.0)
+    tx_fee_sol = float(config.PAPER_TX_FEE_SOL) if config.EXECUTION_MODE == "paper" else 0.0
     existing_pos_dict = (
         state.get("whale_position") if is_whale_slot else state.get("active_position")
     )
@@ -211,7 +212,8 @@ async def executor_node(
 
     if is_buy:
         spent_sol = order.amount_atomic / LAMPORTS_PER_SOL
-        sol_balance = max(0.0, sol_balance - spent_sol)
+        sol_balance = round(max(0.0, sol_balance - spent_sol - tx_fee_sol), 6)
+        daily_pnl_sol = round(daily_pnl_sol - tx_fee_sol, 6)
         pos_strategy = order.strategy or "SCALPER"
         prev_reentries = (
             int(existing_pos_dict.get("reentry_count") or 0)
@@ -267,9 +269,9 @@ async def executor_node(
         if pos_obj.current_sol_value > 0 and received_sol >= pos_obj.current_sol_value * 0.90 and frac <= 0.60:
             received_sol = round(received_sol * frac, 6)
         cost_of_sold = round(pos_obj.initial_entry_sol * frac, 6)
-        partial_pnl = round(received_sol - cost_of_sold, 6)
+        partial_pnl = round(received_sol - cost_of_sold - tx_fee_sol, 6)
         partial_pnl_pct = (partial_pnl / cost_of_sold) if cost_of_sold > 0 else 0.0
-        sol_balance = round(sol_balance + received_sol, 6)
+        sol_balance = round(max(0.0, sol_balance + received_sol - tx_fee_sol), 6)
         daily_pnl_sol = round(daily_pnl_sol + partial_pnl, 6)
 
         rem_tokens = max(0, int(pos_obj.token_amount) - int(order.amount_atomic))
@@ -317,7 +319,7 @@ async def executor_node(
         )
     else:
         received_sol = out_amount / LAMPORTS_PER_SOL
-        sol_balance += received_sol
+        sol_balance = round(max(0.0, sol_balance + received_sol - tx_fee_sol), 6)
         ex_dict = existing_pos_dict if isinstance(existing_pos_dict, dict) else {}
         entry_sol = float(ex_dict.get("entry_sol", 0.0))
         partial_taken = bool(ex_dict.get("partial_tp_taken", False))
@@ -325,10 +327,10 @@ async def executor_node(
         cost_basis = rem_basis_val if (partial_taken and rem_basis_val > 0) else entry_sol
         if partial_taken and entry_sol > 0 and cost_basis < entry_sol and received_sol > entry_sol * 0.80:
             received_sol = round(received_sol * (cost_basis / entry_sol), 6)
-            sol_balance = round(float(state.get("sol_balance") or 0.0) + received_sol, 6)
-        pnl_sol = received_sol - cost_basis if cost_basis > 0 else 0.0
+            sol_balance = round(max(0.0, float(state.get("sol_balance") or 0.0) + received_sol - tx_fee_sol), 6)
+        pnl_sol = round((received_sol - cost_basis - tx_fee_sol) if cost_basis > 0 else -tx_fee_sol, 6)
         pnl_pct = (pnl_sol / cost_basis) if cost_basis > 0 else 0.0
-        daily_pnl_sol += pnl_sol
+        daily_pnl_sol = round(daily_pnl_sol + pnl_sol, 6)
 
         existing_strat = str(ex_dict.get("strategy") or "").strip()
         db_buy_strat = db.get_latest_buy_strategy(order.mint)
