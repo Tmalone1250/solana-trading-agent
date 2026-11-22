@@ -193,6 +193,13 @@ def estimate_position_sol_value(
     return pos.current_sol_value or pos.entry_sol
 
 
+def active_cost_basis_sol(pos: ActivePosition) -> float:
+    """Return remaining_cost_basis_sol once partial TP is taken, otherwise initial entry_sol."""
+    if getattr(pos, "partial_tp_taken", False) and float(getattr(pos, "remaining_cost_basis_sol", 0.0) or 0.0) > 0:
+        return float(pos.remaining_cost_basis_sol)
+    return float(pos.entry_sol)
+
+
 def apply_dex_flow_and_pnl(
     pos: ActivePosition,
     *,
@@ -221,21 +228,22 @@ def apply_dex_flow_and_pnl(
             current_liq = round(float(flow.get("liquidity_usd") or 0.0), 2)
             pos.last_liquidity_usd = current_liq
 
+    basis = active_cost_basis_sol(pos)
     pos.current_sol_value = round(current_sol_value, 6)
     if current_sol_value > pos.peak_sol_value:
         pos.peak_sol_value = round(current_sol_value, 6)
-    pnl_sol = (current_sol_value - pos.entry_sol) if pos.entry_sol > 0 else 0.0
-    pnl_pct = ((pnl_sol / pos.entry_sol) * 100.0) if pos.entry_sol > 0 else 0.0
+    pnl_sol = (current_sol_value - basis) if basis > 0 else 0.0
+    pnl_pct = ((pnl_sol / basis) * 100.0) if basis > 0 else 0.0
     pos.pnl_sol = round(pnl_sol, 6)
     pos.pnl_pct = round(pnl_pct, 2)
 
     logger.info(
-        "[Monitor] [%s] $%s (%s..): val=%.4f SOL (entry=%.4f, peak=%.4f, PnL=%+.4f SOL / %+.2f%%) | liq=$%.0f | 5m_buy=%.0f%%",
+        "[Monitor] [%s] $%s (%s..): val=%.4f SOL (basis=%.4f, peak=%.4f, PnL=%+.4f SOL / %+.2f%%) | liq=$%.0f | 5m_buy=%.0f%%",
         lane_label,
         pos.symbol,
         pos.mint[:6],
         pos.current_sol_value,
-        pos.entry_sol,
+        basis,
         pos.peak_sol_value,
         pos.pnl_sol,
         pos.pnl_pct,
@@ -253,29 +261,26 @@ def needs_exact_jupiter_quote(
     now_dt: Optional[datetime] = None,
     proximity_pct: float = 2.0,
 ) -> bool:
-    """Return True only when estimated PnL is within 2% of Hard Stop, BE Shield, Trailing TP, or Whale exit."""
-    if pos.entry_sol <= 0:
+    """Return True only when estimated PnL is within 2% of Hard Stop, BE Shield, Partial TP, Trailing TP, or Whale exit."""
+    basis = active_cost_basis_sol(pos)
+    if basis <= 0:
         return True
-    pnl_pct_100 = ((estimated_sol_value - pos.entry_sol) / pos.entry_sol) * 100.0
+    pnl_pct_100 = ((estimated_sol_value - basis) / basis) * 100.0
     peak_sol = max(pos.peak_sol_value, estimated_sol_value)
-    peak_pct_100 = ((peak_sol - pos.entry_sol) / pos.entry_sol) * 100.0
+    peak_pct_100 = ((peak_sol - basis) / basis) * 100.0
     is_whale = str(pos.strategy or "").upper() == "WHALE_SCALP"
 
     if is_whale:
         if pos.whale_shadow_exit_flag:
             return True
-        # Near hard stop (-10% -> <= -8%)
         if pnl_pct_100 <= config.WHALE_HARD_STOP_PCT + proximity_pct:
             return True
-        # Near Front-Run TP (+15% -> >= +13%)
         if pnl_pct_100 >= config.WHALE_TP_PCT - proximity_pct:
             return True
-        # Near Whale Breakeven Shield (+1% floor when armed -> <= +3%)
         if (pos.breakeven_armed or peak_pct_100 >= config.WHALE_BREAKEVEN_ARM_PCT) and (
             pnl_pct_100 <= config.WHALE_BREAKEVEN_FLOOR_PCT + proximity_pct
         ):
             return True
-        # Near 2-Tier Peak Trail drop
         if (pos.trail_armed or peak_pct_100 >= config.WHALE_TRAIL_ARM_PCT) and peak_sol > 0:
             drop_limit = (
                 config.WHALE_TIGHT_TRAIL_DROP_PCT
@@ -285,7 +290,6 @@ def needs_exact_jupiter_quote(
             drop_pct = ((peak_sol - estimated_sol_value) / peak_sol) * 100.0
             if drop_pct >= max(0.0, drop_limit - proximity_pct):
                 return True
-        # Near Time Stop
         if pos.opened_at:
             try:
                 o_dt = datetime.fromisoformat(pos.opened_at)
@@ -298,7 +302,9 @@ def needs_exact_jupiter_quote(
                 pass
         return False
 
-    # Regular Chart position thresholds
+    # Regular Chart position thresholds (+15% Partial TP & -10% Runner Trail)
+    if not pos.partial_tp_taken and pnl_pct_100 >= config.PARTIAL_TP_TRIGGER_PCT - proximity_pct:
+        return True
     hard_stop_100 = -config.HARD_STOP_LOSS_PCT * 100.0
     if pnl_pct_100 <= hard_stop_100 + proximity_pct:
         return True
@@ -307,8 +313,10 @@ def needs_exact_jupiter_quote(
     if (pos.breakeven_armed or peak_pct_100 >= be_arm_100) and pnl_pct_100 <= be_floor_100 + proximity_pct:
         return True
     trail_arm_100 = config.TRAIL_ARM_PCT * 100.0
-    trail_drop_100 = config.TRAIL_PULLBACK_PCT * 100.0
-    if (pos.trail_armed or peak_pct_100 >= trail_arm_100) and peak_sol > 0:
+    raw_runner_drop = float(config.RUNNER_TRAIL_PULLBACK_PCT)
+    runner_drop_100 = raw_runner_drop if raw_runner_drop >= 1.0 else raw_runner_drop * 100.0
+    trail_drop_100 = runner_drop_100 if pos.partial_tp_taken else (config.TRAIL_PULLBACK_PCT * 100.0)
+    if (pos.trail_armed or pos.partial_tp_taken or peak_pct_100 >= trail_arm_100) and peak_sol > 0:
         drop_pct = ((peak_sol - estimated_sol_value) / peak_sol) * 100.0
         if drop_pct >= max(0.0, trail_drop_100 - proximity_pct):
             return True

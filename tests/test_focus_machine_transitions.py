@@ -155,16 +155,16 @@ async def test_trailing_tp_plus_12_minus_6_transitions_to_watching_and_leg2_reen
         "active_position": _base_in_position(0.5),
     }
 
-    # Tick 1: Runs to +20% (0.60 SOL) -> arms trailing TP (+12%)
-    async with _make_monitor_client(sol_quote=0.60) as client:
+    # Tick 1: Runs to +14% (0.57 SOL) -> arms trailing TP (+12%) below the +15% partial TP threshold
+    async with _make_monitor_client(sol_quote=0.57) as client:
         mon1 = await position_monitor_node(state, config=cfg, db=db, decision_client=leg2_approve, http_client=client)  # type: ignore[arg-type]
         assert mon1["pending_order"] is None
         assert mon1["active_position"]["trail_armed"] is True
-        assert pytest.approx(mon1["active_position"]["peak_sol_value"]) == 0.60
+        assert pytest.approx(mon1["active_position"]["peak_sol_value"]) == 0.57
 
-    # Tick 2: Pulls back -6.5% from 0.60 peak -> 0.561 SOL -> sells 100% -> WATCHING_REENTRY
+    # Tick 2: Pulls back -6.5% from 0.57 peak -> 0.533 SOL -> sells 100% -> WATCHING_REENTRY
     state.update(mon1)
-    async with _make_monitor_client(sol_quote=0.561) as client:
+    async with _make_monitor_client(sol_quote=0.533) as client:
         mon2 = await position_monitor_node(state, config=cfg, db=db, decision_client=leg2_approve, http_client=client)  # type: ignore[arg-type]
         assert mon2["pending_order"] is not None
         assert "TRAILING_TP" in mon2["pending_order"]["reason"]
@@ -174,7 +174,7 @@ async def test_trailing_tp_plus_12_minus_6_transitions_to_watching_and_leg2_reen
 
     assert ex_sell["focus_state"] == FocusState.WATCHING_REENTRY.value
     assert not db.is_on_cooldown("MintFocus1111111111111111111111111111111111")
-    assert pytest.approx(ex_sell["sol_balance"], rel=1e-4) == 0.761
+    assert pytest.approx(ex_sell["sol_balance"], rel=1e-4) == 0.733
 
     # Tick 3 (WATCHING_REENTRY): Retraces lower to 0.52 SOL (updates retrace_low)
     state.update(ex_sell)
@@ -514,4 +514,141 @@ async def test_max_reentries_per_mint_puts_mint_on_cooldown_after_second_reentry
     assert ex["focus_state"] == FocusState.SCANNING.value
     assert ex["active_position"] is None
     assert db.is_on_cooldown(mint)
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_two_step_partial_tp_scale_out_and_runner_trail_and_breakeven(tmp_path):
+    """Verify Step 1 (50% scale-out at +15%) and Step 2 (runner -10% trailing stop & +2% breakeven floor)."""
+    db = AgentDatabase(db_path=str(tmp_path / "partial_tp.duckdb"), starting_sol=0.7)
+    cfg = AgentConfig(
+        _env_file=None,
+        PARTIAL_TP_TRIGGER_PCT=15.0,
+        PARTIAL_TP_SELL_FRACTION=0.50,
+        RUNNER_TRAIL_PULLBACK_PCT=10.0,
+    )
+    dec = StubDecisionClient({})
+    mint = "MintPartialTP1111111111111111111111111111111"
+    start_pos = ActivePosition(
+        mint=mint,
+        symbol="PART",
+        entry_sol=0.50,
+        token_amount=1_000_000,
+        strategy="BREAKOUT_IGNITION",
+        entry_liquidity_usd=100_000.0,
+        current_sol_value=0.50,
+        peak_sol_value=0.50,
+        reference_token_amount=1_000_000,
+    ).model_dump()
+
+    # Proportional Jupiter mock: quotes SOL value proportional to input `amount`
+    unit_sol_price = {"val": 0.575 / 1_000_000}  # +15% on 0.50 SOL (1,000,000 tokens -> 0.575 SOL)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/swap/v2/order" in url:
+            amt = int(request.url.params.get("amount") or 1_000_000)
+            out_sol = amt * unit_sol_price["val"]
+            return httpx.Response(200, json={"outAmount": str(int(round(out_sol * 1_000_000_000))), "transaction": None})
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "chainId": "solana",
+                    "baseToken": {"address": mint, "symbol": "PART"},
+                    "priceNative": f"{unit_sol_price['val'] * (10 ** 6):.10f}",
+                    "liquidity": {"usd": 100_000.0},
+                    "txns": {"m5": {"buys": 55, "sells": 25}},
+                }
+            ],
+        )
+
+    state = {
+        "focus_state": FocusState.IN_POSITION.value,
+        "sol_balance": 0.20,
+        "daily_pnl_sol": 0.0,
+        "active_position": start_pos,
+        "chart_positions": [start_pos],
+    }
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        # Tick 1: Price hits +15% (0.575 SOL total) -> Step 1 Partial TP sells 50% (500,000 tokens for 0.2875 SOL)
+        mon1 = await position_monitor_node(state, config=cfg, db=db, decision_client=dec, http_client=client)  # type: ignore[arg-type]
+        assert mon1["focus_state"] == FocusState.IN_POSITION.value
+        assert mon1["pending_order"] is None
+        assert mon1["monitor_event"] == "PARTIAL_TP_50PCT (+15%)"
+        pos1 = mon1["active_position"]
+        assert pos1["partial_tp_taken"] is True
+        assert pos1["token_amount"] == 500_000
+        assert pytest.approx(pos1["initial_entry_sol"]) == 0.50
+        assert pytest.approx(pos1["remaining_cost_basis_sol"]) == 0.25
+        assert pytest.approx(pos1["realized_partial_pnl_sol"]) == 0.0375
+        assert pos1["breakeven_armed"] is True
+        assert pos1["trail_armed"] is True
+        assert pytest.approx(mon1["sol_balance"]) == 0.4875  # 0.20 + 0.2875 proceeds
+        assert pytest.approx(mon1["daily_pnl_sol"]) == 0.0375  # 0.2875 - 0.25 cost
+
+        # Verify PARTIAL_SELL row logged in DuckDB trades & action_log + telemetry API exposes partial fields
+        partial_rows = db.get_action_log(actions=["PARTIAL_SELL"], limit=5)
+        assert len(partial_rows) == 1
+        assert partial_rows[0]["reason"] == "PARTIAL_TP_50PCT (+15%)"
+        assert pytest.approx(partial_rows[0]["pnl_amount"]) == 0.0375
+
+        app = create_telemetry_app(config=cfg, db=db)
+        t_resp = TestClient(app).get("/api/telemetry").json()
+        assert t_resp["chart_positions"][0]["partial_tp_taken"] is True
+        assert pytest.approx(t_resp["chart_positions"][0]["realized_partial_pnl_sol"]) == 0.0375
+
+        # Tick 2: Runner climbs to +20% (500,000 tokens worth 0.30 SOL on 0.25 SOL remaining basis) -> does NOT re-fire partial TP
+        state.update(mon1)
+        unit_sol_price["val"] = 0.30 / 500_000
+        mon2 = await position_monitor_node(state, config=cfg, db=db, decision_client=dec, http_client=client)  # type: ignore[arg-type]
+        assert mon2["pending_order"] is None
+        assert mon2["monitor_event"] == "HOLD_IN_POSITION"
+        assert pytest.approx(mon2["active_position"]["peak_sol_value"]) == 0.30
+        assert len(db.get_action_log(actions=["PARTIAL_SELL"], limit=10)) == 1
+
+        # Tick 3: Runner pulls back -8% from 0.30 peak (to 0.276 SOL) -> survives without exiting (-8% < -10% runner trail)
+        state.update(mon2)
+        unit_sol_price["val"] = 0.276 / 500_000
+        mon3 = await position_monitor_node(state, config=cfg, db=db, decision_client=dec, http_client=client)  # type: ignore[arg-type]
+        assert mon3["pending_order"] is None
+        assert mon3["monitor_event"] == "HOLD_IN_POSITION"
+
+        # Tick 4: Runner pulls back -10% from 0.30 peak (to 0.270 SOL) -> triggers TRAILING_TP exit
+        state.update(mon3)
+        unit_sol_price["val"] = 0.270 / 500_000
+        mon4 = await position_monitor_node(state, config=cfg, db=db, decision_client=dec, http_client=client)  # type: ignore[arg-type]
+        assert mon4["pending_order"] is not None
+        assert "TRAILING_TP" in mon4["pending_order"]["reason"]
+        assert "-10%" in mon4["pending_order"]["reason"]
+        state.update(mon4)
+        ex_runner = await executor_node(state, config=cfg, db=db, http_client=client)
+        assert ex_runner["chart_positions"] == []
+        assert pytest.approx(ex_runner["sol_balance"]) == 0.7575  # 0.4875 + 0.270
+        assert pytest.approx(ex_runner["daily_pnl_sol"]) == 0.0575  # 0.0375 partial + 0.020 runner
+
+        # Also verify +2% Breakeven Floor protection on a runner that drops to +1.6% (0.254 SOL on 0.25 basis) before peak climbs
+        be_runner = dict(
+            mon1["active_position"],
+            peak_sol_value=0.28,  # -9.3% pullback to 0.254 (< -10% trail), so Breakeven Shield (+2% = 0.255 SOL) catches it
+            current_sol_value=0.28,
+        )
+        unit_sol_price["val"] = 0.254 / 500_000
+        mon_be = await position_monitor_node(
+            {
+                "focus_state": FocusState.IN_POSITION.value,
+                "sol_balance": 0.4875,
+                "daily_pnl_sol": 0.0375,
+                "active_position": be_runner,
+                "chart_positions": [be_runner],
+            },
+            config=cfg,
+            db=db,
+            decision_client=dec,  # type: ignore[arg-type]
+            http_client=client,
+        )
+        assert mon_be["pending_order"] is not None
+        assert "BREAKEVEN_SHIELD" in mon_be["pending_order"]["reason"]
+
     db.close()

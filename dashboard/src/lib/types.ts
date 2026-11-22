@@ -7,6 +7,10 @@ export interface LiveJupiterPnl {
   strategy?: string;
   triggering_wallets?: string[];
   entry_sol: number;
+  initial_entry_sol?: number;
+  remaining_cost_basis_sol?: number;
+  partial_tp_taken?: boolean;
+  realized_partial_pnl_sol?: number;
   current_sol_value: number;
   peak_sol_value: number;
   pnl_sol: number;

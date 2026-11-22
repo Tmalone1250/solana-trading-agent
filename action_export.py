@@ -74,7 +74,7 @@ ACTION_LOG_MIGRATIONS: list[tuple[str, str]] = [
 
 EXPORT_TYPE_ACTIONS: dict[str, Optional[list[str]]] = {
     "all": None,
-    "trades": ["BUY", "SELL", "REENTRY_BUY"],
+    "trades": ["BUY", "SELL", "PARTIAL_SELL", "REENTRY_BUY"],
     "whales": ["WHALE_WEBHOOK", "WHALE_CONFLUENCE", "WHALE_DISCOVERY"],
     "watchlist": ["DECISION_1", "EVICT", "CIRCUIT_BREAKER"],
 }

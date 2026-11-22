@@ -10,6 +10,7 @@ import httpx
 
 from alpha_node import evaluate_leg2_reentry
 from batched_price_monitor import (
+    active_cost_basis_sol,
     apply_dex_flow_and_pnl,
     estimate_position_sol_value,
     fetch_batched_sol_prices,
@@ -18,38 +19,12 @@ from batched_price_monitor import (
 from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
 from db import AgentDatabase, utc_now
 from decision_client import GeminiDecisionClient
-from executor_node import fetch_jupiter_order
+from executor_node import executor_node, fetch_jupiter_order
 from leg2_predictor import compute_leg2_score
 from state import ActivePosition, AgentGraphState, FocusState, PendingOrder
 
 logger = logging.getLogger(__name__)
 EPS = 1e-9
-
-
-async def fetch_dexscreener_5m_flow(
-    mint: str,
-    config: AgentConfig,
-    client: httpx.AsyncClient,
-) -> dict[str, Any]:
-    """Fetch latest 5m buys/sells and liquidity USD for a single mint from DexScreener."""
-    url = f"{config.DEXSCREENER_BASE_URL}/tokens/v1/solana/{mint}"
-    resp = await client.get(url, timeout=10.0)
-    resp.raise_for_status()
-    data = resp.json()
-    pairs = data if isinstance(data, list) else (data.get("pairs") or [])
-    if not pairs:
-        return {"buys_5m": 0, "sells_5m": 0, "liquidity_usd": 0.0, "pair": {}}
-
-    # Select highest-liquidity Solana pair
-    sol_pairs = [p for p in pairs if str(p.get("chainId", "")).lower() == "solana"] or pairs
-    best = max(sol_pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0.0))
-    m5 = (best.get("txns") or {}).get("m5") or {}
-    return {
-        "buys_5m": int(m5.get("buys") or 0),
-        "sells_5m": int(m5.get("sells") or 0),
-        "liquidity_usd": float((best.get("liquidity") or {}).get("usd") or 0.0),
-        "pair": best,
-    }
 
 
 def _compute_exodus(
@@ -70,16 +45,12 @@ def _compute_exodus(
     )
     if total_5m > 0 and sell_ratio >= config.EXODUS_SELL_RATIO:
         return (
-            True,
-            sell_ratio,
-            liq_drop_pct,
+            True, sell_ratio, liq_drop_pct,
             f"EXODUS_SELL_FLOW (5m sells={sell_ratio * 100:.1f}% >= {config.EXODUS_SELL_RATIO * 100:.0f}%)",
         )
     if entry_liquidity_usd > 0 and current_liquidity_usd > 0 and liq_drop_pct >= config.EXODUS_LIQ_DROP_PCT:
         return (
-            True,
-            sell_ratio,
-            liq_drop_pct,
+            True, sell_ratio, liq_drop_pct,
             f"EXODUS_LIQ_DROP (liq drop={liq_drop_pct * 100:.1f}% >= {config.EXODUS_LIQ_DROP_PCT * 100:.0f}%)",
         )
     return (False, sell_ratio, liq_drop_pct, "")
@@ -128,13 +99,8 @@ async def position_monitor_node(
             pos.decimals = int(flow["decimals"])
         est_sol = estimate_position_sol_value(pos, sol_prices.get(pos.mint), token_decimals=pos.decimals)
         current_sol_value, _ = await resolve_position_sol_value(
-            pos,
-            estimated_sol_value=est_sol,
-            config=config,
-            client=client,
-            now_dt=now_dt,
-            has_batched_price=(pos.mint in sol_prices),
-            quote_amount=quote_amount,
+            pos, estimated_sol_value=est_sol, config=config, client=client,
+            now_dt=now_dt, has_batched_price=(pos.mint in sol_prices), quote_amount=quote_amount,
         )
         # Also refresh any additional open chart positions (slots 2 & 3) in-place
         updated_extra_charts: list[dict[str, Any]] = []
@@ -160,11 +126,8 @@ async def position_monitor_node(
     total_5m = buys_5m + sells_5m
 
     is_exodus, sell_ratio_5m, _, exodus_reason = _compute_exodus(
-        buys_5m=buys_5m,
-        sells_5m=sells_5m,
-        entry_liquidity_usd=pos.entry_liquidity_usd,
-        current_liquidity_usd=current_liq,
-        config=config,
+        buys_5m=buys_5m, sells_5m=sells_5m,
+        entry_liquidity_usd=pos.entry_liquidity_usd, current_liquidity_usd=current_liq, config=config,
     )
     pos.last_5m_sell_ratio = sell_ratio_5m
 
@@ -183,72 +146,74 @@ async def position_monitor_node(
         if current_sol_value > pos.peak_sol_value:
             pos.peak_sol_value = current_sol_value
 
-        pnl_pct = (current_sol_value - pos.entry_sol) / pos.entry_sol if pos.entry_sol > 0 else 0.0
-        peak_pnl_pct = (pos.peak_sol_value - pos.entry_sol) / pos.entry_sol if pos.entry_sol > 0 else 0.0
+        cost_basis = active_cost_basis_sol(pos)
+        pnl_pct = (current_sol_value - cost_basis) / cost_basis if cost_basis > 0 else 0.0
+        peak_pnl_pct = (pos.peak_sol_value - cost_basis) / cost_basis if cost_basis > 0 else 0.0
+        pnl_pct_100 = pnl_pct * 100.0
 
-        # ---------------------------------------------------------------------
         # Dedicated WHALE_SCALP 6-Layer Exit Engine (delegated to whale_lane.py)
-        # ---------------------------------------------------------------------
         if str(pos.strategy or "").upper() == "WHALE_SCALP":
             from whale_lane import evaluate_whale_exit_order
 
             now_dt = now or utc_now()
             exit_order, monitor_event = evaluate_whale_exit_order(
-                pos,
-                current_sol_value=current_sol_value,
-                config=config,
-                db=db,
-                now_dt=now_dt,
+                pos, current_sol_value=current_sol_value, config=config, db=db, now_dt=now_dt,
             )
             if exit_order is not None:
-                return {
-                    "active_position": pos.model_dump(),
-                    "pending_order": exit_order.model_dump(),
-                    "monitor_event": monitor_event,
-                }
+                return {"active_position": pos.model_dump(), "pending_order": exit_order.model_dump(), "monitor_event": monitor_event}
             pos_dict = pos.model_dump()
-            db.save_state(
-                focus_state=FocusState.IN_POSITION.value,
-                sol_balance=sol_balance,
-                daily_pnl_sol=daily_pnl_sol,
-                active_position=pos_dict,
-            )
-            return {
-                "active_position": pos_dict,
-                "pending_order": None,
-                "monitor_event": monitor_event,
-            }
+            db.save_state(focus_state=FocusState.IN_POSITION.value, sol_balance=sol_balance, daily_pnl_sol=daily_pnl_sol, active_position=pos_dict)
+            return {"active_position": pos_dict, "pending_order": None, "monitor_event": monitor_event}
 
         if peak_pnl_pct + EPS >= config.BREAKEVEN_ARM_PCT:
             pos.breakeven_armed = True
         if peak_pnl_pct + EPS >= config.TRAIL_ARM_PCT:
             pos.trail_armed = True
 
+        # Step 1 — 2-Step Partial Take-Profit (Scale-Out 50% at +15%)
+        if not pos.partial_tp_taken and pos.token_amount >= 2 and pnl_pct_100 + EPS >= config.PARTIAL_TP_TRIGGER_PCT:
+            sell_qty = int(pos.token_amount * config.PARTIAL_TP_SELL_FRACTION)
+            if sell_qty > 0:
+                partial_reason = f"PARTIAL_TP_50PCT (+{config.PARTIAL_TP_TRIGGER_PCT:.0f}%)"
+                partial_order = PendingOrder(
+                    side="PARTIAL_SELL", mint=pos.mint, symbol=pos.symbol, amount_atomic=sell_qty,
+                    reason=partial_reason, target_state_after_fill=FocusState.IN_POSITION,
+                    apply_cooldown=False, strategy=pos.strategy or "SCALPER",
+                    rationale=f"[MONITOR PARTIAL TP] {pos.symbol}: {partial_reason} ({pnl_pct_100:+.2f}%)",
+                )
+                p_client_owns = http_client is None
+                p_client = http_client or httpx.AsyncClient()
+                try:
+                    p_out = await executor_node(
+                        {
+                            "focus_state": FocusState.IN_POSITION.value, "sol_balance": sol_balance,
+                            "daily_pnl_sol": daily_pnl_sol, "active_position": pos.model_dump(),
+                            "chart_positions": _sync_chart_list(pos.model_dump()),
+                            "pending_order": partial_order.model_dump(),
+                        },
+                        config=config, db=db, http_client=p_client,
+                    )
+                finally:
+                    if p_client_owns:
+                        await p_client.aclose()
+                return {
+                    "focus_state": FocusState.IN_POSITION.value,
+                    "sol_balance": p_out["sol_balance"], "daily_pnl_sol": p_out["daily_pnl_sol"],
+                    "active_position": p_out["active_position"], "chart_positions": p_out["chart_positions"],
+                    "pending_order": None, "monitor_event": partial_reason, "last_execution": p_out.get("last_execution"),
+                }
+
         def _exit_out(
-            reason: str,
-            *,
-            target_state: FocusState = FocusState.SCANNING,
-            apply_cooldown: bool = True,
-            run_peak_sol: Optional[float] = None,
-            rationale: Optional[str] = None,
+            reason: str, *, target_state: FocusState = FocusState.SCANNING,
+            apply_cooldown: bool = True, run_peak_sol: Optional[float] = None, rationale: Optional[str] = None,
         ) -> dict[str, Any]:
             order = PendingOrder(
-                side="SELL",
-                mint=pos.mint,
-                symbol=pos.symbol,
-                amount_atomic=pos.token_amount,
-                reason=reason,
-                target_state_after_fill=target_state,
-                apply_cooldown=apply_cooldown,
-                run_peak_sol=run_peak_sol,
-                strategy=pos.strategy or "SCALPER",
+                side="SELL", mint=pos.mint, symbol=pos.symbol, amount_atomic=pos.token_amount,
+                reason=reason, target_state_after_fill=target_state, apply_cooldown=apply_cooldown,
+                run_peak_sol=run_peak_sol, strategy=pos.strategy or "SCALPER",
                 rationale=rationale or f"[MONITOR EXIT] {pos.symbol}: {reason}",
             )
-            return {
-                "active_position": pos.model_dump(),
-                "pending_order": order.model_dump(),
-                "monitor_event": reason,
-            }
+            return {"active_position": pos.model_dump(), "pending_order": order.model_dump(), "monitor_event": reason}
 
         # 1. Hard Stop (-10%) -> 100% sell -> SCANNING + 2h cooldown
         if pnl_pct <= -config.HARD_STOP_LOSS_PCT + EPS:
@@ -258,16 +223,19 @@ async def position_monitor_node(
         if is_exodus:
             return _exit_out(exodus_reason)
 
-        # 3. Trailing TP (+12% armed, -6% pullback from peak) -> WATCHING_REENTRY (or SCANNING + cooldown if max re-entries hit)
-        if pos.trail_armed and pos.peak_sol_value > 0:
+        # 3. Trailing TP (+12% armed; -6% pullback pre-partial, or -10% RUNNER_TRAIL_PULLBACK_PCT on remaining 50% runner)
+        if (pos.trail_armed or pos.partial_tp_taken) and pos.peak_sol_value > 0:
+            raw_runner_pb = float(config.RUNNER_TRAIL_PULLBACK_PCT)
+            runner_pb_frac = (raw_runner_pb / 100.0) if raw_runner_pb >= 1.0 else raw_runner_pb
+            active_trail_pb = runner_pb_frac if pos.partial_tp_taken else config.TRAIL_PULLBACK_PCT
             pullback_pct = (pos.peak_sol_value - current_sol_value) / pos.peak_sol_value
-            if pullback_pct + EPS >= config.TRAIL_PULLBACK_PCT:
+            if pullback_pct + EPS >= active_trail_pb:
                 at_reentry_cap = pos.reentry_count >= config.MAX_REENTRIES_PER_MINT
                 target_state = FocusState.SCANNING if at_reentry_cap else FocusState.WATCHING_REENTRY
                 cap_suffix = f" [MAX_REENTRIES={pos.reentry_count}/{config.MAX_REENTRIES_PER_MINT} -> COOLDOWN]" if at_reentry_cap else ""
                 reason = (
                     f"TRAILING_TP (peak {peak_pnl_pct * 100:+.2f}%, "
-                    f"pullback -{pullback_pct * 100:.2f}% >= -{config.TRAIL_PULLBACK_PCT * 100:.0f}%){cap_suffix}"
+                    f"pullback -{pullback_pct * 100:.2f}% >= -{active_trail_pb * 100:.0f}%){cap_suffix}"
                 )
                 return _exit_out(
                     reason,

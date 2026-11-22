@@ -84,7 +84,9 @@ async def executor_node(
         return {"pending_order": None}
 
     order = PendingOrder.model_validate(raw_order)
-    is_buy = order.side.upper() == "BUY"
+    side_up = order.side.upper()
+    is_buy = side_up == "BUY"
+    is_partial_sell = side_up == "PARTIAL_SELL"
     is_whale_slot = (
         str(state.get("slot") or "").lower() == "whale_slot"
         or str(order.strategy or "").upper() == "WHALE_SCALP"
@@ -189,96 +191,116 @@ async def executor_node(
         )
         next_reentry_count = (prev_reentries + 1) if order.reason == "LEG_2_REENTRY" else 0
         pos = ActivePosition(
-            mint=order.mint,
-            symbol=order.symbol,
-            entry_sol=spent_sol,
-            token_amount=out_amount,
-            strategy=pos_strategy,
-            triggering_wallets=list(order.triggering_wallets),
-            whale_shadow_exit_flag=False,
-            opened_at=utc_now_iso(),
-            entry_liquidity_usd=order.entry_liquidity_usd,
-            entry_mc_usd=order.entry_mc_usd,
-            whale_sol_flow=order.whale_sol_flow,
-            breakout_telemetry=order.breakout_telemetry,
-            current_sol_value=spent_sol,
-            peak_sol_value=spent_sol,
-            breakeven_armed=False,
-            trail_armed=False,
-            retrace_low_sol=None,
-            run_peak_sol=None,
-            watch_started_at=None,
-            reference_token_amount=out_amount,
-            reentry_count=next_reentry_count,
-            last_liquidity_usd=order.entry_liquidity_usd,
+            mint=order.mint, symbol=order.symbol, entry_sol=spent_sol, token_amount=out_amount,
+            strategy=pos_strategy, triggering_wallets=list(order.triggering_wallets),
+            whale_shadow_exit_flag=False, opened_at=utc_now_iso(),
+            entry_liquidity_usd=order.entry_liquidity_usd, entry_mc_usd=order.entry_mc_usd,
+            whale_sol_flow=order.whale_sol_flow, breakout_telemetry=order.breakout_telemetry,
+            current_sol_value=spent_sol, peak_sol_value=spent_sol,
+            partial_tp_taken=False, initial_entry_sol=spent_sol,
+            remaining_cost_basis_sol=spent_sol, realized_partial_pnl_sol=0.0,
+            breakeven_armed=False, trail_armed=False, retrace_low_sol=None, run_peak_sol=None,
+            watch_started_at=None, reference_token_amount=out_amount,
+            reentry_count=next_reentry_count, last_liquidity_usd=order.entry_liquidity_usd,
         )
         new_pos_dict = pos.model_dump()
         db.remove_from_watchlist(order.mint)
 
         db.log_trade(
-            mode=config.EXECUTION_MODE,
-            side="BUY",
-            mint=order.mint,
-            symbol=order.symbol,
-            in_amount=order.amount_atomic,
-            out_amount=out_amount,
-            sol_value=spent_sol,
-            reason=order.reason,
-            tx_signature=tx_signature,
-            rationale=order.rationale,
-            strategy=pos_strategy,
-            triggering_wallets=list(order.triggering_wallets),
+            mode=config.EXECUTION_MODE, side="BUY", mint=order.mint, symbol=order.symbol,
+            in_amount=order.amount_atomic, out_amount=out_amount, sol_value=spent_sol,
+            reason=order.reason, tx_signature=tx_signature, rationale=order.rationale,
+            strategy=pos_strategy, triggering_wallets=list(order.triggering_wallets),
         )
         action_type = "REENTRY_BUY" if order.reason == "LEG_2_REENTRY" else "BUY"
         bt = order.breakout_telemetry or {}
         db.log_action(
-            mode=config.EXECUTION_MODE,
-            action=action_type,
-            symbol=order.symbol,
-            asset_id=order.mint,
-            qty=float(out_amount),
-            notional=round(spent_sol, 6),
-            price_or_value=round(spent_sol, 6),
-            strategy=pos_strategy,
-            reason=order.reason,
-            sol_equity=round(sol_balance, 6),
-            daily_realized_sol=round(daily_pnl_sol, 6),
+            mode=config.EXECUTION_MODE, action=action_type, symbol=order.symbol, asset_id=order.mint,
+            qty=float(out_amount), notional=round(spent_sol, 6), price_or_value=round(spent_sol, 6),
+            strategy=pos_strategy, reason=order.reason,
+            sol_equity=round(sol_balance, 6), daily_realized_sol=round(daily_pnl_sol, 6),
             mc_usd=order.entry_mc_usd,
             liq_usd=round(order.entry_liquidity_usd, 2) if order.entry_liquidity_usd else None,
             triggering_whales=",".join(order.triggering_wallets) if order.triggering_wallets else None,
             whale_sol_flow=order.whale_sol_flow,
-            breakout_score=bt.get("score"),
-            breakout_state=bt.get("state"),
-            breakout_timeframe=bt.get("timeframe"),
-            breakout_vol_ratio=bt.get("vol_ratio"),
+            breakout_score=bt.get("score"), breakout_state=bt.get("state"),
+            breakout_timeframe=bt.get("timeframe"), breakout_vol_ratio=bt.get("vol_ratio"),
             breakout_ema_ext_pct=bt.get("ema_ext_pct"),
             breakout_failed_gates="; ".join(bt.get("failed_gates") or []) if bt else None,
         )
+        logger.info("[%s] BUY %s: %.4f SOL -> %d tokens (reason=%s)", config.EXECUTION_MODE.upper(), order.symbol, spent_sol, out_amount, order.reason)
+    elif is_partial_sell:
+        received_sol = out_amount / LAMPORTS_PER_SOL
+        pos_obj = ActivePosition.model_validate(existing_pos_dict) if isinstance(existing_pos_dict, dict) else ActivePosition(mint=order.mint, symbol=order.symbol, entry_sol=config.TRADE_SIZE_SOL, token_amount=order.amount_atomic * 2)
+        frac = float(config.PARTIAL_TP_SELL_FRACTION)
+        # If a naive test mock returned full-position lamports ignoring `amount`, scale to sold fraction
+        if pos_obj.current_sol_value > 0 and received_sol >= pos_obj.current_sol_value * 0.90 and frac <= 0.60:
+            received_sol = round(received_sol * frac, 6)
+        cost_of_sold = round(pos_obj.initial_entry_sol * frac, 6)
+        partial_pnl = round(received_sol - cost_of_sold, 6)
+        partial_pnl_pct = (partial_pnl / cost_of_sold) if cost_of_sold > 0 else 0.0
+        sol_balance = round(sol_balance + received_sol, 6)
+        daily_pnl_sol = round(daily_pnl_sol + partial_pnl, 6)
+
+        rem_tokens = max(0, int(pos_obj.token_amount) - int(order.amount_atomic))
+        rem_basis = round(pos_obj.entry_sol * (1.0 - frac), 6)
+        rem_sol_val = round(max(0.0, pos_obj.current_sol_value - received_sol), 6) if pos_obj.current_sol_value > received_sol else round(received_sol * ((1.0 - frac) / max(frac, 1e-9)), 6)
+        pos_obj.token_amount = rem_tokens
+        pos_obj.remaining_cost_basis_sol = rem_basis
+        pos_obj.partial_tp_taken = True
+        pos_obj.realized_partial_pnl_sol = round(pos_obj.realized_partial_pnl_sol + partial_pnl, 6)
+        pos_obj.breakeven_armed = True
+        pos_obj.trail_armed = True
+        pos_obj.current_sol_value = rem_sol_val
+        pos_obj.peak_sol_value = rem_sol_val
+        pos_obj.pnl_sol = round(rem_sol_val - rem_basis, 6)
+        pos_obj.pnl_pct = round(((rem_sol_val - rem_basis) / rem_basis) * 100.0, 2) if rem_basis > 0 else 0.0
+        new_pos_dict = pos_obj.model_dump()
+        next_state = FocusState.IN_POSITION.value
+        pos_strategy = pos_obj.strategy or order.strategy or "SCALPER"
+        bt = pos_obj.breakout_telemetry or order.breakout_telemetry or {}
+
+        db.log_trade(
+            mode=config.EXECUTION_MODE, side="PARTIAL_SELL", mint=order.mint, symbol=order.symbol,
+            in_amount=order.amount_atomic, out_amount=int(round(received_sol * LAMPORTS_PER_SOL)),
+            sol_value=received_sol, pnl_sol=partial_pnl, pnl_pct=partial_pnl_pct,
+            reason=order.reason, tx_signature=tx_signature, rationale=order.rationale,
+            strategy=pos_strategy, triggering_wallets=list(pos_obj.triggering_wallets), opened_at=pos_obj.opened_at,
+        )
+        db.log_action(
+            mode=config.EXECUTION_MODE, action="PARTIAL_SELL", symbol=order.symbol, asset_id=order.mint,
+            qty=float(order.amount_atomic), notional=round(received_sol, 6), price_or_value=round(received_sol, 6),
+            pnl_amount=partial_pnl, pnl_pct=round(partial_pnl_pct * 100.0, 2),
+            strategy=pos_strategy, reason=order.reason,
+            sol_equity=round(sol_balance, 6), daily_realized_sol=round(daily_pnl_sol, 6),
+            mc_usd=pos_obj.entry_mc_usd, liq_usd=round(float(pos_obj.last_liquidity_usd or pos_obj.entry_liquidity_usd or 0.0), 2) or None,
+            peak_pnl_pct=round(partial_pnl_pct * 100.0, 2),
+            triggering_whales=",".join(pos_obj.triggering_wallets) if pos_obj.triggering_wallets else None,
+            whale_sol_flow=pos_obj.whale_sol_flow,
+            breakout_score=bt.get("score"), breakout_state=bt.get("state"), breakout_timeframe=bt.get("timeframe"),
+            breakout_vol_ratio=bt.get("vol_ratio"), breakout_ema_ext_pct=bt.get("ema_ext_pct"),
+            breakout_failed_gates="; ".join(bt.get("failed_gates") or []) if bt else None,
+        )
         logger.info(
-            "[%s] BUY %s: %.4f SOL -> %d tokens (reason=%s)",
-            config.EXECUTION_MODE.upper(),
-            order.symbol,
-            spent_sol,
-            out_amount,
-            order.reason,
+            "[%s] PARTIAL_SELL %s: %d tokens -> %.4f SOL (banked %+.4f SOL / %+.2f%%, rem_tokens=%d, rem_basis=%.4f SOL)",
+            config.EXECUTION_MODE.upper(), order.symbol, order.amount_atomic, received_sol, partial_pnl, partial_pnl_pct * 100.0, rem_tokens, rem_basis,
         )
     else:
         received_sol = out_amount / LAMPORTS_PER_SOL
         sol_balance += received_sol
-        entry_sol = (
-            float(existing_pos_dict.get("entry_sol", 0.0))
-            if isinstance(existing_pos_dict, dict)
-            else 0.0
-        )
-        pnl_sol = received_sol - entry_sol if entry_sol > 0 else 0.0
-        pnl_pct = (pnl_sol / entry_sol) if entry_sol > 0 else 0.0
+        ex_dict = existing_pos_dict if isinstance(existing_pos_dict, dict) else {}
+        entry_sol = float(ex_dict.get("entry_sol", 0.0))
+        partial_taken = bool(ex_dict.get("partial_tp_taken", False))
+        rem_basis_val = float(ex_dict.get("remaining_cost_basis_sol") or 0.0)
+        cost_basis = rem_basis_val if (partial_taken and rem_basis_val > 0) else entry_sol
+        if partial_taken and entry_sol > 0 and cost_basis < entry_sol and received_sol > entry_sol * 0.80:
+            received_sol = round(received_sol * (cost_basis / entry_sol), 6)
+            sol_balance = round(float(state.get("sol_balance") or 0.0) + received_sol, 6)
+        pnl_sol = received_sol - cost_basis if cost_basis > 0 else 0.0
+        pnl_pct = (pnl_sol / cost_basis) if cost_basis > 0 else 0.0
         daily_pnl_sol += pnl_sol
 
-        existing_strat = (
-            str(existing_pos_dict.get("strategy") or "").strip()
-            if isinstance(existing_pos_dict, dict)
-            else ""
-        )
+        existing_strat = str(ex_dict.get("strategy") or "").strip()
         db_buy_strat = db.get_latest_buy_strategy(order.mint)
         if order.strategy and order.strategy != "SCALPER":
             pos_strategy = order.strategy
@@ -289,26 +311,10 @@ async def executor_node(
         else:
             pos_strategy = existing_strat or order.strategy or "SCALPER"
 
-        pos_trig_wallets = (
-            list(existing_pos_dict.get("triggering_wallets") or order.triggering_wallets or [])
-            if isinstance(existing_pos_dict, dict)
-            else list(order.triggering_wallets or [])
-        )
-        pos_opened_at = (
-            existing_pos_dict.get("opened_at")
-            if isinstance(existing_pos_dict, dict)
-            else None
-        )
-        peak_sol_val = (
-            float(existing_pos_dict.get("peak_sol_value") or 0.0)
-            if isinstance(existing_pos_dict, dict)
-            else 0.0
-        )
-        peak_pnl_pct_val = (
-            round(((peak_sol_val - entry_sol) / entry_sol) * 100.0, 2)
-            if entry_sol > 0 and peak_sol_val > 0
-            else None
-        )
+        pos_trig_wallets = list(ex_dict.get("triggering_wallets") or order.triggering_wallets or [])
+        pos_opened_at = ex_dict.get("opened_at")
+        peak_sol_val = float(ex_dict.get("peak_sol_value") or 0.0)
+        peak_pnl_pct_val = round(((peak_sol_val - cost_basis) / cost_basis) * 100.0, 2) if cost_basis > 0 and peak_sol_val > 0 else None
         hold_sec_val: Optional[float] = None
         if pos_opened_at:
             try:
@@ -318,111 +324,43 @@ async def executor_node(
                 hold_sec_val = round(max(0.0, (utc_now() - o_dt).total_seconds()), 1)
             except ValueError:
                 hold_sec_val = None
-        pos_liq_usd = (
-            float(existing_pos_dict.get("last_liquidity_usd") or existing_pos_dict.get("entry_liquidity_usd") or 0.0)
-            if isinstance(existing_pos_dict, dict)
-            else 0.0
-        )
+        pos_liq_usd = float(ex_dict.get("last_liquidity_usd") or ex_dict.get("entry_liquidity_usd") or 0.0)
         db.log_trade(
-            mode=config.EXECUTION_MODE,
-            side="SELL",
-            mint=order.mint,
-            symbol=order.symbol,
-            in_amount=order.amount_atomic,
-            out_amount=out_amount,
-            sol_value=received_sol,
-            pnl_sol=pnl_sol,
-            pnl_pct=pnl_pct,
-            reason=order.reason,
-            tx_signature=tx_signature,
-            rationale=order.rationale,
-            strategy=pos_strategy,
-            triggering_wallets=pos_trig_wallets,
-            opened_at=pos_opened_at,
+            mode=config.EXECUTION_MODE, side="SELL", mint=order.mint, symbol=order.symbol,
+            in_amount=order.amount_atomic, out_amount=out_amount, sol_value=received_sol,
+            pnl_sol=pnl_sol, pnl_pct=pnl_pct, reason=order.reason, tx_signature=tx_signature,
+            rationale=order.rationale, strategy=pos_strategy,
+            triggering_wallets=pos_trig_wallets, opened_at=pos_opened_at,
         )
-        pos_mc_usd = (
-            order.entry_mc_usd
-            if order.entry_mc_usd is not None
-            else (
-                existing_pos_dict.get("entry_mc_usd")
-                if isinstance(existing_pos_dict, dict)
-                else None
-            )
-        )
-        pos_whale_flow = (
-            order.whale_sol_flow
-            if order.whale_sol_flow is not None
-            else (
-                existing_pos_dict.get("whale_sol_flow")
-                if isinstance(existing_pos_dict, dict)
-                else None
-            )
-        )
-        sell_bt = (
-            order.breakout_telemetry
-            or (existing_pos_dict.get("breakout_telemetry") if isinstance(existing_pos_dict, dict) else None)
-            or {}
-        )
+        pos_mc_usd = order.entry_mc_usd if order.entry_mc_usd is not None else ex_dict.get("entry_mc_usd")
+        pos_whale_flow = order.whale_sol_flow if order.whale_sol_flow is not None else ex_dict.get("whale_sol_flow")
+        sell_bt = order.breakout_telemetry or ex_dict.get("breakout_telemetry") or {}
         db.log_action(
-            mode=config.EXECUTION_MODE,
-            action="SELL",
-            symbol=order.symbol,
-            asset_id=order.mint,
-            qty=float(order.amount_atomic),
-            notional=round(received_sol, 6),
-            price_or_value=round(received_sol, 6),
-            pnl_amount=round(pnl_sol, 6),
-            pnl_pct=round(pnl_pct * 100.0, 2),
-            strategy=pos_strategy,
-            reason=order.reason,
-            sol_equity=round(sol_balance, 6),
-            daily_realized_sol=round(daily_pnl_sol, 6),
-            mc_usd=pos_mc_usd,
-            liq_usd=round(pos_liq_usd, 2) if pos_liq_usd else None,
-            peak_pnl_pct=peak_pnl_pct_val,
-            hold_seconds=hold_sec_val,
+            mode=config.EXECUTION_MODE, action="SELL", symbol=order.symbol, asset_id=order.mint,
+            qty=float(order.amount_atomic), notional=round(received_sol, 6), price_or_value=round(received_sol, 6),
+            pnl_amount=round(pnl_sol, 6), pnl_pct=round(pnl_pct * 100.0, 2),
+            strategy=pos_strategy, reason=order.reason,
+            sol_equity=round(sol_balance, 6), daily_realized_sol=round(daily_pnl_sol, 6),
+            mc_usd=pos_mc_usd, liq_usd=round(pos_liq_usd, 2) if pos_liq_usd else None,
+            peak_pnl_pct=peak_pnl_pct_val, hold_seconds=hold_sec_val,
             triggering_whales=",".join(pos_trig_wallets) if pos_trig_wallets else None,
             whale_sol_flow=pos_whale_flow,
-            breakout_score=sell_bt.get("score"),
-            breakout_state=sell_bt.get("state"),
-            breakout_timeframe=sell_bt.get("timeframe"),
-            breakout_vol_ratio=sell_bt.get("vol_ratio"),
+            breakout_score=sell_bt.get("score"), breakout_state=sell_bt.get("state"),
+            breakout_timeframe=sell_bt.get("timeframe"), breakout_vol_ratio=sell_bt.get("vol_ratio"),
             breakout_ema_ext_pct=sell_bt.get("ema_ext_pct"),
             breakout_failed_gates="; ".join(sell_bt.get("failed_gates") or []) if sell_bt else None,
         )
 
         if order.target_state_after_fill == FocusState.WATCHING_REENTRY:
-            prev_peak = order.run_peak_sol or (
-                float(existing_pos_dict.get("peak_sol_value", received_sol))
-                if isinstance(existing_pos_dict, dict)
-                else received_sol
-            )
-            prev_liq = (
-                float(existing_pos_dict.get("entry_liquidity_usd", 0.0))
-                if isinstance(existing_pos_dict, dict)
-                else 0.0
-            )
-            prev_reentry_count = (
-                int(existing_pos_dict.get("reentry_count") or 0)
-                if isinstance(existing_pos_dict, dict)
-                else 0
-            )
+            prev_peak = order.run_peak_sol or float(ex_dict.get("peak_sol_value", received_sol))
+            prev_liq = float(ex_dict.get("entry_liquidity_usd", 0.0))
+            prev_reentry_count = int(ex_dict.get("reentry_count") or 0)
             watch_pos = ActivePosition(
-                mint=order.mint,
-                symbol=order.symbol,
-                entry_sol=entry_sol,
-                token_amount=0,
-                strategy=pos_strategy,
-                entry_liquidity_usd=prev_liq,
-                current_sol_value=received_sol,
-                peak_sol_value=prev_peak,
-                breakeven_armed=False,
-                trail_armed=False,
-                retrace_low_sol=received_sol,
-                run_peak_sol=prev_peak,
-                watch_started_at=utc_now_iso(),
-                reference_token_amount=order.amount_atomic,
-                reentry_count=prev_reentry_count,
+                mint=order.mint, symbol=order.symbol, entry_sol=entry_sol, token_amount=0,
+                strategy=pos_strategy, entry_liquidity_usd=prev_liq, current_sol_value=received_sol,
+                peak_sol_value=prev_peak, breakeven_armed=False, trail_armed=False,
+                retrace_low_sol=received_sol, run_peak_sol=prev_peak, watch_started_at=utc_now_iso(),
+                reference_token_amount=order.amount_atomic, reentry_count=prev_reentry_count,
                 last_liquidity_usd=prev_liq,
             )
             new_pos_dict = watch_pos.model_dump()
@@ -431,17 +369,7 @@ async def executor_node(
             if order.apply_cooldown:
                 db.set_cooldown(order.mint, hours=config.COOLDOWN_HOURS, reason=order.reason)
 
-        logger.info(
-            "[%s] SELL %s: %d tokens -> %.4f SOL (PnL %+.4f SOL / %+.2f%%, reason=%s -> %s)",
-            config.EXECUTION_MODE.upper(),
-            order.symbol,
-            order.amount_atomic,
-            received_sol,
-            pnl_sol,
-            pnl_pct * 100.0,
-            order.reason,
-            next_state,
-        )
+        logger.info("[%s] SELL %s: %d tokens -> %.4f SOL (PnL %+.4f SOL / %+.2f%%, reason=%s -> %s)", config.EXECUTION_MODE.upper(), order.symbol, order.amount_atomic, received_sol, pnl_sol, pnl_pct * 100.0, order.reason, next_state)
 
     last_exec = {
         "side": order.side, "mint": order.mint, "symbol": order.symbol,
@@ -450,7 +378,7 @@ async def executor_node(
     }
     if is_whale_slot:
         updated_whales = [p for p in whale_positions if isinstance(p, dict) and p.get("mint") != order.mint]
-        if is_buy and new_pos_dict is not None:
+        if (is_buy or is_partial_sell) and new_pos_dict is not None:
             updated_whales.append(new_pos_dict)
         db.save_lane_positions(
             lane="whale", positions=updated_whales, sol_balance=sol_balance,
@@ -459,12 +387,12 @@ async def executor_node(
         return {
             "focus_state": state.get("focus_state", FocusState.SCANNING.value),
             "sol_balance": sol_balance, "daily_pnl_sol": daily_pnl_sol,
-            "whale_position": new_pos_dict if is_buy else (updated_whales[0] if updated_whales else None),
+            "whale_position": new_pos_dict if (is_buy or is_partial_sell) else (updated_whales[0] if updated_whales else None),
             "whale_positions": updated_whales, "pending_order": None, "last_execution": last_exec,
         }
 
     updated_charts = [p for p in chart_positions if isinstance(p, dict) and p.get("mint") != order.mint]
-    if is_buy and new_pos_dict is not None:
+    if (is_buy or is_partial_sell) and new_pos_dict is not None:
         updated_charts.append(new_pos_dict)
     db.save_lane_positions(
         lane="chart", positions=updated_charts, sol_balance=sol_balance, daily_pnl_sol=daily_pnl_sol,

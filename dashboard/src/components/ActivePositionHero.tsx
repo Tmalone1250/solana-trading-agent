@@ -24,9 +24,15 @@ function PositionCard({
 }) {
   const strategy = (pnl.strategy || "SCALPER").toUpperCase();
   const isWhaleScalp = strategy === "WHALE_SCALP";
+  const partialTaken = Boolean(pnl.partial_tp_taken);
+  const bankedSol = pnl.realized_partial_pnl_sol ?? 0;
+  const basisSol =
+    partialTaken && (pnl.remaining_cost_basis_sol ?? 0) > 0
+      ? pnl.remaining_cost_basis_sol!
+      : pnl.entry_sol;
   const pnlPct = pnl.pnl_pct;
   const peakPct =
-    pnl.entry_sol > 0 ? ((pnl.peak_sol_value - pnl.entry_sol) / pnl.entry_sol) * 100 : 0;
+    basisSol > 0 ? ((pnl.peak_sol_value - basisSol) / basisSol) * 100 : 0;
 
   const gaugeMin = -15;
   const baseMax = isWhaleScalp ? 20 : 25;
@@ -40,9 +46,15 @@ function PositionCard({
   const currentPos = clampPct(pnlPct, gaugeMin, gaugeMax);
   const peakPos = clampPct(peakPct, gaugeMin, gaugeMax);
   const tightTrailActive = isWhaleScalp && peakPct >= 12;
-  const trailDropFactor = isWhaleScalp ? (tightTrailActive ? 0.975 : 0.965) : 0.94;
+  const trailDropFactor = isWhaleScalp
+    ? tightTrailActive
+      ? 0.975
+      : 0.965
+    : partialTaken
+      ? 0.9
+      : 0.94;
   const trailStopPct = pnl.trail_armed
-    ? ((pnl.peak_sol_value * trailDropFactor - pnl.entry_sol) / Math.max(pnl.entry_sol, 1e-9)) * 100
+    ? ((pnl.peak_sol_value * trailDropFactor - basisSol) / Math.max(basisSol, 1e-9)) * 100
     : null;
   const trailStopPos = trailStopPct !== null ? clampPct(trailStopPct, gaugeMin, gaugeMax) : null;
 
@@ -82,6 +94,12 @@ function PositionCard({
             >
               {strategy}
             </span>
+            {partialTaken && (
+              <span className="rounded-full border border-emerald-500/50 bg-emerald-500/20 px-2 py-0.5 font-mono text-[10px] font-semibold text-emerald-300">
+                50% BANKED ({bankedSol >= 0 ? "+" : ""}
+                {bankedSol.toFixed(4)} SOL)
+              </span>
+            )}
           </div>
           <div className="mt-0.5 font-mono text-[11px] text-slate-400">
             {mint.slice(0, 6)}...{mint.slice(-6)}
@@ -125,7 +143,7 @@ function PositionCard({
               BE {isWhaleScalp ? "+5%/+1%" : "+8%/+2%"}
             </span>
             <span className={pnl.trail_armed ? "font-semibold text-amber-300" : "text-slate-500"}>
-              Trail {isWhaleScalp ? "+8%/-3.5%" : "+12%/-6%"}
+              Trail {isWhaleScalp ? "+8%/-3.5%" : partialTaken ? "+12%/-10%" : "+12%/-6%"}
             </span>
             {isWhaleScalp && <span className="text-emerald-400">+15% TP</span>}
           </div>

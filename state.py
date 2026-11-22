@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Optional, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class FocusState(str, Enum):
@@ -118,6 +118,10 @@ class ActivePosition(BaseModel):
     peak_sol_value: float = 0.0
     pnl_sol: float = 0.0
     pnl_pct: float = 0.0
+    partial_tp_taken: bool = False
+    initial_entry_sol: float = 0.0
+    remaining_cost_basis_sol: float = 0.0
+    realized_partial_pnl_sol: float = 0.0
     breakeven_armed: bool = False
     trail_armed: bool = False
     retrace_low_sol: Optional[float] = None
@@ -128,6 +132,14 @@ class ActivePosition(BaseModel):
     last_5m_buy_ratio: Optional[float] = None
     last_5m_sell_ratio: Optional[float] = None
     last_liquidity_usd: Optional[float] = None
+
+    @model_validator(mode="after")
+    def _ensure_cost_basis_fields(self) -> "ActivePosition":
+        if self.initial_entry_sol <= 0.0 and self.entry_sol > 0.0:
+            self.initial_entry_sol = self.entry_sol
+        if self.remaining_cost_basis_sol <= 0.0 and self.entry_sol > 0.0:
+            self.remaining_cost_basis_sol = self.entry_sol
+        return self
 
 
 class WatchlistEntry(BaseModel):

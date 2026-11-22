@@ -73,10 +73,14 @@ def create_telemetry_app(
 
         def _build_slot_pnl(p: dict[str, Any], slot_name: str) -> dict[str, Any]:
             e_sol = float(p.get("entry_sol") or 0.0)
+            partial_taken = bool(p.get("partial_tp_taken", False))
+            init_sol = float(p.get("initial_entry_sol") or e_sol)
+            rem_basis = float(p.get("remaining_cost_basis_sol") or e_sol)
+            basis = rem_basis if (partial_taken and rem_basis > 0) else e_sol
             c_sol = float(p.get("current_sol_value") or 0.0)
             pk_sol = float(p.get("peak_sol_value") or 0.0)
-            p_sol = c_sol - e_sol if e_sol > 0 else 0.0
-            p_pct = (p_sol / e_sol) * 100.0 if e_sol > 0 else 0.0
+            p_sol = c_sol - basis if basis > 0 else 0.0
+            p_pct = (p_sol / basis) * 100.0 if basis > 0 else 0.0
             return {
                 "slot": slot_name,
                 "mint": p.get("mint"),
@@ -84,6 +88,10 @@ def create_telemetry_app(
                 "strategy": str(p.get("strategy") or ("WHALE_SCALP" if slot_name == "whale_slot" else st.get("strategy") or "SCALPER")),
                 "triggering_wallets": list(p.get("triggering_wallets") or []),
                 "entry_sol": round(e_sol, 6),
+                "initial_entry_sol": round(init_sol, 6),
+                "remaining_cost_basis_sol": round(rem_basis, 6),
+                "partial_tp_taken": partial_taken,
+                "realized_partial_pnl_sol": round(float(p.get("realized_partial_pnl_sol") or 0.0), 6),
                 "current_sol_value": round(c_sol, 6),
                 "peak_sol_value": round(pk_sol, 6),
                 "pnl_sol": round(p_sol, 6),
