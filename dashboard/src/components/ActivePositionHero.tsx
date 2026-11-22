@@ -39,19 +39,19 @@ function PositionCard({
   const gaugeMax = Math.max(baseMax, Math.ceil((Math.max(peakPct, pnlPct) + 5) / 5) * 5);
   const hardStopPos = clampPct(-10, gaugeMin, gaugeMax);
   const zeroPos = clampPct(0, gaugeMin, gaugeMax);
-  const beFloorPos = clampPct(isWhaleScalp ? 1 : 2, gaugeMin, gaugeMax);
+  const beFloorPos = clampPct(isWhaleScalp && !partialTaken ? 1 : 2, gaugeMin, gaugeMax);
   const trailArmLevel = isWhaleScalp ? 8 : 12;
   const trailArmPos = clampPct(trailArmLevel, gaugeMin, gaugeMax);
   const whaleTpPos = clampPct(15, gaugeMin, gaugeMax);
   const currentPos = clampPct(pnlPct, gaugeMin, gaugeMax);
   const peakPos = clampPct(peakPct, gaugeMin, gaugeMax);
   const tightTrailActive = isWhaleScalp && peakPct >= 12;
-  const trailDropFactor = isWhaleScalp
-    ? tightTrailActive
-      ? 0.975
-      : 0.965
-    : partialTaken
-      ? 0.9
+  const trailDropFactor = partialTaken
+    ? 0.9
+    : isWhaleScalp
+      ? tightTrailActive
+        ? 0.975
+        : 0.965
       : 0.94;
   const trailStopPct = pnl.trail_armed
     ? ((pnl.peak_sol_value * trailDropFactor - basisSol) / Math.max(basisSol, 1e-9)) * 100
@@ -140,12 +140,12 @@ function PositionCard({
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-rose-400">-10% SL</span>
             <span className={pnl.breakeven_armed ? "font-semibold text-cyan-300" : "text-slate-500"}>
-              BE {isWhaleScalp ? "+5%/+1%" : "+8%/+2%"}
+              BE {isWhaleScalp ? (partialTaken ? "+5%/+2%" : "+5%/+1%") : "+8%/+2%"}
             </span>
             <span className={pnl.trail_armed ? "font-semibold text-amber-300" : "text-slate-500"}>
-              Trail {isWhaleScalp ? "+8%/-3.5%" : partialTaken ? "+12%/-10%" : "+12%/-6%"}
+              Trail {partialTaken ? (isWhaleScalp ? "+15%/-10%" : "+12%/-10%") : isWhaleScalp ? "+8%/-3.5%" : "+12%/-6%"}
             </span>
-            {isWhaleScalp && <span className="text-emerald-400">+15% TP</span>}
+            {isWhaleScalp && !partialTaken && <span className="text-emerald-400">+15% 50% TP</span>}
           </div>
         </div>
         <div className="relative h-3 w-full overflow-hidden rounded-full bg-slate-900">

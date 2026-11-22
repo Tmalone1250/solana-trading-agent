@@ -331,3 +331,134 @@ async def test_jupiter_v3_flat_schema_dexscreener_pricenative_fallback_and_telem
     assert cp0["last_5m_buy_ratio"] == pytest.approx(0.80, rel=1e-3)
     assert cp0["last_5m_sell_ratio"] == pytest.approx(0.20, rel=1e-3)
     db.close()
+
+
+@pytest.mark.asyncio
+async def test_whale_scalp_two_step_partial_tp_runner_trail_and_shadow_exit_on_runner(tmp_path):
+    """Verify:
+    1. WHALE_SCALP scaling out 50% at +15%, arming breakeven (+2% floor), logging PARTIAL_SELL
+       with strategy='WHALE_SCALP' and reason='WHALE_PARTIAL_TP_50PCT (+15%)', and trailing the
+       remaining 50% runner at -10%.
+    2. WHALE_SHADOW_EXIT firing on the remaining 50% runner and closing the position cleanly
+       with accurate remaining PnL.
+    """
+    clear_price_backoff()
+    db = AgentDatabase(db_path=str(tmp_path / "whale_partial_tp.duckdb"), starting_sol=1.0)
+    cfg = AgentConfig(
+        _env_file=None,
+        WHALE_STRATEGY_ENABLED=True,
+        WHALE_POSITION_SOL=0.25,
+        WHALE_PARTIAL_TP_TRIGGER_PCT=15.0,
+        WHALE_PARTIAL_TP_SELL_FRACTION=0.50,
+        WHALE_RUNNER_TRAIL_PULLBACK_PCT=10.0,
+    )
+    now_dt = datetime.now(timezone.utc)
+    mint_a = "MintWhalePartialA111111111111111111111111111"
+    mint_b = "MintWhaleShadowB1111111111111111111111111111"
+
+    pos_a = ActivePosition(
+        mint=mint_a, symbol="WPART", entry_sol=0.25, token_amount=1_000_000,
+        strategy="WHALE_SCALP", triggering_wallets=["WhaleAlpha"],
+        opened_at=now_dt.isoformat(), entry_liquidity_usd=80_000.0,
+        current_sol_value=0.25, peak_sol_value=0.25, reference_token_amount=1_000_000,
+    ).model_dump()
+    pos_b = ActivePosition(
+        mint=mint_b, symbol="WSHAD", entry_sol=0.25, token_amount=1_000_000,
+        strategy="WHALE_SCALP", triggering_wallets=["WhaleBeta"],
+        opened_at=now_dt.isoformat(), entry_liquidity_usd=80_000.0,
+        current_sol_value=0.25, peak_sol_value=0.25, reference_token_amount=1_000_000,
+    ).model_dump()
+    db.save_lane_positions(lane="whale", positions=[pos_a, pos_b], sol_balance=0.50, daily_pnl_sol=0.0)
+
+    # Proportional price per atomic token unit for mint_a and mint_b
+    unit_prices = {
+        mint_a: 0.2875 / 1_000_000,  # +15% on 0.25 SOL
+        mint_b: 0.2875 / 1_000_000,  # +15% on 0.25 SOL
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/price/v3" in url:
+            return httpx.Response(200, json={SOL_MINT: {"usdPrice": 200.0, "decimals": 9}})
+        if "/tokens/v1/solana/" in url:
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "chainId": "solana",
+                        "baseToken": {"address": m, "symbol": "WPART" if m == mint_a else "WSHAD"},
+                        "priceNative": f"{unit_prices[m] * (10 ** 6):.10f}",
+                        "liquidity": {"usd": 85_000.0},
+                        "txns": {"m5": {"buys": 35, "sells": 15}},
+                    }
+                    for m in (mint_a, mint_b)
+                ],
+            )
+        if "/swap/v2/order" in url:
+            in_mint = request.url.params.get("inputMint") or mint_a
+            amt = int(request.url.params.get("amount") or 500_000)
+            out_sol = amt * unit_prices[in_mint]
+            return httpx.Response(200, json={"outAmount": str(int(round(out_sol * LAMPORTS_PER_SOL))), "transaction": None})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        # Tick 1: Both Whale positions hit +15% (0.2875 SOL) -> Both scale out 50% (500,000 tokens for 0.14375 SOL each)
+        await run_whale_lane_tick(config=cfg, db=db, http_client=client, now=now_dt)
+        st1 = db.get_state()
+        assert len(st1["whale_positions"]) == 2
+        by_mint1 = {p["mint"]: p for p in st1["whale_positions"]}
+        for m in (mint_a, mint_b):
+            wp = by_mint1[m]
+            assert wp["partial_tp_taken"] is True
+            assert wp["token_amount"] == 500_000
+            assert pytest.approx(wp["remaining_cost_basis_sol"]) == 0.125
+            assert pytest.approx(wp["realized_partial_pnl_sol"]) == 0.01875
+            assert wp["breakeven_armed"] is True
+            assert wp["trail_armed"] is True
+        # Both partial sells credited to sol_balance (0.50 + 2 * 0.14375 = 0.7875) & daily_pnl_sol (2 * 0.01875 = 0.0375)
+        assert pytest.approx(st1["sol_balance"]) == 0.7875
+        assert pytest.approx(st1["daily_pnl_sol"]) == 0.0375
+
+        # Verify PARTIAL_SELL rows in DuckDB & CSV export + /api/telemetry whale_positions
+        partial_rows = db.get_action_log(actions=["PARTIAL_SELL"], limit=10)
+        assert len(partial_rows) == 2
+        assert all(r["strategy"] == "WHALE_SCALP" for r in partial_rows)
+        assert all(r["reason"] == "WHALE_PARTIAL_TP_50PCT (+15%)" for r in partial_rows)
+
+        tc = TestClient(create_telemetry_app(config=cfg, db=db))
+        tel1 = tc.get("/api/telemetry").json()
+        assert all(wp["partial_tp_taken"] is True for wp in tel1["whale_positions"])
+        assert all(pytest.approx(wp["realized_partial_pnl_sol"]) == 0.01875 for wp in tel1["whale_positions"])
+
+        # Tick 2: Both runners climb to +28% on remaining 0.125 SOL basis (500,000 tokens -> 0.160 SOL) -> hold
+        unit_prices[mint_a] = 0.160 / 500_000
+        unit_prices[mint_b] = 0.160 / 500_000
+        await run_whale_lane_tick(config=cfg, db=db, http_client=client, now=now_dt)
+        st2 = db.get_state()
+        assert len(st2["whale_positions"]) == 2
+
+        # Tick 3: mint_a pulls back -7.5% from 0.160 peak (to 0.148 SOL -> survives -10% runner trail!),
+        # while mint_b's triggering whale ("WhaleBeta") dumps -> WHALE_SHADOW_EXIT closes mint_b's remaining 50% runner!
+        unit_prices[mint_a] = 0.148 / 500_000
+        unit_prices[mint_b] = 0.150 / 500_000  # +20% on 0.125 remaining cost basis (+0.025 SOL runner PnL)
+        assert db.flag_whale_shadow_exit(mint_b, "WhaleBeta") is True
+        await run_whale_lane_tick(config=cfg, db=db, http_client=client, now=now_dt)
+        st3 = db.get_state()
+        assert [p["mint"] for p in st3["whale_positions"]] == [mint_a]
+        # mint_b runner sold for 0.150 SOL against 0.125 remaining cost basis -> +0.025 SOL realized PnL
+        assert pytest.approx(st3["sol_balance"]) == 0.7875 + 0.150
+        assert pytest.approx(st3["daily_pnl_sol"]) == 0.0375 + 0.025
+        sell_b = next(r for r in db.get_action_log(actions=["SELL"], limit=5) if r["asset_id"] == mint_b)
+        assert sell_b["reason"] == "WHALE_SHADOW_EXIT"
+        assert pytest.approx(sell_b["pnl_amount"]) == 0.025
+
+        # Tick 4: mint_a pulls back -10% from 0.160 peak (to 0.144 SOL) -> exits via WHALE_PEAK_TRAIL (-10% runner trail)
+        unit_prices[mint_a] = 0.144 / 500_000
+        await run_whale_lane_tick(config=cfg, db=db, http_client=client, now=now_dt)
+        st4 = db.get_state()
+        assert st4["whale_positions"] == []
+        sell_a = next(r for r in db.get_action_log(actions=["SELL"], limit=5) if r["asset_id"] == mint_a)
+        assert sell_a["reason"] == "WHALE_PEAK_TRAIL"
+        assert pytest.approx(sell_a["pnl_amount"]) == 0.144 - 0.125  # +0.019 SOL on remaining 50% runner
+
+    db.close()

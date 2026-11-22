@@ -154,6 +154,9 @@ class AgentConfig(BaseSettings):
     WHALE_MIN_LIQ_USD: float | None = Field(default=None, ge=0.0)
     WHALE_MIN_LIQUIDITY_USD: float = Field(default=40_000.0, ge=0.0)
     WHALE_TP_PCT: float = Field(default=15.0, gt=0.0)
+    WHALE_PARTIAL_TP_TRIGGER_PCT: float | None = Field(default=None, gt=0.0)
+    WHALE_PARTIAL_TP_SELL_FRACTION: float | None = Field(default=None, gt=0.0, lt=1.0)
+    WHALE_RUNNER_TRAIL_PULLBACK_PCT: float | None = Field(default=None, gt=0.0, lt=100.0)
     WHALE_BREAKEVEN_ARM_PCT: float = Field(default=5.0, gt=0.0)
     WHALE_BREAKEVEN_FLOOR_PCT: float = Field(default=1.0, ge=0.0)
     WHALE_TRAIL_ARM_PCT: float = Field(default=8.0, gt=0.0)
@@ -188,6 +191,12 @@ class AgentConfig(BaseSettings):
             raise ValueError(
                 "SOLANA_PRIVATE_KEY_BS58 is required when EXECUTION_MODE='live'."
             )
+        if self.WHALE_PARTIAL_TP_TRIGGER_PCT is None:
+            self.WHALE_PARTIAL_TP_TRIGGER_PCT = float(self.PARTIAL_TP_TRIGGER_PCT)
+        if self.WHALE_PARTIAL_TP_SELL_FRACTION is None:
+            self.WHALE_PARTIAL_TP_SELL_FRACTION = float(self.PARTIAL_TP_SELL_FRACTION)
+        if self.WHALE_RUNNER_TRAIL_PULLBACK_PCT is None:
+            self.WHALE_RUNNER_TRAIL_PULLBACK_PCT = float(self.RUNNER_TRAIL_PULLBACK_PCT)
         return self
 
     def lane_bounds(self) -> tuple[float, float, float]:

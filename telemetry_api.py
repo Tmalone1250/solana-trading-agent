@@ -254,9 +254,43 @@ def create_telemetry_app(
         avg_hold_sec = round(sum(holds) / len(holds), 1) if holds else 0.0
 
         whale_trades_payload: list[dict[str, Any]] = []
-        if open_whale_mint and isinstance(open_whale_pos, dict) and open_whale_pnl is not None:
-            opened_str = open_whale_pos.get("opened_at")
+        for ow_pos, ow_pnl in zip(raw_whale_list, whale_live_positions):
+            if not isinstance(ow_pos, dict):
+                continue
+            opened_str = ow_pos.get("opened_at")
             open_hold: Optional[float] = None
+            if opened_str:
+                try:
+                    o_dt = datetime.fromisoformat(opened_str)
+                    if o_dt.tzinfo is None:
+                        o_dt = o_dt.replace(tzinfo=timezone.utc)
+                    open_hold = round(max(0.0, (now_dt - o_dt).total_seconds()), 1)
+                except ValueError:
+                    open_hold = None
+            whale_trades_payload.append(
+                {
+                    "status": "OPEN",
+                    "symbol": ow_pos.get("symbol") or "UNKNOWN",
+                    "mint": ow_pos.get("mint") or "",
+                    "entry_sol": ow_pnl["entry_sol"],
+                    "exit_sol": ow_pnl["current_sol_value"],
+                    "pnl_sol": ow_pnl["pnl_sol"],
+                    "pnl_pct": ow_pnl["pnl_pct"],
+                    "partial_tp_taken": ow_pnl["partial_tp_taken"],
+                    "realized_partial_pnl_sol": ow_pnl["realized_partial_pnl_sol"],
+                    "exit_reason": "OPEN",
+                    "opened_at": opened_str,
+                    "closed_at": None,
+                    "hold_seconds": open_hold,
+                    "triggering_wallets": [
+                        {"wallet": w, "label": cfg.resolve_wallet_label(w)}
+                        for w in (ow_pnl.get("triggering_wallets") or [])
+                    ],
+                }
+            )
+        if not whale_trades_payload and open_whale_mint and isinstance(open_whale_pos, dict) and open_whale_pnl is not None:
+            opened_str = open_whale_pos.get("opened_at")
+            open_hold = None
             if opened_str:
                 try:
                     o_dt = datetime.fromisoformat(opened_str)
@@ -274,6 +308,8 @@ def create_telemetry_app(
                     "exit_sol": open_whale_pnl["current_sol_value"],
                     "pnl_sol": open_whale_pnl["pnl_sol"],
                     "pnl_pct": open_whale_pnl["pnl_pct"],
+                    "partial_tp_taken": open_whale_pnl.get("partial_tp_taken", False),
+                    "realized_partial_pnl_sol": open_whale_pnl.get("realized_partial_pnl_sol", 0.0),
                     "exit_reason": "OPEN",
                     "opened_at": opened_str,
                     "closed_at": None,

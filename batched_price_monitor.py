@@ -275,22 +275,34 @@ def needs_exact_jupiter_quote(
             return True
         if pnl_pct_100 <= config.WHALE_HARD_STOP_PCT + proximity_pct:
             return True
-        if pnl_pct_100 >= config.WHALE_TP_PCT - proximity_pct:
+        whale_tp_pct = float(config.WHALE_PARTIAL_TP_TRIGGER_PCT or config.PARTIAL_TP_TRIGGER_PCT)
+        if not pos.partial_tp_taken and pnl_pct_100 >= whale_tp_pct - proximity_pct:
             return True
+        be_floor_100 = (
+            max(float(config.WHALE_BREAKEVEN_FLOOR_PCT), float(config.BREAKEVEN_FLOOR_PCT) * 100.0)
+            if pos.partial_tp_taken
+            else float(config.WHALE_BREAKEVEN_FLOOR_PCT)
+        )
         if (pos.breakeven_armed or peak_pct_100 >= config.WHALE_BREAKEVEN_ARM_PCT) and (
-            pnl_pct_100 <= config.WHALE_BREAKEVEN_FLOOR_PCT + proximity_pct
+            pnl_pct_100 <= be_floor_100 + proximity_pct
         ):
             return True
-        if (pos.trail_armed or peak_pct_100 >= config.WHALE_TRAIL_ARM_PCT) and peak_sol > 0:
+        if (pos.trail_armed or pos.partial_tp_taken or peak_pct_100 >= config.WHALE_TRAIL_ARM_PCT) and peak_sol > 0:
+            raw_w_runner = float(config.WHALE_RUNNER_TRAIL_PULLBACK_PCT or config.RUNNER_TRAIL_PULLBACK_PCT)
+            w_runner_100 = raw_w_runner if raw_w_runner >= 1.0 else raw_w_runner * 100.0
             drop_limit = (
-                config.WHALE_TIGHT_TRAIL_DROP_PCT
-                if peak_pct_100 >= config.WHALE_TIGHT_TRAIL_ARM_PCT
-                else config.WHALE_TRAIL_DROP_PCT
+                w_runner_100
+                if pos.partial_tp_taken
+                else (
+                    config.WHALE_TIGHT_TRAIL_DROP_PCT
+                    if peak_pct_100 >= config.WHALE_TIGHT_TRAIL_ARM_PCT
+                    else config.WHALE_TRAIL_DROP_PCT
+                )
             )
             drop_pct = ((peak_sol - estimated_sol_value) / peak_sol) * 100.0
             if drop_pct >= max(0.0, drop_limit - proximity_pct):
                 return True
-        if pos.opened_at:
+        if not pos.partial_tp_taken and pos.opened_at:
             try:
                 o_dt = datetime.fromisoformat(pos.opened_at)
                 if o_dt.tzinfo is None:

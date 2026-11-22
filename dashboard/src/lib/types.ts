@@ -126,6 +126,8 @@ export interface WhaleTrade {
   exit_sol: number;
   pnl_sol: number;
   pnl_pct: number;
+  partial_tp_taken?: boolean;
+  realized_partial_pnl_sol?: number;
   exit_reason: string;
   opened_at: string | null;
   closed_at: string | null;

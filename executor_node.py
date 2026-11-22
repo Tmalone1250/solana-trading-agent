@@ -231,8 +231,9 @@ async def executor_node(
         logger.info("[%s] BUY %s: %.4f SOL -> %d tokens (reason=%s)", config.EXECUTION_MODE.upper(), order.symbol, spent_sol, out_amount, order.reason)
     elif is_partial_sell:
         received_sol = out_amount / LAMPORTS_PER_SOL
-        pos_obj = ActivePosition.model_validate(existing_pos_dict) if isinstance(existing_pos_dict, dict) else ActivePosition(mint=order.mint, symbol=order.symbol, entry_sol=config.TRADE_SIZE_SOL, token_amount=order.amount_atomic * 2)
-        frac = float(config.PARTIAL_TP_SELL_FRACTION)
+        default_entry = config.WHALE_POSITION_SOL if is_whale_slot else config.TRADE_SIZE_SOL
+        pos_obj = ActivePosition.model_validate(existing_pos_dict) if isinstance(existing_pos_dict, dict) else ActivePosition(mint=order.mint, symbol=order.symbol, entry_sol=default_entry, token_amount=order.amount_atomic * 2)
+        frac = float((config.WHALE_PARTIAL_TP_SELL_FRACTION or config.PARTIAL_TP_SELL_FRACTION) if is_whale_slot else config.PARTIAL_TP_SELL_FRACTION)
         # If a naive test mock returned full-position lamports ignoring `amount`, scale to sold fraction
         if pos_obj.current_sol_value > 0 and received_sol >= pos_obj.current_sol_value * 0.90 and frac <= 0.60:
             received_sol = round(received_sol * frac, 6)

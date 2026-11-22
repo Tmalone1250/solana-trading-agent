@@ -80,22 +80,12 @@ async def test_whale_scalp_fast_track_confluence_and_solo_buy_within_mcap_band(t
 
     # 2-whale confluence within 5m (latest buy 20s ago <= 60s)
     db.record_whale_event(
-        signature="sig-c1",
-        wallet="Whale1",
-        mint=mint_conf,
-        side="BUY",
-        sol_amount=0.8,
-        token_amount=100_000.0,
-        timestamp_utc=(now_dt - timedelta(minutes=2)).isoformat(),
+        signature="sig-c1", wallet="Whale1", mint=mint_conf, side="BUY",
+        sol_amount=0.8, token_amount=100_000.0, timestamp_utc=(now_dt - timedelta(minutes=2)).isoformat(),
     )
     db.record_whale_event(
-        signature="sig-c2",
-        wallet="Whale2",
-        mint=mint_conf,
-        side="BUY",
-        sol_amount=0.9,
-        token_amount=110_000.0,
-        timestamp_utc=(now_dt - timedelta(seconds=20)).isoformat(),
+        signature="sig-c2", wallet="Whale2", mint=mint_conf, side="BUY",
+        sol_amount=0.9, token_amount=110_000.0, timestamp_utc=(now_dt - timedelta(seconds=20)).isoformat(),
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -311,48 +301,36 @@ async def test_whale_scalp_five_layer_exit_engine(tmp_path):
     process_helius_webhook_payload(
         [
             {
-                "signature": "sig-whale-dump",
-                "type": "SWAP",
-                "timestamp": int(now_dt.timestamp()),
-                "feePayer": "WhaleTriggerA",
+                "signature": "sig-whale-dump", "type": "SWAP", "timestamp": int(now_dt.timestamp()), "feePayer": "WhaleTriggerA",
                 "nativeTransfers": [{"fromUserAccount": "Pool", "toUserAccount": "WhaleTriggerA", "amount": 500_000_000}],
                 "tokenTransfers": [{"mint": mint, "fromUserAccount": "WhaleTriggerA", "toUserAccount": "Pool", "tokenAmount": 500_000.0}],
             }
         ],
-        config=cfg,
-        db=db_a,
+        config=cfg, db=db_a,
     )
     async with _make_monitor_client(sol_quote=0.26) as client:
         mon_a = await position_monitor_node(
             {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.45, "daily_pnl_sol": 0.0, "active_position": pos_a},
-            config=cfg,
-            db=db_a,
-            decision_client=dec,  # type: ignore[arg-type]
-            http_client=client,
-            now=now_dt,
+            config=cfg, db=db_a, decision_client=dec, http_client=client, now=now_dt,  # type: ignore[arg-type]
         )
         assert mon_a["pending_order"]["reason"] == "WHALE_SHADOW_EXIT"
         await executor_node(
             {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.45, "daily_pnl_sol": 0.0, "active_position": pos_a, "pending_order": mon_a["pending_order"]},
-            config=cfg,
-            db=db_a,
-            http_client=client,
+            config=cfg, db=db_a, http_client=client,
         )
     assert db_a.get_recent_closed_trades(limit=5)[0]["strategy"] == "WHALE_SCALP"
     db_a.close()
 
-    # (b) WHALE_FRONT_RUN_TP at +15% (0.25 -> 0.2875 SOL)
+    # (b) WHALE_PARTIAL_TP_50PCT (+15%) at +15% (0.25 -> 0.2875 SOL) scales out 50%
     db_b = AgentDatabase(db_path=str(tmp_path / "exit_b.duckdb"), starting_sol=0.7)
     async with _make_monitor_client(sol_quote=0.2875) as client:
         mon_b = await position_monitor_node(
             {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.45, "daily_pnl_sol": 0.0, "active_position": _open_whale_pos(0.25)},
-            config=cfg,
-            db=db_b,
-            decision_client=dec,  # type: ignore[arg-type]
-            http_client=client,
-            now=now_dt,
+            config=cfg, db=db_b, decision_client=dec, http_client=client, now=now_dt,  # type: ignore[arg-type]
         )
-    assert mon_b["pending_order"]["reason"] == "WHALE_FRONT_RUN_TP"
+    assert mon_b["pending_order"]["side"] == "PARTIAL_SELL"
+    assert mon_b["pending_order"]["reason"] == "WHALE_PARTIAL_TP_50PCT (+15%)"
+    assert mon_b["pending_order"]["amount_atomic"] == 500_000
     db_b.close()
 
     # (c1) WHALE_PEAK_TRAIL Tier 1: arms at +8% (0.2725 SOL = +9%), exits on 3.5% drop (0.2629 SOL)
@@ -363,11 +341,9 @@ async def test_whale_scalp_five_layer_exit_engine(tmp_path):
         assert m1["pending_order"] is None
         assert m1["active_position"]["trail_armed"] is True
     st_c1.update(m1)
-    # 2.5% drop from 0.2725 -> 0.2657 SOL (below 3.5% threshold -> still holds!)
     async with _make_monitor_client(sol_quote=0.2657) as client:
         m_hold = await position_monitor_node(st_c1, config=cfg, db=db_c1, decision_client=dec, http_client=client, now=now_dt)  # type: ignore[arg-type]
         assert m_hold["pending_order"] is None
-    # 3.6% drop from 0.2725 -> 0.2626 SOL -> exits WHALE_PEAK_TRAIL!
     async with _make_monitor_client(sol_quote=0.2626) as client:
         m2 = await position_monitor_node(st_c1, config=cfg, db=db_c1, decision_client=dec, http_client=client, now=now_dt)  # type: ignore[arg-type]
         assert m2["pending_order"]["reason"] == "WHALE_PEAK_TRAIL"
@@ -380,7 +356,7 @@ async def test_whale_scalp_five_layer_exit_engine(tmp_path):
         mt1 = await position_monitor_node(st_c2, config=cfg, db=db_c2, decision_client=dec, http_client=client, now=now_dt)  # type: ignore[arg-type]
         assert mt1["pending_order"] is None
     st_c2.update(mt1)
-    async with _make_monitor_client(sol_quote=0.2752) as client:  # 2.58% drop from 0.2825 peak
+    async with _make_monitor_client(sol_quote=0.2752) as client:
         mt2 = await position_monitor_node(st_c2, config=cfg, db=db_c2, decision_client=dec, http_client=client, now=now_dt)  # type: ignore[arg-type]
         assert mt2["pending_order"]["reason"] == "WHALE_PEAK_TRAIL"
     db_c2.close()
@@ -390,11 +366,7 @@ async def test_whale_scalp_five_layer_exit_engine(tmp_path):
     async with _make_monitor_client(sol_quote=0.225) as client:
         mon_d = await position_monitor_node(
             {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.45, "daily_pnl_sol": 0.0, "active_position": _open_whale_pos(0.25)},
-            config=cfg,
-            db=db_d,
-            decision_client=dec,  # type: ignore[arg-type]
-            http_client=client,
-            now=now_dt,
+            config=cfg, db=db_d, decision_client=dec, http_client=client, now=now_dt,  # type: ignore[arg-type]
         )
     assert mon_d["pending_order"]["reason"] == "WHALE_HARD_STOP"
     db_d.close()
@@ -403,37 +375,22 @@ async def test_whale_scalp_five_layer_exit_engine(tmp_path):
     db_e = AgentDatabase(db_path=str(tmp_path / "exit_e.duckdb"), starting_sol=0.7)
     opened_95s_ago = now_dt - timedelta(seconds=95)
     opened_305s_ago = now_dt - timedelta(seconds=305)
-    # At 95s (< 300s) with +2% PnL -> still holds!
     async with _make_monitor_client(sol_quote=0.255) as client:
         mon_e_early = await position_monitor_node(
             {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.45, "daily_pnl_sol": 0.0, "active_position": _open_whale_pos(0.25, opened_at=opened_95s_ago)},
-            config=cfg,
-            db=db_e,
-            decision_client=dec,  # type: ignore[arg-type]
-            http_client=client,
-            now=now_dt,
+            config=cfg, db=db_e, decision_client=dec, http_client=client, now=now_dt,  # type: ignore[arg-type]
         )
     assert mon_e_early["pending_order"] is None
-    # At 305s (>= 300s) with +5% PnL (>= +4%) -> holds!
     async with _make_monitor_client(sol_quote=0.2625) as client:
         mon_e_hold = await position_monitor_node(
             {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.45, "daily_pnl_sol": 0.0, "active_position": _open_whale_pos(0.25, opened_at=opened_305s_ago)},
-            config=cfg,
-            db=db_e,
-            decision_client=dec,  # type: ignore[arg-type]
-            http_client=client,
-            now=now_dt,
+            config=cfg, db=db_e, decision_client=dec, http_client=client, now=now_dt,  # type: ignore[arg-type]
         )
     assert mon_e_hold["pending_order"] is None
-    # At 305s (>= 300s) with +2% PnL (< +4%) -> WHALE_TIME_STOP!
     async with _make_monitor_client(sol_quote=0.255) as client:
         mon_e_stop = await position_monitor_node(
             {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.45, "daily_pnl_sol": 0.0, "active_position": _open_whale_pos(0.25, opened_at=opened_305s_ago)},
-            config=cfg,
-            db=db_e,
-            decision_client=dec,  # type: ignore[arg-type]
-            http_client=client,
-            now=now_dt,
+            config=cfg, db=db_e, decision_client=dec, http_client=client, now=now_dt,  # type: ignore[arg-type]
         )
     assert mon_e_stop["pending_order"]["reason"] == "WHALE_TIME_STOP"
     db_e.close()
@@ -462,75 +419,42 @@ def test_telemetry_whale_trades_stats_and_confluence_agent_reasons(tmp_path):
 
     # Seed two closed WHALE_SCALP trades (1 win +25%, 1 loss -12%)
     db.log_trade(
-        mode="paper",
-        side="SELL",
-        mint="MintWin1",
-        symbol="WIN1",
-        in_amount=1_000_000,
-        out_amount=312_500_000,
-        sol_value=0.3125,
-        pnl_sol=0.0625,
-        pnl_pct=0.25,
-        reason="WHALE_FRONT_RUN_TP",
-        strategy="WHALE_SCALP",
-        triggering_wallets=[jijo],
+        mode="paper", side="SELL", mint="MintWin1", symbol="WIN1",
+        in_amount=1_000_000, out_amount=312_500_000, sol_value=0.3125,
+        pnl_sol=0.0625, pnl_pct=0.25, reason="WHALE_PEAK_TRAIL",
+        strategy="WHALE_SCALP", triggering_wallets=[jijo],
         opened_at=(now_dt - timedelta(seconds=40)).isoformat(),
     )
     db.log_trade(
-        mode="paper",
-        side="SELL",
-        mint="MintLoss1",
-        symbol="LOS1",
-        in_amount=1_000_000,
-        out_amount=220_000_000,
-        sol_value=0.22,
-        pnl_sol=-0.03,
-        pnl_pct=-0.12,
-        reason="WHALE_HARD_STOP",
-        strategy="WHALE_SCALP",
-        triggering_wallets=[jijo],
+        mode="paper", side="SELL", mint="MintLoss1", symbol="LOS1",
+        in_amount=1_000_000, out_amount=220_000_000, sol_value=0.22,
+        pnl_sol=-0.03, pnl_pct=-0.12, reason="WHALE_HARD_STOP",
+        strategy="WHALE_SCALP", triggering_wallets=[jijo],
         opened_at=(now_dt - timedelta(seconds=60)).isoformat(),
     )
 
     # Seed a currently open WHALE_SCALP position
     open_pos = ActivePosition(
-        mint="MintOpen1",
-        symbol="OPENW",
-        entry_sol=0.25,
-        token_amount=1_000_000,
-        strategy="WHALE_SCALP",
-        triggering_wallets=[jijo],
+        mint="MintOpen1", symbol="OPENW", entry_sol=0.25, token_amount=1_000_000,
+        strategy="WHALE_SCALP", triggering_wallets=[jijo],
         opened_at=(now_dt - timedelta(seconds=15)).isoformat(),
-        current_sol_value=0.28,
-        peak_sol_value=0.28,
+        current_sol_value=0.28, peak_sol_value=0.28,
     ).model_dump()
     db.save_state(
-        focus_state=FocusState.IN_POSITION.value,
-        sol_balance=0.75,
-        daily_pnl_sol=0.0325,
-        active_position=open_pos,
+        focus_state=FocusState.IN_POSITION.value, sol_balance=0.75,
+        daily_pnl_sol=0.0325, active_position=open_pos,
     )
 
     # Seed two active whale signals: MintOpen1 (ENTERED) and MintSkip1 (SKIPPED: MCAP > $120K)
     db.record_whale_event(
-        signature="sig-open",
-        wallet=jijo,
-        mint="MintOpen1",
-        side="BUY",
-        sol_amount=2.5,
-        token_amount=500_000.0,
-        timestamp_utc=now_dt.isoformat(),
+        signature="sig-open", wallet=jijo, mint="MintOpen1", side="BUY",
+        sol_amount=2.5, token_amount=500_000.0, timestamp_utc=now_dt.isoformat(),
     )
     db.recompute_whale_signal("MintOpen1", ttl_minutes=30, now=now_dt)
 
     db.record_whale_event(
-        signature="sig-skip",
-        wallet=jijo,
-        mint="MintSkip1",
-        side="BUY",
-        sol_amount=2.2,
-        token_amount=400_000.0,
-        timestamp_utc=now_dt.isoformat(),
+        signature="sig-skip", wallet=jijo, mint="MintSkip1", side="BUY",
+        sol_amount=2.2, token_amount=400_000.0, timestamp_utc=now_dt.isoformat(),
     )
     db.recompute_whale_signal("MintSkip1", ttl_minutes=30, now=now_dt)
     db.upsert_whale_decision("MintSkip1", "SKIPPED", "MCAP > $120K", updated_at=now_dt.isoformat())

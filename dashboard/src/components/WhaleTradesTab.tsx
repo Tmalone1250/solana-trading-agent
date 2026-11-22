@@ -102,15 +102,23 @@ export function WhaleTradesTab({ whaleTrades, whaleStats, formatRelativeTime }: 
                     className={isOpen ? "bg-fuchsia-950/15 hover:bg-fuchsia-950/25" : "hover:bg-slate-800/30"}
                   >
                     <td className="px-4 py-3">
-                      <a
-                        href={`https://dexscreener.com/solana/${t.mint}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="inline-flex items-center gap-1 font-sans font-semibold text-slate-100 hover:text-sky-300"
-                      >
-                        ${t.symbol}
-                        <ExternalLink className="h-3 w-3 text-slate-500" />
-                      </a>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <a
+                          href={`https://dexscreener.com/solana/${t.mint}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 font-sans font-semibold text-slate-100 hover:text-sky-300"
+                        >
+                          ${t.symbol}
+                          <ExternalLink className="h-3 w-3 text-slate-500" />
+                        </a>
+                        {t.partial_tp_taken && (
+                          <span className="rounded-full border border-emerald-500/50 bg-emerald-500/20 px-1.5 py-0.5 font-mono text-[9px] font-semibold text-emerald-300">
+                            50% BANKED ({(t.realized_partial_pnl_sol ?? 0) >= 0 ? "+" : ""}
+                            {(t.realized_partial_pnl_sol ?? 0).toFixed(4)} SOL)
+                          </span>
+                        )}
+                      </div>
                       <div className="text-[10px] text-slate-500">{truncateAddress(t.mint)}</div>
                     </td>
                     <td className="px-4 py-3">

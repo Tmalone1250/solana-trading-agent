@@ -9,6 +9,7 @@ from typing import Any, Optional
 import httpx
 
 from batched_price_monitor import (
+    active_cost_basis_sol,
     apply_dex_flow_and_pnl,
     estimate_position_sol_value,
     fetch_batched_sol_prices,
@@ -39,12 +40,13 @@ def evaluate_whale_exit_order(
     db: AgentDatabase,
     now_dt: datetime,
 ) -> tuple[Optional[PendingOrder], str]:
-    """Evaluate the 6-layer WHALE_SCALP exit engine (Shadow, TP, 2-Tier Trail, BE Shield, Stop, Time)."""
+    """Evaluate the 6-layer WHALE_SCALP exit engine (Shadow, 2-Step Partial TP, Runner/2-Tier Trail, BE Shield, Stop, Time)."""
     if current_sol_value > pos.peak_sol_value:
         pos.peak_sol_value = current_sol_value
 
-    pnl_pct = (current_sol_value - pos.entry_sol) / pos.entry_sol if pos.entry_sol > 0 else 0.0
-    peak_pnl_pct = (pos.peak_sol_value - pos.entry_sol) / pos.entry_sol if pos.entry_sol > 0 else 0.0
+    cost_basis = active_cost_basis_sol(pos)
+    pnl_pct = (current_sol_value - cost_basis) / cost_basis if cost_basis > 0 else 0.0
+    peak_pnl_pct = (pos.peak_sol_value - cost_basis) / cost_basis if cost_basis > 0 else 0.0
     pnl_pct_100 = pnl_pct * 100.0
     peak_pnl_pct_100 = peak_pnl_pct * 100.0
 
@@ -53,46 +55,63 @@ def evaluate_whale_exit_order(
     if peak_pnl_pct_100 + EPS >= config.WHALE_TRAIL_ARM_PCT:
         pos.trail_armed = True
 
-    def _sell(reason: str, rationale: str) -> tuple[PendingOrder, str]:
+    def _sell(reason: str, rationale: str, *, side: str = "SELL", amount_atomic: Optional[int] = None, apply_cooldown: bool = True) -> tuple[PendingOrder, str]:
         return (
             PendingOrder(
-                side="SELL",
+                side=side,
                 mint=pos.mint,
                 symbol=pos.symbol,
-                amount_atomic=pos.token_amount,
+                amount_atomic=int(amount_atomic if amount_atomic is not None else pos.token_amount),
                 reason=reason,
-                target_state_after_fill=FocusState.SCANNING,
-                apply_cooldown=True,
+                target_state_after_fill=FocusState.IN_POSITION if side == "PARTIAL_SELL" else FocusState.SCANNING,
+                apply_cooldown=apply_cooldown,
                 strategy="WHALE_SCALP",
                 triggering_wallets=list(pos.triggering_wallets),
                 entry_mc_usd=pos.entry_mc_usd,
                 whale_sol_flow=pos.whale_sol_flow,
+                breakout_telemetry=pos.breakout_telemetry,
                 rationale=rationale,
             ),
             reason,
         )
 
-    # 1. Whale Shadow Exit: triggering whale sold this mint
-    db_shadow_flag = bool(db.get_state().get("whale_shadow_exit_requested", False))
+    # 1. Whale Shadow Exit: triggering whale sold this mint (top priority even on remaining 50% runner)
+    st_db = db.get_state()
+    db_shadow_flag = bool(st_db.get("whale_shadow_exit_requested", False)) and len(st_db.get("whale_positions") or []) <= 1
     if pos.whale_shadow_exit_flag or db_shadow_flag:
         return _sell(
             "WHALE_SHADOW_EXIT",
             f"[WHALE_SCALP EXIT] {pos.symbol}: WHALE_SHADOW_EXIT (triggering whale sold)",
         )
 
-    # 2. Front-Run Hard TP (+15%)
-    if pnl_pct_100 + EPS >= config.WHALE_TP_PCT:
-        return _sell(
-            "WHALE_FRONT_RUN_TP",
-            f"[WHALE_SCALP TP] {pos.symbol}: WHALE_FRONT_RUN_TP ({pnl_pct_100:+.2f}% >= +{config.WHALE_TP_PCT:.0f}%)",
-        )
+    # 2. Step 1 Scale-Out at +15% (WHALE_PARTIAL_TP_TRIGGER_PCT): sell 50%, arm +2% BE & -10% runner trail
+    whale_tp_trigger = float(config.WHALE_PARTIAL_TP_TRIGGER_PCT or config.PARTIAL_TP_TRIGGER_PCT)
+    whale_sell_frac = float(config.WHALE_PARTIAL_TP_SELL_FRACTION or config.PARTIAL_TP_SELL_FRACTION)
+    if not pos.partial_tp_taken and pos.token_amount >= 2 and pnl_pct_100 + EPS >= whale_tp_trigger:
+        sell_qty = int(pos.token_amount * whale_sell_frac)
+        if sell_qty > 0:
+            pct_label = int(round(whale_sell_frac * 100))
+            partial_reason = f"WHALE_PARTIAL_TP_{pct_label}PCT (+{whale_tp_trigger:.0f}%)"
+            return _sell(
+                partial_reason,
+                f"[WHALE_SCALP PARTIAL TP] {pos.symbol}: {partial_reason} ({pnl_pct_100:+.2f}% >= +{whale_tp_trigger:.0f}%)",
+                side="PARTIAL_SELL",
+                amount_atomic=sell_qty,
+                apply_cooldown=False,
+            )
 
-    # 3. 2-Tier Peak Drawdown Trail (+8%/-3.5% -> +12%/-2.5%)
-    if pos.trail_armed and pos.peak_sol_value > 0:
+    # 3. Peak Drawdown Trail: -10% (WHALE_RUNNER_TRAIL_PULLBACK_PCT) on remaining 50% runner; else 2-Tier (+8%/-3.5% -> +12%/-2.5%)
+    if (pos.trail_armed or pos.partial_tp_taken) and pos.peak_sol_value > 0:
+        raw_w_runner = float(config.WHALE_RUNNER_TRAIL_PULLBACK_PCT or config.RUNNER_TRAIL_PULLBACK_PCT)
+        w_runner_100 = raw_w_runner if raw_w_runner >= 1.0 else raw_w_runner * 100.0
         active_drop_limit = (
-            config.WHALE_TIGHT_TRAIL_DROP_PCT
-            if peak_pnl_pct_100 + EPS >= config.WHALE_TIGHT_TRAIL_ARM_PCT
-            else config.WHALE_TRAIL_DROP_PCT
+            w_runner_100
+            if pos.partial_tp_taken
+            else (
+                config.WHALE_TIGHT_TRAIL_DROP_PCT
+                if peak_pnl_pct_100 + EPS >= config.WHALE_TIGHT_TRAIL_ARM_PCT
+                else config.WHALE_TRAIL_DROP_PCT
+            )
         )
         drop_from_peak_100 = ((pos.peak_sol_value - current_sol_value) / pos.peak_sol_value) * 100.0
         if drop_from_peak_100 + EPS >= active_drop_limit:
@@ -102,12 +121,17 @@ def evaluate_whale_exit_order(
                 f"(peak {peak_pnl_pct_100:+.2f}%, drop -{drop_from_peak_100:.2f}% >= -{active_drop_limit:.1f}%)",
             )
 
-    # 4. Whale Breakeven Shield (+5% arm -> +1% floor)
-    if pos.breakeven_armed and pnl_pct_100 <= config.WHALE_BREAKEVEN_FLOOR_PCT + EPS:
+    # 4. Whale Breakeven Shield (+5% arm -> +1% floor pre-partial; +2% floor once partial_tp_taken)
+    be_floor_pct_100 = (
+        max(float(config.WHALE_BREAKEVEN_FLOOR_PCT), float(config.BREAKEVEN_FLOOR_PCT) * 100.0)
+        if pos.partial_tp_taken
+        else float(config.WHALE_BREAKEVEN_FLOOR_PCT)
+    )
+    if pos.breakeven_armed and pnl_pct_100 <= be_floor_pct_100 + EPS:
         return _sell(
             "WHALE_BREAKEVEN_SHIELD",
             f"[WHALE_SCALP BE] {pos.symbol}: WHALE_BREAKEVEN_SHIELD "
-            f"(armed >= +{config.WHALE_BREAKEVEN_ARM_PCT:.0f}%, hit floor {pnl_pct_100:+.2f}% <= +{config.WHALE_BREAKEVEN_FLOOR_PCT:.0f}%)",
+            f"(armed, hit floor {pnl_pct_100:+.2f}% <= +{be_floor_pct_100:.0f}%)",
         )
 
     # 5. Hard Stop (-10%)
@@ -117,8 +141,8 @@ def evaluate_whale_exit_order(
             f"[WHALE_SCALP STOP] {pos.symbol}: WHALE_HARD_STOP ({pnl_pct_100:+.2f}% <= {config.WHALE_HARD_STOP_PCT:.0f}%)",
         )
 
-    # 6. Configurable Time Stop (.env WHALE_TIME_STOP_SECONDS, default 300s)
-    if pos.opened_at:
+    # 6. Configurable Time Stop (.env WHALE_TIME_STOP_SECONDS, default 300s) for stagnant pre-partial positions
+    if not pos.partial_tp_taken and pos.opened_at:
         opened_dt = datetime.fromisoformat(pos.opened_at)
         if opened_dt.tzinfo is None:
             opened_dt = opened_dt.replace(tzinfo=timezone.utc)
@@ -235,6 +259,8 @@ async def run_whale_lane_tick(
                     )
                     sol_balance = float(ex.get("sol_balance", sol_balance))
                     daily_pnl = float(ex.get("daily_pnl_sol", daily_pnl))
+                    if exit_order.side.upper() == "PARTIAL_SELL" and isinstance(ex.get("whale_position"), dict):
+                        surviving.append(ex["whale_position"])
             whale_positions = surviving
             db.save_lane_positions(
                 lane="whale",
