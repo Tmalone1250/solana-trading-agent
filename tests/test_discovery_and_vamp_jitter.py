@@ -150,7 +150,7 @@ async def test_dexscreener_cto_and_gecko_merged_batch_lookup():
 @pytest.mark.asyncio
 async def test_vamp_jitter_two_consecutive_strikes_and_reset(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "vamp_jitter.duckdb"), starting_sol=0.7)
-    cfg = AgentConfig(_env_file=None)
+    cfg = AgentConfig(_env_file=None, NARRATIVE_CACHE_TTL_SECONDS=0)
     now_dt = datetime(2026, 11, 19, 17, 0, 0, tzinfo=timezone.utc)
 
     db.upsert_watchlist_entry(

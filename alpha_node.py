@@ -12,6 +12,7 @@ from config import LAMPORTS_PER_SOL, AgentConfig
 from db import AgentDatabase, utc_now
 from decision_client import GeminiDecisionClient
 from leg2_predictor import Leg2Result, compute_leg2_score
+from narrative_cache import get_cached_narrative, put_cached_narrative
 from ohlcv_client import (
     cache_breakout_telemetry,
     fetch_ohlcv_1m_batch,
@@ -397,15 +398,63 @@ async def alpha_node(
         min_buys=0,
         now=now_dt,
     )
-    input_text = _build_batch_entry_prompt(
-        safe_candidates,
-        leg2_results,
-        scalper_results,
-        social_by_mint=active_social,
-        whale_by_mint=active_whales,
-    )
-    questions = _build_batch_entry_questions(safe_candidates)
-    answers = await decision_client.decide(input_text=input_text, questions=questions)
+    cache_ttl = float(getattr(config, "NARRATIVE_CACHE_TTL_SECONDS", 1800.0))
+    now_ts = now_dt.timestamp()
+    answers: dict[str, dict[str, Any]] = {}
+    cache_meta_by_idx: dict[int, tuple[bool, str]] = {}
+    miss_indices: list[int] = []
+
+    for idx, cand in enumerate(safe_candidates):
+        cached = get_cached_narrative(cand["mint"], now_ts=now_ts, ttl_seconds=cache_ttl)
+        if cached is not None:
+            prefix = f"t{idx}"
+            answers[f"{prefix}_narrative_strength"] = cached["narrative_strength"]
+            answers[f"{prefix}_momentum_quality"] = cached["momentum_quality"]
+            answers[f"{prefix}_is_copycat_vamp"] = cached["is_copycat_vamp"]
+            answers[f"{prefix}_action"] = cached["action"]
+            cache_meta_by_idx[idx] = (True, str(cached["cached_at"]))
+            logger.info(
+                "[Alpha] $%s | serving cached Gemini narrative (cached_at=%s)",
+                cand.get("symbol", "UNKNOWN"),
+                cached["cached_at"],
+            )
+        else:
+            miss_indices.append(idx)
+
+    if miss_indices:
+        miss_cands = [safe_candidates[i] for i in miss_indices]
+        miss_leg2 = [leg2_results[i] for i in miss_indices]
+        miss_scalper = [scalper_results[i] for i in miss_indices]
+        input_text = _build_batch_entry_prompt(
+            miss_cands,
+            miss_leg2,
+            miss_scalper,
+            social_by_mint=active_social,
+            whale_by_mint=active_whales,
+        )
+        questions = _build_batch_entry_questions(miss_cands)
+        fresh_answers = await decision_client.decide(input_text=input_text, questions=questions)
+        for m_pos, orig_idx in enumerate(miss_indices):
+            m_pref = f"t{m_pos}"
+            o_pref = f"t{orig_idx}"
+            raw_narr = fresh_answers.get(f"{m_pref}_narrative_strength") or {}
+            raw_mom = fresh_answers.get(f"{m_pref}_momentum_quality") or {}
+            raw_vamp = fresh_answers.get(f"{m_pref}_is_copycat_vamp") or {}
+            raw_act = fresh_answers.get(f"{m_pref}_action") or {}
+            answers[f"{o_pref}_narrative_strength"] = raw_narr
+            answers[f"{o_pref}_momentum_quality"] = raw_mom
+            answers[f"{o_pref}_is_copycat_vamp"] = raw_vamp
+            answers[f"{o_pref}_action"] = raw_act
+            stored = put_cached_narrative(
+                safe_candidates[orig_idx]["mint"],
+                narrative_strength=raw_narr,
+                momentum_quality=raw_mom,
+                is_copycat_vamp=raw_vamp,
+                action=raw_act,
+                now_dt=now_dt,
+                ttl_seconds=cache_ttl,
+            )
+            cache_meta_by_idx[orig_idx] = (False, str(stored["cached_at"]))
 
     decisions: list[AlphaDecision] = []
     approved_pairs: list[tuple[AlphaDecision, dict[str, Any], bool, float, str, Optional[dict[str, Any]]]] = []
@@ -467,6 +516,7 @@ async def alpha_node(
             )
         decisions.append(dec)
 
+        c_hit, c_at = cache_meta_by_idx.get(idx, (False, now_iso))
         scores_payload = {
             "narrative_strength": dec.narrative_strength,
             "momentum_quality": dec.momentum_quality,
@@ -481,6 +531,8 @@ async def alpha_node(
             "dist_from_1h_high_pct": scalper.dist_from_1h_high_pct,
             "breakout_metrics": scalper.breakout_metrics,
             "breakout_telemetry": scalper.breakout_telemetry,
+            "narrative_cache_hit": c_hit,
+            "narrative_cached_at": c_at,
             "approved": dec.approved,
         }
 

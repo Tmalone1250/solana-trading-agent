@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -16,6 +17,33 @@ from db import AgentDatabase, utc_now, utc_now_iso
 from state import ActivePosition, AgentGraphState, FocusState, PendingOrder
 
 logger = logging.getLogger(__name__)
+_SELL_GUARD_TTL_SEC, _SELL_GUARD_MAX = 60.0, 64
+_inflight_sells: set[tuple[str, str, str, str]] = set()
+_recently_closed_sells: dict[tuple[str, str, str, str], float] = {}
+
+
+def clear_sell_idempotency_guard() -> None:
+    _inflight_sells.clear()
+    _recently_closed_sells.clear()
+
+
+def _prune_closed_sells(now_ts: float) -> None:
+    for k, ts in list(_recently_closed_sells.items()):
+        if (now_ts - ts) >= _SELL_GUARD_TTL_SEC:
+            _recently_closed_sells.pop(k, None)
+    while len(_recently_closed_sells) > _SELL_GUARD_MAX:
+        _recently_closed_sells.pop(min(_recently_closed_sells, key=_recently_closed_sells.get), None)
+
+
+def extract_raw_price_impact(order_resp: dict[str, Any]) -> Optional[str]:
+    """Preserve raw Jupiter /swap/v2/order priceImpactPct (provider percentage string) verbatim."""
+    if not isinstance(order_resp, dict):
+        return None
+    for key in ("priceImpactPct", "priceImpact"):
+        val = order_resp.get(key)
+        if val is not None and str(val).strip() != "":
+            return str(val).strip()
+    return None
 
 
 def sign_jupiter_transaction(tx_base64: str, private_key_bs58: str) -> str:
@@ -86,14 +114,10 @@ async def executor_node(
     if state.get("_hard_stop_already_executed"):
         st_done = db.get_state()
         return {
-            "focus_state": st_done["focus_state"],
-            "sol_balance": float(st_done["sol_balance"]),
-            "daily_pnl_sol": float(st_done["daily_pnl_sol"]),
-            "active_position": st_done["active_position"],
-            "chart_positions": st_done["chart_positions"],
-            "whale_position": st_done["whale_position"],
-            "whale_positions": st_done["whale_positions"],
-            "pending_order": None,
+            "focus_state": st_done["focus_state"], "sol_balance": float(st_done["sol_balance"]),
+            "daily_pnl_sol": float(st_done["daily_pnl_sol"]), "active_position": st_done["active_position"],
+            "chart_positions": st_done["chart_positions"], "whale_position": st_done["whale_position"],
+            "whale_positions": st_done["whale_positions"], "pending_order": None,
             "last_execution": state.get("last_execution"),
         }
 
@@ -140,6 +164,29 @@ async def executor_node(
             logger.warning("[Executor] Insufficient free SOL (%.4f < %.4f) for %s BUY", avail_sol, req_sol, order.symbol)
             return {"pending_order": None}
 
+    is_full_sell = (not is_buy) and (not is_partial_sell)
+    existing_for_fallback = (
+        state.get("whale_position") if is_whale_slot else state.get("active_position")
+    ) or (state.get("active_position") if is_whale_slot else None)
+    sell_key: Optional[tuple[str, str, str, str]] = None
+    if is_full_sell:
+        lane_tag = "whale" if is_whale_slot else "chart"
+        opened_tag = str(existing_for_fallback.get("opened_at") or "") if isinstance(existing_for_fallback, dict) else ""
+        sell_key = (str(db.db_path), lane_tag, order.mint, opened_tag)
+        _prune_closed_sells(time.monotonic())
+        live_lane_list = whale_positions if is_whale_slot else chart_positions
+        in_live_db = any(isinstance(p, dict) and p.get("mint") == order.mint for p in live_lane_list)
+        if sell_key in _inflight_sells or sell_key in _recently_closed_sells or (existing_for_fallback is None and not in_live_db):
+            logger.warning("[Executor] Duplicate/already-closed full SELL skipped for %s (%s)", order.symbol, order.reason)
+            return {
+                "focus_state": st_live["focus_state"], "sol_balance": float(st_live["sol_balance"]),
+                "daily_pnl_sol": float(st_live["daily_pnl_sol"]), "active_position": st_live["active_position"],
+                "chart_positions": st_live["chart_positions"], "whale_position": st_live["whale_position"],
+                "whale_positions": st_live["whale_positions"], "pending_order": None,
+                "last_execution": state.get("last_execution"),
+            }
+        _inflight_sells.add(sell_key)
+
     input_mint = SOL_MINT if is_buy else order.mint
     output_mint = order.mint if is_buy else SOL_MINT
 
@@ -150,9 +197,6 @@ async def executor_node(
 
     owns_client = http_client is None
     client = http_client or httpx.AsyncClient()
-    existing_for_fallback = (
-        state.get("whale_position") if is_whale_slot else state.get("active_position")
-    ) or state.get("active_position")
     try:
         try:
             order_resp = await fetch_jupiter_order(
@@ -196,12 +240,15 @@ async def executor_node(
         else:
             tx_signature = f"paper-{order.side.lower()}-{order.mint[:8]}"
     finally:
+        if sell_key is not None:
+            _inflight_sells.discard(sell_key)
         if owns_client:
             await client.aclose()
 
     sol_balance = float(state.get("sol_balance") or 0.0)
     daily_pnl_sol = float(state.get("daily_pnl_sol") or 0.0)
     tx_fee_sol = float(config.PAPER_TX_FEE_SOL) if config.EXECUTION_MODE == "paper" else 0.0
+    raw_price_impact = extract_raw_price_impact(order_resp)
     existing_pos_dict = (
         state.get("whale_position") if is_whale_slot else state.get("active_position")
     )
@@ -242,6 +289,7 @@ async def executor_node(
             in_amount=order.amount_atomic, out_amount=out_amount, sol_value=spent_sol,
             reason=order.reason, tx_signature=tx_signature, rationale=order.rationale,
             strategy=pos_strategy, triggering_wallets=list(order.triggering_wallets),
+            jupiter_price_impact_raw=raw_price_impact,
         )
         action_type = "REENTRY_BUY" if order.reason == "LEG_2_REENTRY" else "BUY"
         bt = order.breakout_telemetry or {}
@@ -258,6 +306,7 @@ async def executor_node(
             breakout_timeframe=bt.get("timeframe"), breakout_vol_ratio=bt.get("vol_ratio"),
             breakout_ema_ext_pct=bt.get("ema_ext_pct"),
             breakout_failed_gates="; ".join(bt.get("failed_gates") or []) if bt else None,
+            jupiter_price_impact_raw=raw_price_impact,
         )
         logger.info("[%s] BUY %s: %.4f SOL -> %d tokens (reason=%s)", config.EXECUTION_MODE.upper(), order.symbol, spent_sol, out_amount, order.reason)
     elif is_partial_sell:
@@ -401,12 +450,16 @@ async def executor_node(
             if order.apply_cooldown:
                 db.set_cooldown(order.mint, hours=config.COOLDOWN_HOURS, reason=order.reason)
 
+        if sell_key is not None:
+            _recently_closed_sells[sell_key] = time.monotonic()
+            _prune_closed_sells(time.monotonic())
         logger.info("[%s] SELL %s: %d tokens -> %.4f SOL (PnL %+.4f SOL / %+.2f%%, reason=%s -> %s)", config.EXECUTION_MODE.upper(), order.symbol, order.amount_atomic, received_sol, pnl_sol, pnl_pct * 100.0, order.reason, next_state)
 
     last_exec = {
         "side": order.side, "mint": order.mint, "symbol": order.symbol,
         "in_amount": order.amount_atomic, "out_amount": out_amount,
         "tx_signature": tx_signature, "reason": order.reason,
+        "jupiter_price_impact_raw": raw_price_impact,
     }
     if is_whale_slot:
         updated_whales = [p for p in whale_positions if isinstance(p, dict) and p.get("mint") != order.mint]

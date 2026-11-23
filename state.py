@@ -189,4 +189,5 @@ class AgentGraphState(TypedDict, total=False):
     pending_order: Optional[dict[str, Any]]
     last_execution: Optional[dict[str, Any]]
     monitor_event: Optional[str]
+    _hard_stop_already_executed: bool
     error: Optional[str]

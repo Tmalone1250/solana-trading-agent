@@ -181,6 +181,7 @@ class AgentConfig(BaseSettings):
     # Loop, Persistence & Telemetry
     MONITOR_POLL_SECONDS: float = Field(default=5.0, gt=0.0)
     SCAN_POLL_SECONDS: float = Field(default=15.0, gt=0.0)
+    NARRATIVE_CACHE_TTL_SECONDS: int = Field(default=1800, ge=0)
     DUCKDB_PATH: str = "solana_meme_agent.duckdb"
     TELEMETRY_HOST: str = "0.0.0.0"
     TELEMETRY_PORT: int = 8001

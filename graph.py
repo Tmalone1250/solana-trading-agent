@@ -40,6 +40,8 @@ def _route_after_safety(state: AgentGraphState) -> str:
 
 
 def _route_if_order(state: AgentGraphState) -> str:
+    if state.get("_hard_stop_already_executed"):
+        return END
     if state.get("pending_order"):
         return "executor"
     return END

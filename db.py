@@ -100,7 +100,8 @@ class AgentDatabase:
                     rationale VARCHAR,
                     strategy VARCHAR DEFAULT 'SCALPER',
                     triggering_wallets_json VARCHAR DEFAULT '[]',
-                    opened_at VARCHAR
+                    opened_at VARCHAR,
+                    jupiter_price_impact_raw VARCHAR
                 )
                 """
             )
@@ -316,6 +317,7 @@ class AgentDatabase:
             ("strategy", "VARCHAR DEFAULT 'SCALPER'"),
             ("triggering_wallets_json", "VARCHAR DEFAULT '[]'"),
             ("opened_at", "VARCHAR"),
+            ("jupiter_price_impact_raw", "VARCHAR"),
         ]:
             if col not in trade_cols:
                 self._conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type}")
@@ -973,6 +975,7 @@ class AgentDatabase:
         strategy: str = "SCALPER",
         triggering_wallets: Optional[list[str]] = None,
         opened_at: Optional[str] = None,
+        jupiter_price_impact_raw: Optional[str] = None,
     ) -> None:
         with self._lock:
             self._conn.execute(
@@ -980,8 +983,8 @@ class AgentDatabase:
                 INSERT INTO trades (
                     timestamp, mode, side, mint, symbol, in_amount, out_amount,
                     sol_value, pnl_sol, pnl_pct, reason, tx_signature, rationale,
-                    strategy, triggering_wallets_json, opened_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    strategy, triggering_wallets_json, opened_at, jupiter_price_impact_raw
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     utc_now_iso(),
@@ -1000,6 +1003,7 @@ class AgentDatabase:
                     strategy or "SCALPER",
                     json.dumps(triggering_wallets or []),
                     opened_at,
+                    jupiter_price_impact_raw,
                 ],
             )
 
@@ -1250,6 +1254,7 @@ class AgentDatabase:
         breakout_vol_ratio: Optional[float] = None,
         breakout_ema_ext_pct: Optional[float] = None,
         breakout_failed_gates: Optional[str] = None,
+        jupiter_price_impact_raw: Optional[str] = None,
     ) -> None:
         """Append a structured board action row to DuckDB action_log."""
         ts = timestamp_utc or utc_now_iso()
@@ -1283,6 +1288,7 @@ class AgentDatabase:
                     peak_pnl_pct, hold_seconds, triggering_whales, whale_sol_flow,
                     breakout_score, breakout_state, breakout_timeframe,
                     breakout_vol_ratio, breakout_ema_ext_pct, breakout_failed_gates,
+                    jupiter_price_impact_raw,
                 ],
             )
 
