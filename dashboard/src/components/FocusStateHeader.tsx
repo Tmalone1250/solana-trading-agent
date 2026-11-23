@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Activity, Download, ShieldAlert, ShieldCheck, Wallet } from "lucide-react";
+import { Download, ShieldAlert, ShieldCheck, Wallet } from "lucide-react";
 import { FocusState, TelemetryPayload, formatShortTime, formatSol } from "@/lib/types";
 
 interface Props {
@@ -73,12 +73,14 @@ export function FocusStateHeader({ telemetry, agentUrl, error, lastFetchedAt }: 
         {/* Left: Title + Live Focus State Badge + Mode */}
         <div className="flex flex-wrap items-center gap-3">
           <div className="flex items-center gap-2.5">
-            <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-slate-700/80 bg-slate-950 text-sky-400">
-              <Activity className="h-5 w-5" />
-            </div>
+            <img
+              src="/chibi_agent.png"
+              alt="Chibi Trading Agent"
+              className="h-10 w-10 rounded-full border border-sky-400/40 bg-slate-950 object-cover"
+            />
             <div>
               <h1 className="text-base font-semibold tracking-tight text-slate-100 sm:text-lg">
-                solana-meme-agent
+                Chibi Trading Agent
               </h1>
               <p className="font-mono text-[11px] text-slate-400">
                 {agentUrl} {lastFetchedAt ? `• polled ${lastFetchedAt}` : ""}
