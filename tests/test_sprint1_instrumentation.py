@@ -366,3 +366,113 @@ async def test_hard_stop_loss_no_duplicate_sell_in_graph_or_concurrent_executor(
     assert len(db2.get_action_log(limit=10, actions=["SELL"])) == 1
     db2.close()
     clear_sell_idempotency_guard()
+
+
+@pytest.mark.asyncio
+async def test_graph_multi_slot_chart_routing_scans_below_cap_and_stops_at_cap(tmp_path):
+    """With 1/3 Chart slots open and no exit, graph runs position_monitor -> scanner -> safety -> alpha -> executor; at 3/3 it stops at END."""
+    from graph import build_agent_graph
+    from ohlcv_client import clear_ohlcv_cache
+    from scanner_node import clear_geckoterminal_cache
+    from state import ActivePosition
+    from tests.test_scalper_entry_engine import make_sweep_reclaim_candles
+
+    clear_geckoterminal_cache()
+    clear_ohlcv_cache()
+    clear_narrative_cache()
+
+    db = AgentDatabase(db_path=str(tmp_path / "multislot.duckdb"), starting_sol=2.0)
+    cfg = AgentConfig(
+        _env_file=None, EXECUTION_MODE="paper", HUNTING_LANE="graduations",
+        MAX_CHART_POSITIONS=3, MAX_OPEN_POSITIONS=6, TRADE_SIZE_SOL=0.50,
+        OHLCV_PACING_DELAY_SECONDS=0.0, ENABLE_JUPITER_DISCOVERY=False,
+    )
+    now_dt = datetime.now(timezone.utc)
+    mint_open = "MintOpenSlot1111111111111111111111111111111"
+    mint_stale = "MintStaleWatch11111111111111111111111111111"
+    mint_new = "MintNewSlot22222222222222222222222222222222"
+
+    pos1 = ActivePosition(
+        mint=mint_open, symbol="OPEN1", entry_sol=0.50, token_amount=1_000_000,
+        strategy="BREAKOUT_IGNITION", opened_at=now_dt.isoformat(),
+        current_sol_value=0.50, peak_sol_value=0.50, reference_token_amount=1_000_000,
+        entry_liquidity_usd=80_000.0,
+    ).model_dump()
+    db.save_lane_positions(lane="chart", positions=[pos1], sol_balance=1.50, daily_pnl_sol=0.0, focus_state=FocusState.IN_POSITION.value, active_position=pos1)
+    # Seed 1 stale watchlist entry (>15m) and 1 soaked candidate ready for Chart slot 2
+    db.upsert_watchlist_entry(mint=mint_stale, symbol="STALE", pair_address="PoolStale", candidate={"mint": mint_stale, "symbol": "STALE"}, added_at=(now_dt - timedelta(minutes=25)).isoformat())
+    db.upsert_watchlist_entry(mint=mint_new, symbol="NEW2", pair_address="PoolNew2", candidate={"mint": mint_new, "symbol": "NEW2"}, added_at=(now_dt - timedelta(minutes=5)).isoformat())
+
+    sweep_ohlcv = [[c["timestamp"], c["open"], c["high"], c["low"], c["close"], c["volume"]] for c in make_sweep_reclaim_candles()]
+    stub_dec = CountingStubDecisionClient({
+        "t0_narrative_strength": {"type": "score", "score": 4.5, "confidence": 0.92},
+        "t0_momentum_quality": {"type": "score", "score": 4.3, "confidence": 0.91},
+        "t0_is_copycat_vamp": {"type": "noul", "noul": 0.10, "confidence": 0.95},
+        "t0_action": {"type": "choice", "choice": "BUY", "confidence": 0.90},
+    })
+    boost_calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "token-boosts" in url:
+            boost_calls["n"] += 1
+            return httpx.Response(200, json=[
+                {"chainId": "solana", "tokenAddress": mint_open, "totalAmount": 300},
+                {"chainId": "solana", "tokenAddress": mint_new, "totalAmount": 200},
+            ])
+        if "token-profiles" in url or "community-takeovers" in url or ("geckoterminal.com" in url and "/ohlcv/" not in url):
+            return httpx.Response(200, json=[] if "dexscreener" in url else {"data": []})
+        if "/ohlcv/minute" in url:
+            return httpx.Response(200, json={"data": {"attributes": {"ohlcv_list": sweep_ohlcv}}})
+        if "/tokens/v1/solana/" in url:
+            return httpx.Response(200, json=[
+                {"chainId": "solana", "pairAddress": "PoolOpen1", "baseToken": {"address": mint_open, "symbol": "OPEN1"}, "priceNative": "0.51", "marketCap": 100_000, "liquidity": {"usd": 80_000}, "volume": {"h1": 80_000, "m5": 12_000}, "txns": {"m5": {"buys": 35, "sells": 10}}},
+                {"chainId": "solana", "pairAddress": "PoolNew2", "baseToken": {"address": mint_new, "symbol": "NEW2"}, "priceNative": "0.50", "marketCap": 100_000, "liquidity": {"usd": 60_000}, "volume": {"h1": 90_000, "m5": 15_000}, "txns": {"m5": {"buys": 40, "sells": 10}}},
+                {"chainId": "solana", "pairAddress": "PoolOpen3", "baseToken": {"address": "MintOpenSlot3333333333333333333333333333333", "symbol": "OPEN3"}, "priceNative": "0.51", "marketCap": 100_000, "liquidity": {"usd": 80_000}, "volume": {"h1": 80_000, "m5": 12_000}, "txns": {"m5": {"buys": 35, "sells": 10}}},
+            ])
+        if "rugcheck.xyz" in url:
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/ultra/v1/shield" in url:
+            return httpx.Response(200, json={"warnings": {mint_new: []}})
+        if "/swap/v2/order" in url:
+            return httpx.Response(200, json={"outAmount": "1000000", "transaction": None})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        compiled = build_agent_graph(config=cfg, db=db, decision_client=stub_dec, http_client=client)  # type: ignore[arg-type]
+        st = db.get_state()
+        res1 = await compiled.ainvoke({
+            "focus_state": st["focus_state"], "sol_balance": st["sol_balance"],
+            "daily_start_sol": st["daily_start_sol"], "daily_pnl_sol": st["daily_pnl_sol"],
+            "active_position": st["active_position"], "chart_positions": st["chart_positions"],
+            "whale_positions": st["whale_positions"],
+        })
+
+        # Slot 1 stayed open, stale watchlist token evicted, and Slot 2 opened concurrently!
+        assert boost_calls["n"] >= 1
+        assert stub_dec.calls == 1
+        open_mints_after = {p["mint"] for p in res1["chart_positions"]}
+        assert open_mints_after == {mint_open, mint_new}
+        assert all(w["mint"] != mint_stale for w in db.get_watchlist())
+        assert all(w["mint"] != mint_open for w in db.get_watchlist())
+
+        # Now saturate MAX_CHART_POSITIONS=3 -> graph must stop at END after position_monitor (no scanner/alpha call)
+        pos3 = ActivePosition(
+            mint="MintOpenSlot3333333333333333333333333333333", symbol="OPEN3", entry_sol=0.50,
+            token_amount=1_000_000, strategy="SCALPER", opened_at=now_dt.isoformat(),
+            current_sol_value=0.51, peak_sol_value=0.51, reference_token_amount=1_000_000, entry_liquidity_usd=80_000.0,
+        ).model_dump()
+        full_charts = list(res1["chart_positions"]) + [pos3]
+        db.save_lane_positions(lane="chart", positions=full_charts, sol_balance=0.50, daily_pnl_sol=0.0, focus_state=FocusState.IN_POSITION.value, active_position=full_charts[0])
+        prev_boosts = boost_calls["n"]
+        prev_dec_calls = stub_dec.calls
+        await compiled.ainvoke({
+            "focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.50,
+            "daily_start_sol": 2.0, "daily_pnl_sol": 0.0,
+            "active_position": full_charts[0], "chart_positions": full_charts, "whale_positions": [],
+        })
+        assert boost_calls["n"] == prev_boosts
+        assert stub_dec.calls == prev_dec_calls
+
+    db.close()
+    clear_narrative_cache()

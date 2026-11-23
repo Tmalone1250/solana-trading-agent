@@ -597,9 +597,16 @@ async def scanner_node(
             trig["age_seconds"],
         )
 
-    # Hard Guardrail: reject tokens flagged audit.isSus == True by Jupiter Token v2
+    # Hard Guardrail: reject tokens flagged audit.isSus == True or already open in Chart/Whale slots
+    open_mints = db.get_all_open_mints()
+    for p in (state.get("chart_positions") or []) + (state.get("whale_positions") or []) + [state.get("active_position"), state.get("whale_position")]:
+        if isinstance(p, dict) and p.get("mint"):
+            open_mints.add(str(p["mint"]))
+
     clean_eligible: list[CandidateToken] = []
     for c in eligible:
+        if c.mint in open_mints:
+            continue
         j_meta = jup_meta_by_mint.get(c.mint)
         if j_meta and j_meta.get("is_sus") is True:
             logger.info(

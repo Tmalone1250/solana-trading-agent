@@ -86,6 +86,16 @@ def build_agent_graph(
     async def _executor(state: AgentGraphState):
         return await executor_node(state, config=config, db=db, http_client=http_client)
 
+    def _route_after_position_monitor(state: AgentGraphState) -> str:
+        if state.get("pending_order") and not state.get("_hard_stop_already_executed"):
+            return "executor"
+        if "chart_positions" in state:
+            chart_open = len(state.get("chart_positions") or [])
+            whale_open = len(state.get("whale_positions") or [])
+            if chart_open < config.MAX_CHART_POSITIONS and (chart_open + whale_open) < config.MAX_OPEN_POSITIONS:
+                return "scanner"
+        return END
+
     graph.add_node("scanner", _scanner)
     graph.add_node("safety_gate", _safety_gate)
     graph.add_node("alpha", _alpha)
@@ -114,8 +124,8 @@ def build_agent_graph(
     )
     graph.add_conditional_edges(
         "position_monitor",
-        _route_if_order,
-        {"executor": "executor", END: END},
+        _route_after_position_monitor,
+        {"executor": "executor", "scanner": "scanner", END: END},
     )
     graph.add_edge("executor", END)
 

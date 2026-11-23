@@ -1,16 +1,12 @@
-# Fix Duplicate `HARD_STOP_LOSS` SELL Execution Plan
+# Fix Multi-Slot Chart Routing (`graph.py`, `safety_gate_node.py`, `scanner_node.py`)
 
 ## Root Cause
-- `position_monitor_node.py` executed `executor_node(...)` immediately on `HARD_STOP_LOSS` and returned `"pending_order": hs_order.model_dump()` alongside `"_hard_stop_already_executed": True`.
-- Because `_hard_stop_already_executed` was not declared on `AgentGraphState` in `state.py`, LangGraph silently stripped the flag when merging state, causing `_route_if_order` in `graph.py` to route `pending_order` to `executor_node` a second time ~200ms later with `active_position=None` (logging a duplicate `0.00%` SELL and deducting an extra `PAPER_TX_FEE_SOL`).
+- `graph.py` routed `position_monitor -> END` whenever no `pending_order` was emitted, freezing the 5-slot rotating watchlist and blocking Chart slots 2–3 whenever `len(chart_positions) >= 1`.
+- `safety_gate_node.py` also short-circuited on `focus_state != SCANNING`, blocking multi-slot Chart entries when `focus_state == IN_POSITION`.
+- `scanner_node.py` did not filter out already-open mints from `chart_positions` / `whale_positions` during watchlist backfill.
 
 ## Fix
-1. **Eliminate double-trigger path (`state.py`, `graph.py`):**
-   - Declare `_hard_stop_already_executed: bool` in `AgentGraphState`.
-   - Short-circuit `_route_if_order` in `graph.py` to `END` whenever `_hard_stop_already_executed` is truthy.
-2. **Enforce SELL idempotency (`executor_node.py`):**
-   - Add a bounded in-flight & recently-closed SELL guard (`_inflight_sells` + `_recently_closed_sells`, max 64 entries / 60s TTL) keyed by `(db.db_path, lane, mint, opened_at)`.
-   - Reject duplicate concurrent/back-to-back full `SELL` calls and already-closed positions before calling Jupiter or writing to DuckDB.
-3. **Verification (`tests/test_sprint1_instrumentation.py`):**
-   - Add regression tests covering both LangGraph end-to-end `HARD_STOP_LOSS` and concurrent/back-to-back `executor_node` `SELL` calls for the same position, asserting 1 fill, 1 `sol_balance` credit, and 1 DuckDB closed trade row.
-   - Run `./venv/bin/pytest -v`.
+1. **`graph.py`:** Add `_route_after_position_monitor` so when `position_monitor` has no executable `pending_order` (or after an already-executed hard stop) AND `len(chart_positions) < config.MAX_CHART_POSITIONS` (and total open `< config.MAX_OPEN_POSITIONS`), it routes to `scanner` instead of `END`.
+2. **`safety_gate_node.py`:** Mirror the `if "chart_positions" in state:` multi-slot capacity check used by `scanner_node.py` and `alpha_node.py`.
+3. **`scanner_node.py`:** Exclude all open mints (`chart_positions`, `whale_positions`, `active_position`, `whale_position`) from `clean_eligible` so open positions never re-enter the watchlist.
+4. **Verification (`tests/test_sprint1_instrumentation.py`):** Add unit test verifying `len(chart_positions) == 1 < 3` runs `position_monitor -> scanner -> safety_gate -> alpha -> executor` (evicting stale watchlist entries and opening slot 2), while `len(chart_positions) == 3` stops at `END`. Run `./venv/bin/pytest -v`.

@@ -271,7 +271,12 @@ async def safety_gate_node(
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
     """LangGraph node: deterministically filters candidates before calling Gemini."""
-    if state.get("focus_state") != FocusState.SCANNING.value:
+    if "chart_positions" in state:
+        chart_open = len(state.get("chart_positions") or [])
+        whale_open = len(state.get("whale_positions") or [])
+        if chart_open >= config.MAX_CHART_POSITIONS or (chart_open + whale_open) >= config.MAX_OPEN_POSITIONS:
+            return {"safe_candidates": [], "rejected_candidates": []}
+    elif state.get("focus_state") != FocusState.SCANNING.value:
         return {"safe_candidates": [], "rejected_candidates": []}
 
     raw_candidates = state.get("raw_candidates") or []
