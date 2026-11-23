@@ -1718,7 +1718,7 @@ class AgentDatabase:
                         "age_seconds": round(age_sec, 1),
                     }
                 )
-            elif min_confluence_wallets <= 1 and solo_wallets:
+            elif solo_wallets:
                 triggers.append(
                     {
                         "mint": mint,

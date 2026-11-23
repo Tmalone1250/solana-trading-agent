@@ -155,21 +155,19 @@ async def test_whale_scalp_fast_track_confluence_and_solo_buy_within_mcap_band(t
     assert tel["whale_position"]["strategy"] == "WHALE_SCALP"
     assert len(tel["active_positions"]) == 1
 
-    # Solo buy MUST NOT trigger when WHALE_MIN_UNIQUE_WALLETS=2
+    # Solo buy >= min_solo_sol MUST trigger SOLO even when WHALE_MIN_UNIQUE_WALLETS=2; below threshold must not
     db2 = AgentDatabase(db_path=str(tmp_path / "whale_solo.duckdb"), starting_sol=0.7)
     db2.record_whale_event(
-        signature="sig-solo-1",
-        wallet="WhaleBig",
-        mint="MintSolo60",
-        side="BUY",
-        sol_amount=5.0,
-        token_amount=500_000.0,
-        timestamp_utc=(now_dt - timedelta(seconds=15)).isoformat(),
+        signature="sig-solo-pass", wallet="WhaleBig", mint="MintSoloPass", side="BUY",
+        sol_amount=1.5, token_amount=500_000.0, timestamp_utc=(now_dt - timedelta(seconds=15)).isoformat(),
     )
-    trigs = db2.get_whale_fast_track_triggers(
-        max_age_seconds=60, min_confluence_wallets=2, min_solo_sol=1.5, now=now_dt
+    db2.record_whale_event(
+        signature="sig-solo-small", wallet="WhaleSmall", mint="MintSoloSmall", side="BUY",
+        sol_amount=0.5, token_amount=100_000.0, timestamp_utc=(now_dt - timedelta(seconds=10)).isoformat(),
     )
-    assert trigs == []
+    trigs = db2.get_whale_fast_track_triggers(max_age_seconds=60, min_confluence_wallets=2, min_solo_sol=0.9, now=now_dt)
+    assert len(trigs) == 1 and trigs[0]["mint"] == "MintSoloPass" and trigs[0]["trigger_type"] == "SOLO"
+    assert trigs[0]["triggering_wallets"] == ["WhaleBig"]
 
     db.close()
     db2.close()
