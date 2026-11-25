@@ -69,6 +69,7 @@ def evaluate_whale_exit_order(
                 side=side,
                 mint=pos.mint,
                 symbol=pos.symbol,
+                opened_at=pos.opened_at,
                 amount_atomic=int(amount_atomic if amount_atomic is not None else pos.token_amount),
                 reason=reason,
                 target_state_after_fill=FocusState.IN_POSITION if side == "PARTIAL_SELL" else FocusState.SCANNING,
@@ -78,15 +79,22 @@ def evaluate_whale_exit_order(
                 entry_mc_usd=pos.entry_mc_usd,
                 whale_sol_flow=pos.whale_sol_flow,
                 breakout_telemetry=pos.breakout_telemetry,
+                monitor_sol_value=round(current_sol_value, 6),
+                price_source=pos.last_price_source,
                 rationale=rationale,
             ),
             reason,
         )
 
-    # 1. Whale Shadow Exit: triggering whale sold this mint (top priority even on remaining 50% runner)
-    st_db = db.get_state()
-    db_shadow_flag = bool(st_db.get("whale_shadow_exit_requested", False)) and len(st_db.get("whale_positions") or []) <= 1
-    if pos.whale_shadow_exit_flag or db_shadow_flag:
+    # 1. Whale Shadow Exit: rely strictly on per-position whale_shadow_exit_flag (hydrated from live DB by mint/opened_at)
+    if not pos.whale_shadow_exit_flag:
+        st_db = db.get_state()
+        for db_p in list(st_db.get("whale_positions") or []) + [st_db.get("active_position")]:
+            if isinstance(db_p, dict) and db_p.get("mint") == pos.mint and db_p.get("whale_shadow_exit_flag"):
+                if not pos.opened_at or not db_p.get("opened_at") or pos.opened_at == db_p.get("opened_at"):
+                    pos.whale_shadow_exit_flag = True
+                    break
+    if pos.whale_shadow_exit_flag:
         return _sell(
             "WHALE_SHADOW_EXIT",
             f"[WHALE_SCALP EXIT] {pos.symbol}: WHALE_SHADOW_EXIT (triggering whale sold)",
@@ -236,13 +244,13 @@ async def run_whale_lane_tick(
             open_mints = [str(p["mint"]) for p in whale_positions if isinstance(p, dict) and p.get("mint")]
             sol_prices, dex_flow = await fetch_batched_sol_prices(open_mints, config, client, now_ts=now_dt.timestamp())
             surviving: list[dict[str, Any]] = []
-            for raw_p in whale_positions:
+            for idx, raw_p in enumerate(whale_positions):
                 pos = ActivePosition.model_validate(raw_p)
                 flow = dex_flow.get(pos.mint)
                 if isinstance(flow, dict) and flow.get("decimals") is not None:
                     pos.decimals = int(flow["decimals"])
                 est_val = estimate_position_sol_value(pos, sol_prices.get(pos.mint), token_decimals=pos.decimals)
-                curr_val, _used_q = await resolve_position_sol_value(
+                curr_val, used_q = await resolve_position_sol_value(
                     pos,
                     estimated_sol_value=est_val,
                     config=config,
@@ -250,7 +258,7 @@ async def run_whale_lane_tick(
                     now_dt=now_dt,
                     has_batched_price=(pos.mint in sol_prices),
                 )
-                apply_dex_flow_and_pnl(pos, current_sol_value=curr_val, flow=flow, lane_label="whale_slot")
+                apply_dex_flow_and_pnl(pos, current_sol_value=curr_val, flow=flow, lane_label="whale_slot", used_exact_quote=used_q)
                 hs_whale = await enforce_hard_stop_if_hit(
                     pos, current_sol_value=curr_val, config=config, db=db, client=client, lane="whale"
                 )
@@ -264,6 +272,7 @@ async def run_whale_lane_tick(
                 if exit_order is None:
                     surviving.append(pos.model_dump())
                 else:
+                    full_remaining = surviving + [pos.model_dump()] + whale_positions[idx + 1 :]
                     ex = await executor_node(
                         {
                             "focus_state": st["focus_state"],
@@ -272,7 +281,7 @@ async def run_whale_lane_tick(
                             "active_position": chart_pos_raw,
                             "chart_positions": chart_positions,
                             "whale_position": pos.model_dump(),
-                            "whale_positions": surviving + [pos.model_dump()],
+                            "whale_positions": full_remaining,
                             "pending_order": exit_order.model_dump(),
                             "slot": "whale_slot",
                         },
@@ -282,15 +291,22 @@ async def run_whale_lane_tick(
                     )
                     sol_balance = float(ex.get("sol_balance", sol_balance))
                     daily_pnl = float(ex.get("daily_pnl_sol", daily_pnl))
-                    if exit_order.side.upper() == "PARTIAL_SELL" and isinstance(ex.get("whale_position"), dict):
-                        surviving.append(ex["whale_position"])
-            whale_positions = surviving
-            db.save_lane_positions(
-                lane="whale",
-                positions=whale_positions,
-                sol_balance=sol_balance,
-                daily_pnl_sol=daily_pnl,
-            )
+                    if exit_order.side.upper() == "PARTIAL_SELL":
+                        updated_p = next(
+                            (
+                                wp for wp in (ex.get("whale_positions") or [])
+                                if isinstance(wp, dict) and wp.get("mint") == pos.mint
+                                and (not pos.opened_at or wp.get("opened_at") == pos.opened_at)
+                            ),
+                            ex.get("whale_position"),
+                        )
+                        if isinstance(updated_p, dict):
+                            surviving.append(updated_p)
+            whale_positions = db.update_lane_positions_only(lane="whale", positions=surviving)
+            st_fresh = db.get_state()
+            sol_balance = float(st_fresh["sol_balance"])
+            daily_pnl = float(st_fresh["daily_pnl_sol"])
+            chart_positions = list(st_fresh.get("chart_positions") or [])
 
         # Step 2: Check capacity (MAX_WHALE_POSITIONS=3, MAX_OPEN_POSITIONS=6), circuit breaker & free SOL
         total_open = len(chart_positions) + len(whale_positions)
@@ -304,12 +320,22 @@ async def run_whale_lane_tick(
         min_unique = config.whale_min_unique_wallets()
         min_liq = config.whale_min_liquidity_usd()
         triggers = db.get_whale_fast_track_triggers(
-            confluence_window_minutes=5,
-            max_age_seconds=config.WHALE_ENTRY_MAX_AGE_SECONDS,
-            min_confluence_wallets=min_unique,
-            min_solo_sol=config.WHALE_MIN_SOLO_BUY_SOL,
-            now=now_dt,
+            confluence_window_minutes=5, max_age_seconds=config.WHALE_ENTRY_MAX_AGE_SECONDS,
+            min_confluence_wallets=min_unique, min_solo_sol=config.WHALE_MIN_SOLO_BUY_SOL, now=now_dt,
         )
+        trig_mints = {t["mint"] for t in triggers}
+        for w_mint, sig in db.get_active_whale_signals(ttl_minutes=config.WHALE_SIGNAL_TTL_MINUTES, min_buys=1, now=now_dt).items():
+            if w_mint in trig_mints:
+                continue
+            if db.is_on_cooldown(w_mint, now=now_dt):
+                db.upsert_whale_decision(w_mint, "SKIPPED", "COOLDOWN", updated_at=now_dt.isoformat())
+                continue
+            seen_dt = datetime.fromisoformat(sig["last_seen_utc"])
+            if seen_dt.tzinfo is None:
+                seen_dt = seen_dt.replace(tzinfo=timezone.utc)
+            age_s = max(0.0, (now_dt - seen_dt).total_seconds())
+            skip_r = f"STALE > {config.WHALE_ENTRY_MAX_AGE_SECONDS}s" if age_s > config.WHALE_ENTRY_MAX_AGE_SECONDS else f"< {min_unique} UNIQUE WHALES"
+            db.upsert_whale_decision(w_mint, "SKIPPED", skip_r, updated_at=now_dt.isoformat())
         if not triggers:
             return {"slot": "whale_slot", "event": "NO_QUALIFYING_CONFLUENCE", "whale_positions": whale_positions}
 
@@ -415,55 +441,34 @@ async def run_whale_lane_tick(
             entry_reason = "WHALE_BREAKOUT_CONFLUENCE" if bt_state == "IGNITION" else f"WHALE_SCALP_{trig_type}"
             db.upsert_whale_decision(mint, "ENTERED", entry_reason, updated_at=now_dt.isoformat(), breakout_telemetry=bt)
             db.log_action(
-                mode=config.EXECUTION_MODE,
-                action="WHALE_CONFLUENCE",
-                symbol=symbol,
-                asset_id=mint,
-                notional=round(config.WHALE_POSITION_SOL, 6),
-                strategy="WHALE_SCALP",
-                reason=entry_reason,
-                timestamp_utc=now_dt.isoformat(),
-                mc_usd=round(mc_usd, 2) if mc_usd else None,
+                mode=config.EXECUTION_MODE, action="WHALE_CONFLUENCE", symbol=symbol, asset_id=mint,
+                notional=round(config.WHALE_POSITION_SOL, 6), strategy="WHALE_SCALP", reason=entry_reason,
+                timestamp_utc=now_dt.isoformat(), mc_usd=round(mc_usd, 2) if mc_usd else None,
                 liq_usd=round(liq_usd, 2) if liq_usd else None,
                 triggering_whales=",".join(config.resolve_wallet_label(w) for w in trig_wallets),
-                whale_sol_flow=round(total_sol, 6),
-                **bt_log_kwargs,
+                whale_sol_flow=round(total_sol, 6), **bt_log_kwargs,
             )
             order = PendingOrder(
-                side="BUY",
-                mint=mint,
-                symbol=symbol,
+                side="BUY", mint=mint, symbol=symbol,
                 amount_atomic=int(round(config.WHALE_POSITION_SOL * LAMPORTS_PER_SOL)),
-                reason=entry_reason,
-                target_state_after_fill=FocusState.IN_POSITION,
-                apply_cooldown=False,
-                entry_liquidity_usd=liq_usd,
+                reason=entry_reason, target_state_after_fill=FocusState.IN_POSITION,
+                apply_cooldown=False, entry_liquidity_usd=liq_usd,
                 entry_mc_usd=round(mc_usd, 2) if mc_usd else None,
-                whale_sol_flow=round(total_sol, 6),
-                strategy="WHALE_SCALP",
-                triggering_wallets=trig_wallets,
-                breakout_telemetry=bt or None,
+                whale_sol_flow=round(total_sol, 6), strategy="WHALE_SCALP",
+                triggering_wallets=trig_wallets, breakout_telemetry=bt or None,
                 rationale=f"[{entry_reason}] {symbol} ({mint[:6]}..): {len(trig_wallets)} whales, {total_sol:.2f} SOL, breakout={bt_score}/100 ({bt_state})",
             )
             exec_out = await executor_node(
                 {
-                    "focus_state": st["focus_state"],
-                    "sol_balance": sol_balance,
-                    "daily_pnl_sol": daily_pnl,
-                    "active_position": chart_pos_raw,
-                    "chart_positions": chart_positions,
+                    "focus_state": st["focus_state"], "sol_balance": sol_balance, "daily_pnl_sol": daily_pnl,
+                    "active_position": chart_pos_raw, "chart_positions": chart_positions,
                     "whale_position": whale_positions[0] if whale_positions else None,
-                    "whale_positions": whale_positions,
-                    "pending_order": order.model_dump(),
-                    "slot": "whale_slot",
+                    "whale_positions": whale_positions, "pending_order": order.model_dump(), "slot": "whale_slot",
                 },
-                config=config,
-                db=db,
-                http_client=client,
+                config=config, db=db, http_client=client,
             )
             return {
-                "slot": "whale_slot",
-                "event": f"{entry_reason}_ENTERED",
+                "slot": "whale_slot", "event": f"{entry_reason}_ENTERED",
                 "whale_position": exec_out.get("whale_position"),
                 "whale_positions": exec_out.get("whale_positions", whale_positions),
                 "last_execution": exec_out.get("last_execution"),

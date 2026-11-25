@@ -146,8 +146,12 @@ def build_loss_attribution(
                     best_buy_gap = gap
                     best_buy = b
 
-        mfe = best_o.get("mfe_pct") if best_o else None
-        mae = best_o.get("mae_pct") if best_o else None
+        pos_mfe = sell.get("position_mfe_pct")
+        pos_mae = sell.get("position_mae_pct")
+        has_pos_metrics = pos_mfe is not None or pos_mae is not None
+        metrics_source = "position_anchored" if has_pos_metrics else "candidate_joined_provisional"
+        mfe = pos_mfe if pos_mfe is not None else (best_o.get("mfe_pct") if best_o else None)
+        mae = pos_mae if pos_mae is not None else (best_o.get("mae_pct") if best_o else None)
         p5 = best_o.get("price_5m_pct") if best_o else None
         p15 = best_o.get("price_15m_pct") if best_o else None
         p30 = best_o.get("price_30m_pct") if best_o else None
@@ -184,12 +188,23 @@ def build_loss_attribution(
             secondary.append("late_breakout_confirmation")
         if "STOP" in reason.upper() and ((p15 is not None and p15 > 0.0) or (p30 is not None and p30 > 0.0)):
             secondary.append("stop_triggered_during_recovery")
-        raw_imp = (best_buy or {}).get("jupiter_price_impact_raw")
-        try:
-            imp_num = abs(float(raw_imp)) if raw_imp not in (None, "") else None
-        except (TypeError, ValueError):
-            imp_num = None
-        if (imp_num is not None and imp_num >= 2.0) or friction_pct >= 3.0:
+
+        # Trigger high_entry_friction ONLY from observed price impact (>=2.0%) or monitor-vs-fill slippage (>=2.0%)
+        max_obs_impact = 0.0
+        for raw_imp in ((best_buy or {}).get("jupiter_price_impact_raw"), sell.get("jupiter_price_impact_raw")):
+            try:
+                if raw_imp not in (None, ""):
+                    max_obs_impact = max(max_obs_impact, abs(float(raw_imp)))
+            except (TypeError, ValueError):
+                pass
+        mon_val = sell.get("monitor_sol_value")
+        fill_val = sell.get("notional")
+        obs_slippage_pct = (
+            ((float(mon_val) - float(fill_val)) / float(mon_val)) * 100.0
+            if mon_val is not None and fill_val is not None and float(mon_val) > 0
+            else 0.0
+        )
+        if max_obs_impact >= 2.0 or obs_slippage_pct >= 2.0:
             secondary.append("high_entry_friction")
 
         sim_net_pnl = round(float(pnl_pct) - friction_pct, 2) if pnl_pct is not None else None
@@ -203,6 +218,7 @@ def build_loss_attribution(
                 "simulated_net_pnl_pct": sim_net_pnl,
                 "mfe_pct": mfe,
                 "mae_pct": mae,
+                "metrics_source": metrics_source,
                 "price_15m_pct": p15,
                 "price_30m_pct": p30,
                 "primary_cause": primary,
@@ -351,8 +367,11 @@ def build_wallet_attribution(
                     exit_before_exp += 1
 
         med_hold = safe_median(holds)
-        fast_farmer = (med_hold is not None and med_hold < FAST_EXIT_FARMER_SECONDS) or any(
-            h < FAST_EXIT_FARMER_SECONDS for h in holds
+        hold_count = len(holds)
+        fast_exit_count = sum(1 for h in holds if h < FAST_EXIT_FARMER_SECONDS)
+        fast_exit_rate = round(fast_exit_count / hold_count, 3) if hold_count > 0 else 0.0
+        fast_farmer = (med_hold is not None and med_hold < FAST_EXIT_FARMER_SECONDS) or (
+            fast_exit_count >= 2 and fast_exit_rate >= 0.30
         )
         report.append(
             {
@@ -364,6 +383,9 @@ def build_wallet_attribution(
                 "median_fwd_15m_pct": safe_median(fwd15),
                 "median_r_1_to_5_pct": safe_median(r_1_5),
                 "median_r_1_to_15_pct": safe_median(r_1_15),
+                "hold_count": hold_count,
+                "fast_exit_count": fast_exit_count,
+                "fast_exit_rate": fast_exit_rate,
                 "median_hold_seconds": med_hold,
                 "wallet_exit_before_expansion_count": exit_before_exp,
                 "fast_exit_farmer": fast_farmer,

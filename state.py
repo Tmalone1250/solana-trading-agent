@@ -81,9 +81,10 @@ class ReentryDecision(BaseModel):
 class PendingOrder(BaseModel):
     """Order instruction emitted by alpha_node or position_monitor_node."""
 
-    side: str  # "BUY" or "SELL"
+    side: str  # "BUY", "PARTIAL_SELL", or "SELL"
     mint: str
     symbol: str
+    opened_at: Optional[str] = None
     amount_atomic: int  # lamports for BUY, token atomic units for SELL
     reason: str
     target_state_after_fill: FocusState
@@ -95,6 +96,8 @@ class PendingOrder(BaseModel):
     strategy: str = "SCALPER"
     triggering_wallets: list[str] = Field(default_factory=list)
     breakout_telemetry: Optional[dict[str, Any]] = None
+    monitor_sol_value: Optional[float] = None
+    price_source: Optional[str] = None
     rationale: str = ""
 
 
@@ -132,6 +135,9 @@ class ActivePosition(BaseModel):
     last_5m_buy_ratio: Optional[float] = None
     last_5m_sell_ratio: Optional[float] = None
     last_liquidity_usd: Optional[float] = None
+    last_price_source: Optional[str] = None
+    position_mfe_pct: Optional[float] = None
+    position_mae_pct: Optional[float] = None
 
     @model_validator(mode="after")
     def _ensure_cost_basis_fields(self) -> "ActivePosition":

@@ -434,7 +434,7 @@ def process_helius_webhook_payload(
                 )
         elif ev["side"] == "BUY":
             st = db.get_state()
-            if st.get("whale_position") is not None:
+            if len(st.get("whale_positions") or []) >= config.MAX_WHALE_POSITIONS:
                 db.upsert_whale_decision(ev["mint"], "SKIPPED", "POSITION_OPEN", updated_at=now_dt.isoformat())
             record_outcome_snapshot(
                 db, mint=ev["mint"], symbol=ev["token_symbol"], source="WHALE_WEBHOOK", decision="WHALE_BUY",

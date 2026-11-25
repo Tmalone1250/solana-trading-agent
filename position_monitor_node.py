@@ -10,13 +10,17 @@ import httpx
 
 from alpha_node import evaluate_leg2_reentry
 from batched_price_monitor import (
-    active_cost_basis_sol,
     apply_dex_flow_and_pnl,
-    enforce_hard_stop_if_hit,
     estimate_position_sol_value,
     fetch_batched_sol_prices,
-    is_hard_stop_hit,
     resolve_position_sol_value,
+)
+from chart_exit_engine import (
+    PRIO_HARD_STOP,
+    PRIO_PARTIAL_TP,
+    compute_exodus,
+    evaluate_chart_position_exit,
+    pos_matches,
 )
 from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
 from db import AgentDatabase, utc_now
@@ -29,35 +33,6 @@ logger = logging.getLogger(__name__)
 EPS = 1e-9
 
 
-def _compute_exodus(
-    *,
-    buys_5m: int,
-    sells_5m: int,
-    entry_liquidity_usd: float,
-    current_liquidity_usd: float,
-    config: AgentConfig,
-) -> tuple[bool, float, float, str]:
-    """Return (is_exodus, sell_ratio_5m, liq_drop_pct, detail)."""
-    total_5m = buys_5m + sells_5m
-    sell_ratio = (sells_5m / total_5m) if total_5m > 0 else 0.0
-    liq_drop_pct = (
-        (entry_liquidity_usd - current_liquidity_usd) / entry_liquidity_usd
-        if entry_liquidity_usd > 0 and current_liquidity_usd > 0
-        else 0.0
-    )
-    if total_5m > 0 and sell_ratio >= config.EXODUS_SELL_RATIO:
-        return (
-            True, sell_ratio, liq_drop_pct,
-            f"EXODUS_SELL_FLOW (5m sells={sell_ratio * 100:.1f}% >= {config.EXODUS_SELL_RATIO * 100:.0f}%)",
-        )
-    if entry_liquidity_usd > 0 and current_liquidity_usd > 0 and liq_drop_pct >= config.EXODUS_LIQ_DROP_PCT:
-        return (
-            True, sell_ratio, liq_drop_pct,
-            f"EXODUS_LIQ_DROP (liq drop={liq_drop_pct * 100:.1f}% >= {config.EXODUS_LIQ_DROP_PCT * 100:.0f}%)",
-        )
-    return (False, sell_ratio, liq_drop_pct, "")
-
-
 async def position_monitor_node(
     state: AgentGraphState,
     *,
@@ -67,7 +42,7 @@ async def position_monitor_node(
     http_client: Optional[httpx.AsyncClient] = None,
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
-    """LangGraph node: monitors single active mint in IN_POSITION or WATCHING_REENTRY."""
+    """LangGraph node: monitors all open Chart slots (1–3) + WATCHING_REENTRY."""
     focus_state = state.get("focus_state")
     raw_chart_list = list(state.get("chart_positions") or [])
     if focus_state not in (FocusState.IN_POSITION.value, FocusState.WATCHING_REENTRY.value) and not raw_chart_list:
@@ -77,245 +52,152 @@ async def position_monitor_node(
     if not raw_pos:
         return {"focus_state": FocusState.SCANNING.value, "active_position": None, "chart_positions": [], "pending_order": None}
 
-    pos = ActivePosition.model_validate(raw_pos)
-    is_holding_tokens = pos.token_amount > 0 or focus_state == FocusState.IN_POSITION.value
-    quote_amount = pos.token_amount if pos.token_amount > 0 else pos.reference_token_amount
-    if quote_amount <= 0:
-        quote_amount = 1_000_000
+    primary_pos = ActivePosition.model_validate(raw_pos)
+    primary_is_watch = (primary_pos.token_amount <= 0) and (focus_state == FocusState.WATCHING_REENTRY.value)
 
-    all_chart_dicts: list[dict[str, Any]] = []
-    seen_mints: set[str] = set()
-    for p_item in [pos.model_dump(), *raw_chart_list]:
-        if isinstance(p_item, dict) and p_item.get("mint") and p_item["mint"] not in seen_mints:
-            seen_mints.add(str(p_item["mint"]))
-            all_chart_dicts.append(p_item)
+    # Deduplicate open token-holding Chart positions by (mint, opened_at) while preserving order
+    open_chart_positions: list[ActivePosition] = []
+    for p_item in ([primary_pos.model_dump()] if not primary_is_watch else []) + raw_chart_list:
+        if not isinstance(p_item, dict) or not p_item.get("mint"):
+            continue
+        cp_cand = ActivePosition.model_validate(p_item)
+        if cp_cand.token_amount <= 0 and not (not open_chart_positions and not primary_is_watch):
+            continue
+        if not any(pos_matches(existing.model_dump(), cp_cand.mint, cp_cand.opened_at) for existing in open_chart_positions):
+            open_chart_positions.append(cp_cand)
 
+    all_mints = list(dict.fromkeys([cp.mint for cp in open_chart_positions] + ([primary_pos.mint] if primary_is_watch else [])))
     now_dt = now or utc_now()
     owns_client = http_client is None
     client = http_client or httpx.AsyncClient()
+    st_latest = db.get_state()
+    sol_balance = float(state.get("sol_balance") if "sol_balance" in state else st_latest.get("sol_balance") or 0.0)
+    daily_pnl_sol = float(state.get("daily_pnl_sol") if "daily_pnl_sol" in state else st_latest.get("daily_pnl_sol") or 0.0)
+
     try:
-        sol_prices, dex_flow = await fetch_batched_sol_prices(
-            list(seen_mints), config, client, now_ts=now_dt.timestamp()
-        )
+        sol_prices, dex_flow = await fetch_batched_sol_prices(all_mints, config, client, now_ts=now_dt.timestamp())
+
+        # Evaluate EVERY open Chart slot (Slots 1, 2, and 3) independently with full 5-layer exit protection
+        triggered_exits: list[tuple[int, int, ActivePosition, PendingOrder, str]] = []
+        for slot_idx, cp in enumerate(open_chart_positions):
+            ef = dex_flow.get(cp.mint) or {"buys_5m": 0, "sells_5m": 0, "liquidity_usd": 0.0, "pair": {}}
+            if isinstance(ef, dict) and ef.get("decimals") is not None:
+                cp.decimals = int(ef["decimals"])
+            q_amt = cp.token_amount if cp.token_amount > 0 else max(1, cp.reference_token_amount or 1_000_000)
+            est_val = estimate_position_sol_value(cp, sol_prices.get(cp.mint), token_decimals=cp.decimals)
+            curr_val, used_q = await resolve_position_sol_value(
+                cp, estimated_sol_value=est_val, config=config, client=client,
+                now_dt=now_dt, has_batched_price=(cp.mint in sol_prices), quote_amount=q_amt,
+            )
+            b5, s5, _, c_liq = apply_dex_flow_and_pnl(
+                cp, current_sol_value=curr_val, flow=ef, lane_label="chart_slot", used_exact_quote=used_q,
+            )
+
+            # Legacy Slot-1 WHALE_SCALP delegation (for backward-compatible single-slot whale exit tests)
+            if str(cp.strategy or "").upper() == "WHALE_SCALP":
+                from whale_lane import evaluate_whale_exit_order
+
+                w_order, w_ev = evaluate_whale_exit_order(cp, current_sol_value=curr_val, config=config, db=db, now_dt=now_dt)
+                if w_order is not None:
+                    return {"active_position": cp.model_dump(), "pending_order": w_order.model_dump(), "monitor_event": w_ev}
+                cp_d = cp.model_dump()
+                db.update_lane_positions_only(lane="whale", positions=[cp_d], focus_state=FocusState.IN_POSITION.value, active_position=cp_d)
+                return {"active_position": cp_d, "pending_order": None, "monitor_event": w_ev}
+
+            order, ev, prio = evaluate_chart_position_exit(
+                cp, current_sol_value=curr_val, buys_5m=b5, sells_5m=s5, current_liquidity_usd=c_liq, config=config,
+            )
+            if order is not None:
+                triggered_exits.append((prio, slot_idx, cp, order, ev))
+
+        updated_open_dicts = [cp.model_dump() for cp in open_chart_positions]
+        if open_chart_positions:
+            db.update_lane_positions_only(
+                lane="chart", positions=updated_open_dicts,
+                focus_state=FocusState.WATCHING_REENTRY.value if primary_is_watch else FocusState.IN_POSITION.value,
+                active_position=primary_pos.model_dump() if primary_is_watch else updated_open_dicts[0],
+            )
+
+        if triggered_exits:
+            # Sort protective exits (HARD_STOP_LOSS=0, EXODUS=1) ahead of profit-taking exits
+            triggered_exits.sort(key=lambda item: (item[0], item[1]))
+            first_prio, _, first_cp, first_order, first_ev = triggered_exits[0]
+
+            # Single-slot non-immediate exit returns PendingOrder for graph/caller execution compatibility
+            if len(open_chart_positions) == 1 and not primary_is_watch and len(triggered_exits) == 1 and first_prio not in (PRIO_HARD_STOP, PRIO_PARTIAL_TP):
+                return {"active_position": first_cp.model_dump(), "chart_positions": updated_open_dicts, "pending_order": first_order.model_dump(), "monitor_event": first_ev}
+
+            # Multi-slot exits or immediate Hard Stop / Partial TP: execute SEQUENTIALLY with refreshed DB state
+            last_out: dict[str, Any] = {}
+            events: list[str] = []
+            any_hs = False
+            for prio, _, cp, order, ev in triggered_exits:
+                if prio == PRIO_HARD_STOP:
+                    any_hs = True
+                st_step = db.get_state()
+                live_charts = list(st_step.get("chart_positions") or updated_open_dicts)
+                target_dict = next((p for p in live_charts if isinstance(p, dict) and pos_matches(p, cp.mint, cp.opened_at)), cp.model_dump())
+                step_sol = sol_balance if len(events) == 0 else float(st_step["sol_balance"])
+                step_pnl = daily_pnl_sol if len(events) == 0 else float(st_step["daily_pnl_sol"])
+                last_out = await executor_node(
+                    {
+                        "focus_state": FocusState.IN_POSITION.value,
+                        "sol_balance": step_sol,
+                        "daily_pnl_sol": step_pnl,
+                        "active_position": target_dict,
+                        "chart_positions": live_charts,
+                        "pending_order": order.model_dump(),
+                    },
+                    config=config, db=db, http_client=client,
+                )
+                events.append(ev)
+
+            single_hs = len(triggered_exits) == 1 and first_prio == PRIO_HARD_STOP
+            return {
+                "focus_state": last_out["focus_state"],
+                "sol_balance": last_out["sol_balance"],
+                "daily_pnl_sol": last_out["daily_pnl_sol"],
+                "active_position": last_out["active_position"],
+                "chart_positions": last_out["chart_positions"],
+                "pending_order": first_order.model_dump() if single_hs else None,
+                "monitor_event": "; ".join(events),
+                "last_execution": last_out.get("last_execution"),
+                "_hard_stop_already_executed": any_hs,
+            }
+
+        if not primary_is_watch:
+            return {
+                "active_position": updated_open_dicts[0],
+                "chart_positions": updated_open_dicts,
+                "pending_order": None,
+                "monitor_event": "HOLD_IN_POSITION",
+            }
+
+        # Refresh primary WATCHING_REENTRY quote while client is open
+        pos = primary_pos
+        updated_extra_charts = updated_open_dicts
         flow = dex_flow.get(pos.mint) or {"buys_5m": 0, "sells_5m": 0, "liquidity_usd": 0.0, "pair": {}}
         if isinstance(flow, dict) and flow.get("decimals") is not None:
             pos.decimals = int(flow["decimals"])
+        quote_amount = pos.reference_token_amount if pos.reference_token_amount > 0 else 1_000_000
         est_sol = estimate_position_sol_value(pos, sol_prices.get(pos.mint), token_decimals=pos.decimals)
-        current_sol_value, _ = await resolve_position_sol_value(
+        current_sol_value, used_watch_q = await resolve_position_sol_value(
             pos, estimated_sol_value=est_sol, config=config, client=client,
             now_dt=now_dt, has_batched_price=(pos.mint in sol_prices), quote_amount=quote_amount,
         )
-        # Also refresh any additional open chart positions (slots 2 & 3) and enforce HARD_STOP_LOSS
-        updated_extra_charts: list[dict[str, Any]] = []
-        for extra_d in all_chart_dicts[1:]:
-            ep = ActivePosition.model_validate(extra_d)
-            ef = dex_flow.get(ep.mint)
-            if isinstance(ef, dict) and ef.get("decimals") is not None:
-                ep.decimals = int(ef["decimals"])
-            e_est = estimate_position_sol_value(ep, sol_prices.get(ep.mint), token_decimals=ep.decimals)
-            e_curr, _ = await resolve_position_sol_value(
-                ep, estimated_sol_value=e_est, config=config, client=client,
-                now_dt=now_dt, has_batched_price=(ep.mint in sol_prices),
-            )
-            apply_dex_flow_and_pnl(ep, current_sol_value=e_curr, flow=ef, lane_label="chart_slot")
-            hs_extra = await enforce_hard_stop_if_hit(
-                ep, current_sol_value=e_curr, config=config, db=db, client=client, lane="chart"
-            )
-            if hs_extra is None:
-                updated_extra_charts.append(ep.model_dump())
     finally:
         if owns_client:
             await client.aclose()
 
     buys_5m, sells_5m, buy_ratio_5m, current_liq = apply_dex_flow_and_pnl(
-        pos, current_sol_value=current_sol_value, flow=flow,
-        lane_label="chart_slot" if is_holding_tokens else "watch_reentry",
+        pos, current_sol_value=current_sol_value, flow=flow, lane_label="watch_reentry", used_exact_quote=used_watch_q,
     )
     total_5m = buys_5m + sells_5m
-
-    is_exodus, sell_ratio_5m, _, exodus_reason = _compute_exodus(
+    is_exodus, sell_ratio_5m, _, exodus_reason = compute_exodus(
         buys_5m=buys_5m, sells_5m=sells_5m,
         entry_liquidity_usd=pos.entry_liquidity_usd, current_liquidity_usd=current_liq, config=config,
     )
     pos.last_5m_sell_ratio = sell_ratio_5m
-
-    st_latest = db.get_state()
-    sol_balance = float(state.get("sol_balance") if "sol_balance" in state else st_latest.get("sol_balance") or 0.0)
-    daily_pnl_sol = float(state.get("daily_pnl_sol") if "daily_pnl_sol" in state else st_latest.get("daily_pnl_sol") or 0.0)
-
-    def _sync_chart_list(primary: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
-        if primary is not None and is_holding_tokens:
-            return [primary, *updated_extra_charts]
-        return list(updated_extra_charts)
-
-    # =========================================================================
-    # STATE 2: IN_POSITION (or any active position holding tokens > 0)
-    # =========================================================================
-    if is_holding_tokens:
-        if current_sol_value > pos.peak_sol_value:
-            pos.peak_sol_value = current_sol_value
-
-        cost_basis = active_cost_basis_sol(pos)
-        pnl_pct = (current_sol_value - cost_basis) / cost_basis if cost_basis > 0 else 0.0
-        peak_pnl_pct = (pos.peak_sol_value - cost_basis) / cost_basis if cost_basis > 0 else 0.0
-        pnl_pct_100 = pnl_pct * 100.0
-
-        # Dedicated WHALE_SCALP 6-Layer Exit Engine (delegated to whale_lane.py)
-        if str(pos.strategy or "").upper() == "WHALE_SCALP":
-            from whale_lane import evaluate_whale_exit_order
-
-            now_dt = now or utc_now()
-            exit_order, monitor_event = evaluate_whale_exit_order(
-                pos, current_sol_value=current_sol_value, config=config, db=db, now_dt=now_dt,
-            )
-            if exit_order is not None:
-                return {"active_position": pos.model_dump(), "pending_order": exit_order.model_dump(), "monitor_event": monitor_event}
-            pos_dict = pos.model_dump()
-            db.save_state(focus_state=FocusState.IN_POSITION.value, sol_balance=sol_balance, daily_pnl_sol=daily_pnl_sol, active_position=pos_dict)
-            return {"active_position": pos_dict, "pending_order": None, "monitor_event": monitor_event}
-
-        # 0. Unconditional Hard Stop (-10% against remaining_cost_basis_sol) -> immediate 100% SELL -> SCANNING + cooldown
-        hs_hit, hs_pnl_100, hs_limit_100 = is_hard_stop_hit(pos, current_sol_value, config)
-        if hs_hit or pnl_pct <= -config.HARD_STOP_LOSS_PCT + EPS:
-            hs_reason = f"HARD_STOP_LOSS ({hs_pnl_100:+.2f}% <= {hs_limit_100:.0f}%)"
-            hs_order = PendingOrder(
-                side="SELL", mint=pos.mint, symbol=pos.symbol, amount_atomic=pos.token_amount,
-                reason=hs_reason, target_state_after_fill=FocusState.SCANNING, apply_cooldown=True,
-                strategy=pos.strategy or "SCALPER",
-                rationale=f"[MONITOR EXIT] {pos.symbol}: {hs_reason}",
-            )
-            hs_owns = http_client is None
-            hs_client = http_client or httpx.AsyncClient()
-            try:
-                hs_out = await executor_node(
-                    {
-                        "focus_state": FocusState.IN_POSITION.value, "sol_balance": sol_balance,
-                        "daily_pnl_sol": daily_pnl_sol, "active_position": pos.model_dump(),
-                        "chart_positions": _sync_chart_list(pos.model_dump()),
-                        "pending_order": hs_order.model_dump(),
-                    },
-                    config=config, db=db, http_client=hs_client,
-                )
-            finally:
-                if hs_owns:
-                    await hs_client.aclose()
-            return {
-                "focus_state": hs_out["focus_state"],
-                "sol_balance": hs_out["sol_balance"],
-                "daily_pnl_sol": hs_out["daily_pnl_sol"],
-                "active_position": hs_out["active_position"],
-                "chart_positions": hs_out["chart_positions"],
-                "pending_order": hs_order.model_dump(),
-                "monitor_event": hs_reason,
-                "last_execution": hs_out.get("last_execution"),
-                "_hard_stop_already_executed": True,
-            }
-
-        if peak_pnl_pct + EPS >= config.BREAKEVEN_ARM_PCT:
-            pos.breakeven_armed = True
-        if peak_pnl_pct + EPS >= config.TRAIL_ARM_PCT:
-            pos.trail_armed = True
-
-        # Step 1 — 2-Step Partial Take-Profit (Scale-Out 50% at +15%)
-        if not pos.partial_tp_taken and pos.token_amount >= 2 and pnl_pct_100 + EPS >= config.PARTIAL_TP_TRIGGER_PCT:
-            sell_qty = int(pos.token_amount * config.PARTIAL_TP_SELL_FRACTION)
-            if sell_qty > 0:
-                partial_reason = f"PARTIAL_TP_50PCT (+{config.PARTIAL_TP_TRIGGER_PCT:.0f}%)"
-                partial_order = PendingOrder(
-                    side="PARTIAL_SELL", mint=pos.mint, symbol=pos.symbol, amount_atomic=sell_qty,
-                    reason=partial_reason, target_state_after_fill=FocusState.IN_POSITION,
-                    apply_cooldown=False, strategy=pos.strategy or "SCALPER",
-                    rationale=f"[MONITOR PARTIAL TP] {pos.symbol}: {partial_reason} ({pnl_pct_100:+.2f}%)",
-                )
-                p_client_owns = http_client is None
-                p_client = http_client or httpx.AsyncClient()
-                try:
-                    p_out = await executor_node(
-                        {
-                            "focus_state": FocusState.IN_POSITION.value, "sol_balance": sol_balance,
-                            "daily_pnl_sol": daily_pnl_sol, "active_position": pos.model_dump(),
-                            "chart_positions": _sync_chart_list(pos.model_dump()),
-                            "pending_order": partial_order.model_dump(),
-                        },
-                        config=config, db=db, http_client=p_client,
-                    )
-                finally:
-                    if p_client_owns:
-                        await p_client.aclose()
-                return {
-                    "focus_state": FocusState.IN_POSITION.value,
-                    "sol_balance": p_out["sol_balance"], "daily_pnl_sol": p_out["daily_pnl_sol"],
-                    "active_position": p_out["active_position"], "chart_positions": p_out["chart_positions"],
-                    "pending_order": None, "monitor_event": partial_reason, "last_execution": p_out.get("last_execution"),
-                }
-
-        def _exit_out(
-            reason: str, *, target_state: FocusState = FocusState.SCANNING,
-            apply_cooldown: bool = True, run_peak_sol: Optional[float] = None, rationale: Optional[str] = None,
-        ) -> dict[str, Any]:
-            order = PendingOrder(
-                side="SELL", mint=pos.mint, symbol=pos.symbol, amount_atomic=pos.token_amount,
-                reason=reason, target_state_after_fill=target_state, apply_cooldown=apply_cooldown,
-                run_peak_sol=run_peak_sol, strategy=pos.strategy or "SCALPER",
-                rationale=rationale or f"[MONITOR EXIT] {pos.symbol}: {reason}",
-            )
-            return {"active_position": pos.model_dump(), "pending_order": order.model_dump(), "monitor_event": reason}
-
-        # 1. Hard Stop (-10%) -> 100% sell -> SCANNING + 2h cooldown
-        if pnl_pct <= -config.HARD_STOP_LOSS_PCT + EPS:
-            return _exit_out(f"HARD_STOP_LOSS ({pnl_pct * 100:+.2f}% <= -{config.HARD_STOP_LOSS_PCT * 100:.0f}%)")
-
-        # 2. Exodus (5m sells >= 65% or liquidity drop >= 10%) -> 100% sell -> SCANNING + 2h cooldown
-        if is_exodus:
-            return _exit_out(exodus_reason)
-
-        # 3. Trailing TP (+12% armed; -6% pullback pre-partial, or -10% RUNNER_TRAIL_PULLBACK_PCT on remaining 50% runner)
-        if (pos.trail_armed or pos.partial_tp_taken) and pos.peak_sol_value > 0:
-            raw_runner_pb = float(config.RUNNER_TRAIL_PULLBACK_PCT)
-            runner_pb_frac = (raw_runner_pb / 100.0) if raw_runner_pb >= 1.0 else raw_runner_pb
-            active_trail_pb = runner_pb_frac if pos.partial_tp_taken else config.TRAIL_PULLBACK_PCT
-            pullback_pct = (pos.peak_sol_value - current_sol_value) / pos.peak_sol_value
-            if pullback_pct + EPS >= active_trail_pb:
-                at_reentry_cap = pos.reentry_count >= config.MAX_REENTRIES_PER_MINT
-                target_state = FocusState.SCANNING if at_reentry_cap else FocusState.WATCHING_REENTRY
-                cap_suffix = f" [MAX_REENTRIES={pos.reentry_count}/{config.MAX_REENTRIES_PER_MINT} -> COOLDOWN]" if at_reentry_cap else ""
-                reason = (
-                    f"TRAILING_TP (peak {peak_pnl_pct * 100:+.2f}%, "
-                    f"pullback -{pullback_pct * 100:.2f}% >= -{active_trail_pb * 100:.0f}%){cap_suffix}"
-                )
-                return _exit_out(
-                    reason,
-                    target_state=target_state,
-                    apply_cooldown=at_reentry_cap,
-                    run_peak_sol=pos.peak_sol_value,
-                    rationale=f"[MONITOR TP] {pos.symbol}: {reason} -> {target_state.value}",
-                )
-
-        # 4. Breakeven Shield (+2% floor once +8% reached) -> 100% sell -> SCANNING + 2h cooldown
-        if pos.breakeven_armed and pnl_pct <= config.BREAKEVEN_FLOOR_PCT + EPS:
-            reason = (
-                f"BREAKEVEN_SHIELD (armed >= +{config.BREAKEVEN_ARM_PCT * 100:.0f}%, "
-                f"hit floor {pnl_pct * 100:+.2f}% <= +{config.BREAKEVEN_FLOOR_PCT * 100:.0f}%)"
-            )
-            return _exit_out(reason)
-
-        # Hold position and persist updated peak / PnL to both active_position & chart_positions
-        pos_dict = pos.model_dump()
-        synced_charts = _sync_chart_list(pos_dict)
-        db.save_lane_positions(
-            lane="chart",
-            positions=synced_charts,
-            sol_balance=sol_balance,
-            daily_pnl_sol=daily_pnl_sol,
-            focus_state=FocusState.IN_POSITION.value,
-            active_position=pos_dict,
-        )
-        return {
-            "active_position": pos_dict,
-            "chart_positions": synced_charts,
-            "pending_order": None,
-            "monitor_event": "HOLD_IN_POSITION",
-        }
 
     # =========================================================================
     # STATE 3: WATCHING_REENTRY
@@ -330,19 +212,15 @@ async def position_monitor_node(
     def _abandon_watch(reason: str) -> dict[str, Any]:
         db.set_cooldown(pos.mint, hours=config.COOLDOWN_HOURS, reason=reason)
         rationale = f"[WATCH ABANDON] {pos.symbol}: {reason} -> SCANNING"
-        db.save_state(
-            focus_state=FocusState.SCANNING.value,
-            sol_balance=sol_balance,
-            daily_pnl_sol=daily_pnl_sol,
-            active_position=None,
-            last_decision_rationale=rationale,
+        next_act = updated_extra_charts[0] if updated_extra_charts else None
+        next_fs = FocusState.IN_POSITION.value if next_act is not None else FocusState.SCANNING.value
+        kept_charts = db.update_lane_positions_only(
+            lane="chart", positions=list(updated_extra_charts),
+            focus_state=next_fs, active_position=next_act, last_decision_rationale=rationale,
         )
         return {
-            "focus_state": FocusState.SCANNING.value,
-            "active_position": None,
-            "pending_order": None,
-            "monitor_event": reason,
-            "last_decision_rationale": rationale,
+            "focus_state": next_fs, "active_position": next_act, "chart_positions": kept_charts,
+            "pending_order": None, "monitor_event": reason, "last_decision_rationale": rationale,
         }
 
     # Abandonment 0: Max re-entries per mint reached -> cooldown + SCANNING
@@ -434,18 +312,15 @@ async def position_monitor_node(
                     strategy="LEG2_ENTRY",
                     reason=abort_reason,
                 )
-                db.save_state(
-                    focus_state=FocusState.SCANNING.value,
-                    sol_balance=sol_balance,
-                    daily_pnl_sol=daily_pnl_sol,
-                    active_position=None,
-                    last_decision_rationale=rationale,
+                next_act = updated_extra_charts[0] if updated_extra_charts else None
+                next_fs = FocusState.IN_POSITION.value if next_act is not None else FocusState.SCANNING.value
+                kept_charts = db.update_lane_positions_only(
+                    lane="chart", positions=list(updated_extra_charts),
+                    focus_state=next_fs, active_position=next_act, last_decision_rationale=rationale,
                 )
                 return {
-                    "focus_state": FocusState.SCANNING.value,
-                    "active_position": None,
-                    "pending_order": None,
-                    "monitor_event": "LEG_2_REENTRY_ABORT_CHASE",
+                    "focus_state": next_fs, "active_position": next_act, "chart_positions": kept_charts,
+                    "pending_order": None, "monitor_event": "LEG_2_REENTRY_ABORT_CHASE",
                     "last_decision_rationale": rationale,
                 }
 
@@ -458,6 +333,7 @@ async def position_monitor_node(
                 target_state_after_fill=FocusState.IN_POSITION,
                 apply_cooldown=False,
                 entry_liquidity_usd=current_liq or pos.entry_liquidity_usd,
+                entry_mc_usd=pos.entry_mc_usd,
                 strategy="LEG2_ENTRY",
                 rationale=reentry_dec.rationale,
             )
@@ -469,30 +345,20 @@ async def position_monitor_node(
             }
         else:
             pos_dict = pos.model_dump()
-            db.save_state(
-                focus_state=FocusState.WATCHING_REENTRY.value,
-                sol_balance=sol_balance,
-                daily_pnl_sol=daily_pnl_sol,
-                active_position=pos_dict,
+            db.update_lane_positions_only(
+                lane="chart", positions=list(updated_extra_charts),
+                focus_state=FocusState.WATCHING_REENTRY.value, active_position=pos_dict,
                 last_decision_rationale=reentry_dec.rationale,
             )
             return {
-                "active_position": pos_dict,
-                "pending_order": None,
-                "monitor_event": "LEG_2_REENTRY_REJECTED",
-                "last_decision_rationale": reentry_dec.rationale,
+                "active_position": pos_dict, "pending_order": None,
+                "monitor_event": "LEG_2_REENTRY_REJECTED", "last_decision_rationale": reentry_dec.rationale,
             }
 
-    # Continue watching
+    # Continue watching without overwriting sol_balance or daily_pnl_sol
     pos_dict = pos.model_dump()
-    db.save_state(
-        focus_state=FocusState.WATCHING_REENTRY.value,
-        sol_balance=sol_balance,
-        daily_pnl_sol=daily_pnl_sol,
-        active_position=pos_dict,
+    db.update_lane_positions_only(
+        lane="chart", positions=list(updated_extra_charts),
+        focus_state=FocusState.WATCHING_REENTRY.value, active_position=pos_dict,
     )
-    return {
-        "active_position": pos_dict,
-        "pending_order": None,
-        "monitor_event": "WATCHING_REENTRY",
-    }
+    return {"active_position": pos_dict, "pending_order": None, "monitor_event": "WATCHING_REENTRY"}

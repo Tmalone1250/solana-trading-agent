@@ -45,8 +45,12 @@ ACTION_LOG_COLUMNS: list[str] = [
     "breakout_vol_ratio",
     "breakout_ema_ext_pct",
     "breakout_failed_gates",
-    # Jupiter Swap API V2 raw price impact instrumentation (verbatim provider string)
+    # Jupiter Swap API V2 raw price impact & Sprint 2A exit/position-anchored telemetry
     "jupiter_price_impact_raw",
+    "monitor_sol_value",
+    "price_source",
+    "position_mfe_pct",
+    "position_mae_pct",
 ]
 
 ACTION_LOG_MIGRATIONS: list[tuple[str, str]] = [
@@ -73,6 +77,10 @@ ACTION_LOG_MIGRATIONS: list[tuple[str, str]] = [
     ("breakout_ema_ext_pct", "DOUBLE"),
     ("breakout_failed_gates", "VARCHAR"),
     ("jupiter_price_impact_raw", "VARCHAR"),
+    ("monitor_sol_value", "DOUBLE"),
+    ("price_source", "VARCHAR"),
+    ("position_mfe_pct", "DOUBLE"),
+    ("position_mae_pct", "DOUBLE"),
 ]
 
 EXPORT_TYPE_ACTIONS: dict[str, Optional[list[str]]] = {

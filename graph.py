@@ -26,7 +26,7 @@ def _route_entry(state: AgentGraphState) -> str:
 
 
 def _route_after_scanner(state: AgentGraphState) -> str:
-    if state.get("raw_candidates") or state.get("whale_fast_track_candidates"):
+    if state.get("raw_candidates"):
         return "safety_gate"
     return END
 

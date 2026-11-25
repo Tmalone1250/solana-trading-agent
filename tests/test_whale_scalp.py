@@ -125,19 +125,18 @@ async def test_whale_scalp_fast_track_confluence_and_solo_buy_within_mcap_band(t
         return httpx.Response(404)
 
     dec = DummyDecisionClient()
+    from whale_lane import run_whale_lane_tick
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         compiled = build_agent_graph(config=cfg, db=db, decision_client=dec, http_client=client)  # type: ignore[arg-type]
         st = db.get_state()
-        result = await compiled.ainvoke(
-            {
-                "focus_state": st["focus_state"],
-                "sol_balance": st["sol_balance"],
-                "daily_start_sol": st["daily_start_sol"],
-                "daily_pnl_sol": st["daily_pnl_sol"],
-                "active_position": st["active_position"],
-                "last_decision_rationale": st["last_decision_rationale"],
-            }
-        )
+        # Chart graph must NOT execute WHALE_SCALP fast-track anymore (whale_lane is sole authority)
+        await compiled.ainvoke({
+            "focus_state": st["focus_state"], "sol_balance": st["sol_balance"],
+            "daily_start_sol": st["daily_start_sol"], "daily_pnl_sol": st["daily_pnl_sol"],
+            "active_position": st["active_position"], "last_decision_rationale": st["last_decision_rationale"],
+        })
+        assert db.get_state()["whale_positions"] == []
+        result = await run_whale_lane_tick(config=cfg, db=db, http_client=client, now=now_dt)
 
     assert dec.called is False
     # Slot 2 (whale_slot) opens independently without mutating Slot 1 focus_state
@@ -212,6 +211,7 @@ async def test_whale_scalp_mcap_band_gating_stale_60s_and_is_sus(tmp_path):
             token_amount=100_000.0,
             timestamp_utc=(now_dt - timedelta(seconds=age_sec)).isoformat(),
         )
+        db.recompute_whale_signal(m, now=now_dt)
 
     # 1. Stale (> 60s) -> ignored
     _seed_confluence("MintStale", 75, "stale")
@@ -250,21 +250,24 @@ async def test_whale_scalp_mcap_band_gating_stale_60s_and_is_sus(tmp_path):
                     {"chainId": "solana", "baseToken": {"address": "MintJustRight", "symbol": "RIGHT"}, "marketCap": 14_000_000, "liquidity": {"usd": 500_000}},
                 ],
             )
+        if "rugcheck.xyz" in url:
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/ultra/v1/shield" in url:
+            return httpx.Response(200, json={"warnings": {"MintJustRight": []}})
+        if "/swap/v2/order" in url:
+            return httpx.Response(200, json={"outAmount": "2500000", "transaction": None})
         return httpx.Response(404)
 
+    from whale_lane import run_whale_lane_tick
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        out = await scanner_node(
-            {"focus_state": FocusState.SCANNING.value, "daily_start_sol": 0.7, "daily_pnl_sol": 0.0},
-            config=cfg,
-            db=db,
-            http_client=client,
-            now_ms=now_ms,
-            now=now_dt,
-        )
+        out = await run_whale_lane_tick(config=cfg, db=db, http_client=client, now=now_dt)
 
-    assert [c["mint"] for c in out["whale_fast_track_candidates"]] == ["MintJustRight"]
+    assert [c["mint"] for c in out["whale_positions"]] == ["MintJustRight"]
     decisions = db.get_whale_decisions()
+    assert decisions["MintTooSmall"]["reason"] == "MCAP < $15K"
     assert decisions["MintTooLarge"]["reason"] == "MCAP > $50M"
+    assert decisions["MintSus"]["reason"] == "AUDIT_SUS"
+    assert decisions["MintStale"]["reason"] == "STALE > 60s"
     db.close()
     clear_geckoterminal_cache()
     clear_jupiter_token_cache()

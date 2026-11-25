@@ -91,6 +91,7 @@ def _normalize_action_row(raw: dict[str, Any]) -> dict[str, Any]:
         "qty", "notional", "price_or_value", "pnl_amount", "pnl_pct",
         "mc_usd", "liq_usd", "peak_pnl_pct", "hold_seconds",
         "whale_sol_flow", "breakout_ema_ext_pct",
+        "monitor_sol_value", "position_mfe_pct", "position_mae_pct",
     ):
         row[col] = _to_float(raw.get(col))
     return row
@@ -245,12 +246,46 @@ def classify_observation_states(
     return counts
 
 
+def load_trades_from_duckdb(db_path: str) -> list[dict[str, Any]]:
+    """Read trades table from a local DuckDB copy (read-only) for accounting reconciliation."""
+    import duckdb
+
+    conn = duckdb.connect(db_path, read_only=True)
+    try:
+        tables = {r[0] for r in conn.execute("SHOW TABLES").fetchall()}
+        if "trades" not in tables:
+            return []
+        cur = conn.execute("SELECT id, timestamp, side, mint, symbol, out_amount, sol_value, reason FROM trades")
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def reconcile_trades_accounting(trades: list[dict[str, Any]], *, tol_sol: float = 1e-4) -> dict[str, Any]:
+    """Compare trades.out_amount / 1e9 vs trades.sol_value on PARTIAL_SELL / SELL rows."""
+    checked = 0
+    discrepant: list[dict[str, Any]] = []
+    for t in trades:
+        side = str(t.get("side") or "").upper()
+        if side not in ("PARTIAL_SELL", "SELL"):
+            continue
+        checked += 1
+        out_sol = float(t.get("out_amount") or 0) / 1_000_000_000.0
+        sol_val = float(t.get("sol_value") or 0.0)
+        diff = round(abs(out_sol - sol_val), 6)
+        if diff > tol_sol:
+            discrepant.append({**t, "out_amount_sol": round(out_sol, 6), "diff_sol": diff})
+    return {"checked": checked, "discrepancy_count": len(discrepant), "discrepant_rows": discrepant}
+
+
 def render_audit_report(
     outcomes: list[dict[str, Any]],
     actions: list[dict[str, Any]],
     whale_events: Optional[list[dict[str, Any]]] = None,
     *,
     friction_pct: float = 3.0,
+    trades: Optional[list[dict[str, Any]]] = None,
 ) -> str:
     """Run full Sprint 1 audit and render a structured Markdown report."""
     ledger = classify_observation_states(outcomes, actions)
@@ -302,15 +337,15 @@ def render_audit_report(
         f"- **Primary Cause Breakdown**: {dict(cause_counts) if cause_counts else 'No closed SELL trades'}",
         f"- **Secondary Contributing Factors**: {dict(sec_counts) if sec_counts else 'None'}",
         "",
-        "| Symbol | Strategy | Exit Reason | Observed PnL | Sim Net PnL (-fric) | MFE | MAE | Primary Cause | Secondary Factors |",
-        "|---|---|---|---:|---:|---:|---:|---|---|",
+        "| Symbol | Strategy | Exit Reason | Observed PnL | Sim Net PnL (-fric) | MFE | MAE | Source | Primary Cause | Secondary Factors |",
+        "|---|---|---|---:|---:|---:|---:|---|---|---|",
     ]
     for r in loss_rows[:50]:
         sec_str = ", ".join(r["secondary_factors"]) or "-"
         lines.append(
             f"| {r['symbol']} | `{r['strategy']}` | {r['exit_reason']} | {fmt_pct(r['observed_pnl_pct'])} | "
             f"{fmt_pct(r['simulated_net_pnl_pct'])} | {fmt_pct(r['mfe_pct'])} | {fmt_pct(r['mae_pct'])} | "
-            f"`{r['primary_cause']}` | {sec_str} |"
+            f"`{r['metrics_source']}` | `{r['primary_cause']}` | {sec_str} |"
         )
 
     # Report 2: Rejection-Reason Counterfactuals
@@ -372,6 +407,19 @@ def render_audit_report(
     for metric, v1, v2 in rows_cmp:
         lines.append(f"| {metric} | {v1} | {v2} |")
 
+    if trades is not None:
+        rec = reconcile_trades_accounting(trades)
+        lines += [
+            "",
+            "## D. Read-Only Accounting Reconciliation (DuckDB `trades`)",
+            f"- **Exit rows checked (`PARTIAL_SELL` / `SELL`)**: {rec['checked']}",
+            f"- **Discrepancies (`|out_amount/1e9 - sol_value| > 0.0001 SOL`)**: {rec['discrepancy_count']}",
+        ]
+        for d in rec["discrepant_rows"][:20]:
+            lines.append(
+                f"  - id={d.get('id')} {d.get('side')} {d.get('symbol')}: out_amount={d['out_amount_sol']} SOL vs sol_value={d.get('sol_value')} SOL (diff={d['diff_sol']})"
+            )
+
     return "\n".join(lines)
 
 
@@ -384,14 +432,16 @@ def main() -> None:
     parser.add_argument("--output", type=str, default=None, help="Optional Markdown file path to save the report")
     args = parser.parse_args()
 
+    trades_rows: Optional[list[dict[str, Any]]] = None
     if args.duckdb:
         outcomes, actions, whale_events = load_from_duckdb(args.duckdb)
+        trades_rows = load_trades_from_duckdb(args.duckdb)
     else:
         outcomes = load_csv_rows(args.outcomes, _normalize_outcome_row)
         actions = load_csv_rows(args.actions, _normalize_action_row)
         whale_events = []
 
-    report = render_audit_report(outcomes, actions, whale_events, friction_pct=args.friction_pct)
+    report = render_audit_report(outcomes, actions, whale_events, friction_pct=args.friction_pct, trades=trades_rows)
     print(report)
     if args.output:
         Path(args.output).write_text(report, encoding="utf-8")

@@ -280,8 +280,7 @@ async def safety_gate_node(
         return {"safe_candidates": [], "rejected_candidates": []}
 
     raw_candidates = state.get("raw_candidates") or []
-    whale_fast_candidates = state.get("whale_fast_track_candidates") or []
-    if not raw_candidates and not whale_fast_candidates:
+    if not raw_candidates:
         return {"safe_candidates": [], "rejected_candidates": []}
 
     watchlist_safety = (
@@ -294,98 +293,7 @@ async def safety_gate_node(
     client = http_client or httpx.AsyncClient(follow_redirects=True)
     safe: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
-    fast_track_order: Optional[dict[str, Any]] = None
-    sol_balance = float(state.get("sol_balance") or 0.0)
     try:
-        # Priority: WHALE_SCALP fast-track instant safety gate (Slot 2: bypasses 3m soak & 5m OHLCV)
-        if config.WHALE_STRATEGY_ENABLED and whale_fast_candidates:
-            whale_pos = state.get("whale_position") or (db.get_state().get("whale_position") if db is not None else None)
-            chart_pos = state.get("active_position")
-            chart_mint = str(chart_pos.get("mint") or "") if isinstance(chart_pos, dict) else ""
-            min_whale_liq = config.whale_min_liquidity_usd()
-            if whale_pos:
-                if db is not None:
-                    for w_cand in whale_fast_candidates:
-                        db.upsert_whale_decision(w_cand["mint"], "SKIPPED", "POSITION_OPEN", updated_at=now.isoformat() if now else None)
-            elif sol_balance < config.WHALE_POSITION_SOL:
-                if db is not None:
-                    for w_cand in whale_fast_candidates:
-                        db.upsert_whale_decision(w_cand["mint"], "SKIPPED", "LOW_SOL_BALANCE", updated_at=now.isoformat() if now else None)
-            else:
-                for w_cand in whale_fast_candidates:
-                    mint = w_cand["mint"]
-                    symbol = w_cand.get("symbol", "UNKNOWN")
-                    if chart_mint and mint == chart_mint:
-                        if db is not None:
-                            db.upsert_whale_decision(mint, "SKIPPED", "DUPLICATE_MINT_IN_CHART_SLOT", updated_at=now.isoformat() if now else None)
-                        rejected.append({"mint": mint, "symbol": symbol, "reasons": ["Duplicate mint already open in chart_slot"]})
-                        continue
-                    jup_sus = w_cand.get("jup_is_sus") is True or (
-                        isinstance(w_cand.get("jup_meta"), dict) and w_cand["jup_meta"].get("is_sus") is True
-                    )
-                    liq_usd = float(w_cand.get("liquidity_usd") or 0.0)
-                    mc_usd = float(w_cand.get("market_cap_usd") or 0.0)
-
-                    if jup_sus:
-                        if db is not None:
-                            db.upsert_whale_decision(mint, "SKIPPED", "AUDIT_SUS", updated_at=now.isoformat() if now else None)
-                        rejected.append({"mint": mint, "symbol": symbol, "reasons": ["Jupiter Token v2: audit.isSus=True"]})
-                        continue
-                    if liq_usd < min_whale_liq:
-                        if db is not None:
-                            db.upsert_whale_decision(mint, "SKIPPED", f"LIQ < ${min_whale_liq / 1000:.0f}K", updated_at=now.isoformat() if now else None)
-                        rejected.append({"mint": mint, "symbol": symbol, "reasons": [f"Liquidity ${liq_usd:,.0f} < ${min_whale_liq:,.0f}"]})
-                        continue
-                    if not (config.WHALE_MIN_MCAP_USD <= mc_usd <= config.WHALE_MAX_MCAP_USD):
-                        def _fmt_usd(v: float) -> str:
-                            return f"${v / 1_000_000:.0f}M" if v >= 1_000_000 else f"${v / 1_000:.0f}K"
-                        mc_reason = f"MCAP < {_fmt_usd(config.WHALE_MIN_MCAP_USD)}" if mc_usd < config.WHALE_MIN_MCAP_USD else f"MCAP > {_fmt_usd(config.WHALE_MAX_MCAP_USD)}"
-                        if db is not None:
-                            db.upsert_whale_decision(mint, "SKIPPED", mc_reason, updated_at=now.isoformat() if now else None)
-                        rejected.append({"mint": mint, "symbol": symbol, "reasons": [f"MCAP ${mc_usd:,.0f} outside [${config.WHALE_MIN_MCAP_USD:,.0f}, ${config.WHALE_MAX_MCAP_USD:,.0f}]"]})
-                        continue
-
-                    report = get_cached_safety_report(mint) or await check_token_safety(mint, config, client)
-                    cache_safety_report(mint, report)
-                    if not report.passed:
-                        reason_str = "; ".join(report.reasons)
-                        if db is not None:
-                            db.upsert_whale_decision(mint, "SKIPPED", "SAFETY_REJECT", updated_at=now.isoformat() if now else None)
-                            db.set_cooldown_minutes(mint, minutes=config.SAFETY_REJECT_COOLDOWN_MINUTES, reason=f"WHALE_SAFETY_REJECT: {reason_str}", now=now)
-                        logger.info("[SafetyGate] WHALE_SCALP $%s | REJECTED (%s)", symbol, reason_str)
-                        rejected.append({"mint": mint, "symbol": symbol, "reasons": report.reasons})
-                        continue
-
-                    trig_wallets = list(w_cand.get("triggering_wallets") or [])
-                    trig_type = str(w_cand.get("whale_trigger_type") or "WHALE")
-                    if db is not None:
-                        db.upsert_whale_decision(mint, "ENTERED", f"WHALE_SCALP_{trig_type}", updated_at=now.isoformat() if now else None)
-                        db.log_action(
-                            mode=config.EXECUTION_MODE, action="WHALE_CONFLUENCE", symbol=symbol, asset_id=mint,
-                            notional=round(config.WHALE_POSITION_SOL, 6), strategy="WHALE_SCALP", reason=f"WHALE_SCALP_{trig_type}",
-                            timestamp_utc=now.isoformat() if now else None, mc_usd=round(mc_usd, 2) if mc_usd else None,
-                            liq_usd=round(liq_usd, 2) if liq_usd else None,
-                            triggering_whales=",".join(config.resolve_wallet_label(w) for w in trig_wallets),
-                            whale_sol_flow=round(float(w_cand.get("whale_total_sol") or 0.0), 6),
-                        )
-                    rationale = (
-                        f"[WHALE_SCALP FAST-TRACK] {symbol} ({mint[:6]}..): "
-                        f"trigger={trig_type} ({len(trig_wallets)} wallets, "
-                        f"{float(w_cand.get('whale_total_sol') or 0.0):.2f} SOL) -> APPROVED"
-                    )
-                    order = PendingOrder(
-                        side="BUY", mint=mint, symbol=symbol,
-                        amount_atomic=int(round(config.WHALE_POSITION_SOL * LAMPORTS_PER_SOL)),
-                        reason=f"WHALE_SCALP_{trig_type}", target_state_after_fill=FocusState.IN_POSITION,
-                        apply_cooldown=False, entry_liquidity_usd=liq_usd,
-                        entry_mc_usd=round(mc_usd, 2) if mc_usd else None,
-                        whale_sol_flow=round(float(w_cand.get("whale_total_sol") or 0.0), 6),
-                        strategy="WHALE_SCALP", triggering_wallets=trig_wallets, rationale=rationale,
-                    )
-                    fast_track_order = order.model_dump()
-                    logger.info("[SafetyGate] WHALE_SCALP $%s | INSTANT PASS -> entering %.2f SOL (%s)", symbol, config.WHALE_POSITION_SOL, trig_type)
-                    break
-
         for cand in raw_candidates:
             mint = cand["mint"]
             symbol = cand.get("symbol", "UNKNOWN")
@@ -452,9 +360,6 @@ async def safety_gate_node(
         "safe_candidates": safe,
         "rejected_candidates": rejected,
     }
-    if fast_track_order is not None:
-        out["pending_order"] = fast_track_order
-        out["last_decision_rationale"] = fast_track_order["rationale"]
     if db is not None:
         out["active_watchlist"] = db.get_watchlist()
     return out

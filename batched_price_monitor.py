@@ -79,6 +79,7 @@ async def fetch_batched_sol_prices(
     ts = now_ts if now_ts is not None else time.time()
     sol_per_token: dict[str, float] = {}
     decimals_by_mint: dict[str, int] = {}
+    price_source_by_mint: dict[str, str] = {}
     dex_flow: dict[str, dict[str, Any]] = {}
 
     # 1. Single batched Jupiter Price API v3 call (always includes SOL_MINT + all active mints)
@@ -120,6 +121,7 @@ async def fetch_batched_sol_prices(
                             tok_usd = float(m_entry.get("usdPrice") or m_entry.get("price") or 0.0)
                             if tok_usd > 0:
                                 sol_per_token[m] = tok_usd / sol_usd
+                                price_source_by_mint[m] = "jupiter_v3"
         except Exception as exc:
             logger.warning("[BatchedPrice] Jupiter /price/v3 failed: %s", exc)
 
@@ -154,23 +156,21 @@ async def fetch_batched_sol_prices(
                 for m, p in best_by_mint.items():
                     m5 = (p.get("txns") or {}).get("m5") or {}
                     native_p = float(p.get("priceNative") or 0.0)
-                    dex_flow[m] = {
-                        "buys_5m": int(m5.get("buys") or 0),
-                        "sells_5m": int(m5.get("sells") or 0),
-                        "liquidity_usd": float((p.get("liquidity") or {}).get("usd") or 0.0),
-                        "price_native": native_p,
-                        "decimals": decimals_by_mint.get(m),
-                        "pair": p,
-                    }
-                    # Mandatory meme-coin fallback when Jupiter /price/v3 omits mint or fails
                     if m not in sol_per_token and native_p > 0:
                         sol_per_token[m] = native_p
+                        price_source_by_mint[m] = "dexscreener_native"
+                    dex_flow[m] = {
+                        "buys_5m": int(m5.get("buys") or 0), "sells_5m": int(m5.get("sells") or 0),
+                        "liquidity_usd": float((p.get("liquidity") or {}).get("usd") or 0.0),
+                        "price_native": native_p, "decimals": decimals_by_mint.get(m),
+                        "price_source": price_source_by_mint.get(m), "pair": p,
+                    }
             except Exception as exc:
                 logger.warning("[BatchedPrice] DexScreener batch failed: %s", exc)
 
     for m, dec in decimals_by_mint.items():
         if m not in dex_flow:
-            dex_flow[m] = {"decimals": dec}
+            dex_flow[m] = {"decimals": dec, "price_source": price_source_by_mint.get(m)}
 
     return sol_per_token, dex_flow
 
@@ -234,6 +234,7 @@ def apply_dex_flow_and_pnl(
     current_sol_value: float,
     flow: Optional[dict[str, Any]],
     lane_label: str = "chart_slot",
+    used_exact_quote: bool = False,
 ) -> tuple[int, int, float, float]:
     """Update current/peak SOL, PnL, and DexScreener 5m flow/liquidity in-place and log 1-line status."""
     buys_5m = 0
@@ -255,6 +256,10 @@ def apply_dex_flow_and_pnl(
         if "liquidity_usd" in flow:
             current_liq = round(float(flow.get("liquidity_usd") or 0.0), 2)
             pos.last_liquidity_usd = current_liq
+        if flow.get("price_source"):
+            pos.last_price_source = str(flow["price_source"])
+    if used_exact_quote:
+        pos.last_price_source = "jupiter_exact_quote"
 
     basis = active_cost_basis_sol(pos)
     pos.current_sol_value = round(current_sol_value, 6)
@@ -264,6 +269,8 @@ def apply_dex_flow_and_pnl(
     pnl_pct = ((pnl_sol / basis) * 100.0) if basis > 0 else 0.0
     pos.pnl_sol = round(pnl_sol, 6)
     pos.pnl_pct = round(pnl_pct, 2)
+    pos.position_mfe_pct = pos.pnl_pct if pos.position_mfe_pct is None else max(pos.position_mfe_pct, pos.pnl_pct)
+    pos.position_mae_pct = pos.pnl_pct if pos.position_mae_pct is None else min(pos.position_mae_pct, pos.pnl_pct)
 
     logger.info(
         "[Monitor] [%s] $%s (%s..): val=%.4f SOL (basis=%.4f, peak=%.4f, PnL=%+.4f SOL / %+.2f%%) | liq=$%.0f | 5m_buy=%.0f%%",
@@ -419,18 +426,12 @@ async def enforce_hard_stop_if_hit(
     pos.current_sol_value = round(current_sol_value, 6)
     reason = f"HARD_STOP_LOSS ({pnl_pct_100:+.2f}% <= {stop_limit_100:.0f}%)"
     order = PendingOrder(
-        side="SELL",
-        mint=pos.mint,
-        symbol=pos.symbol,
-        amount_atomic=pos.token_amount,
-        reason=reason,
-        target_state_after_fill=FocusState.SCANNING,
-        apply_cooldown=True,
+        side="SELL", mint=pos.mint, symbol=pos.symbol, opened_at=pos.opened_at, amount_atomic=pos.token_amount,
+        reason=reason, target_state_after_fill=FocusState.SCANNING, apply_cooldown=True,
         strategy=pos.strategy or ("WHALE_SCALP" if is_whale else "SCALPER"),
-        triggering_wallets=list(pos.triggering_wallets),
-        entry_mc_usd=pos.entry_mc_usd,
-        whale_sol_flow=pos.whale_sol_flow,
-        breakout_telemetry=pos.breakout_telemetry,
+        triggering_wallets=list(pos.triggering_wallets), entry_mc_usd=pos.entry_mc_usd,
+        whale_sol_flow=pos.whale_sol_flow, breakout_telemetry=pos.breakout_telemetry,
+        monitor_sol_value=round(current_sol_value, 6), price_source=pos.last_price_source,
         rationale=f"[HARD STOP LOSS] {pos.symbol}: {reason}",
     )
     st = db.get_state()
@@ -478,15 +479,11 @@ async def monitor_and_enforce_hard_stops(
             if isinstance(flow, dict) and flow.get("decimals") is not None:
                 pos.decimals = int(flow["decimals"])
             est_val = estimate_position_sol_value(pos, sol_prices.get(pos.mint), token_decimals=pos.decimals)
-            curr_val, _ = await resolve_position_sol_value(
-                pos,
-                estimated_sol_value=est_val,
-                config=config,
-                client=client,
-                now_dt=dt,
-                has_batched_price=(pos.mint in sol_prices),
+            curr_val, used_q = await resolve_position_sol_value(
+                pos, estimated_sol_value=est_val, config=config, client=client,
+                now_dt=dt, has_batched_price=(pos.mint in sol_prices),
             )
-            apply_dex_flow_and_pnl(pos, current_sol_value=curr_val, flow=flow, lane_label=lane_label)
+            apply_dex_flow_and_pnl(pos, current_sol_value=curr_val, flow=flow, lane_label=lane_label, used_exact_quote=used_q)
             hs_out = await enforce_hard_stop_if_hit(
                 pos, current_sol_value=curr_val, config=config, db=db, client=client, lane=lane_name
             )

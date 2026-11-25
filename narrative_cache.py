@@ -1,4 +1,7 @@
-"""Bounded 30-minute TTL cache for Gemini DECISION_1 narrative/vamp assessments."""
+"""Bounded 30-minute TTL cache for slow-moving Gemini narrative/vamp classifications ONLY.
+
+Never caches or serves fast-changing `momentum_quality` or `action` decisions.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +14,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_NARRATIVE_CACHE_TTL_SECONDS = 1800.0  # 30 minutes
 NARRATIVE_CACHE_MAX_SIZE = 200
 
-# Bounded in-memory cache: mint -> {cached_at, cached_ts, narrative_strength, momentum_quality, is_copycat_vamp, action}
+# Bounded in-memory cache: mint -> {mint, cached_at, cached_ts, narrative_strength, is_copycat_vamp}
 _narrative_cache: dict[str, dict[str, Any]] = {}
 
 
@@ -40,7 +43,7 @@ def get_cached_narrative(
     now_ts: Optional[float] = None,
     ttl_seconds: float = DEFAULT_NARRATIVE_CACHE_TTL_SECONDS,
 ) -> Optional[dict[str, Any]]:
-    """Return a valid cached Gemini narrative entry for `mint`, or None on miss/expiry."""
+    """Return cached slow-moving narrative/vamp classification for `mint`, or None on miss/expiry."""
     if not mint or ttl_seconds <= 0:
         return None
     ts = now_ts if now_ts is not None else datetime.now(timezone.utc).timestamp()
@@ -58,14 +61,13 @@ def put_cached_narrative(
     mint: str,
     *,
     narrative_strength: dict[str, Any],
-    momentum_quality: dict[str, Any],
     is_copycat_vamp: dict[str, Any],
-    action: dict[str, Any],
     now_dt: Optional[datetime] = None,
     ttl_seconds: float = DEFAULT_NARRATIVE_CACHE_TTL_SECONDS,
     max_size: int = NARRATIVE_CACHE_MAX_SIZE,
+    **_ignored_live_fields: Any,
 ) -> dict[str, Any]:
-    """Store raw Gemini DECISION_1 scores & original response timestamp with TTL + max-size bounds."""
+    """Store slow-moving Gemini narrative/vamp scores & timestamp (excludes momentum_quality & action)."""
     dt = now_dt or datetime.now(timezone.utc)
     ts = dt.timestamp()
     entry = {
@@ -73,9 +75,7 @@ def put_cached_narrative(
         "cached_at": dt.isoformat(),
         "cached_ts": ts,
         "narrative_strength": dict(narrative_strength),
-        "momentum_quality": dict(momentum_quality),
         "is_copycat_vamp": dict(is_copycat_vamp),
-        "action": dict(action),
     }
     if not mint or ttl_seconds <= 0 or max_size <= 0:
         return entry

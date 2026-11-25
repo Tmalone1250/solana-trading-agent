@@ -13,6 +13,13 @@ from action_export import ACTION_LOG_COLUMNS, ACTION_LOG_MIGRATIONS
 from memory_guard import configure_duckdb_connection, prune_duckdb_tables
 from outcome_tracker import ensure_outcomes_table
 from state import FocusState
+from state_ledger import (
+    apply_trade_settlement,
+    release_buy_reservation,
+    reserve_buy_slot,
+    rollover_daily_if_needed_locked,
+    update_lane_positions_only,
+)
 
 
 def utc_now() -> datetime:
@@ -478,11 +485,15 @@ class AgentDatabase:
                 else False
             )
             trig_json = json.dumps(trig_wallets)
-            curr_row = self._conn.execute("SELECT chart_positions_json FROM agent_state WHERE id = 1").fetchone()
+            curr_row = self._conn.execute(
+                "SELECT chart_positions_json, whale_positions_json, whale_shadow_exit_requested FROM agent_state WHERE id = 1"
+            ).fetchone()
             chart_list: list[dict[str, Any]] = json.loads(curr_row[0]) if (curr_row and curr_row[0]) else []
-            if isinstance(active_position, dict) and str(active_position.get("strategy") or "").upper() != "WHALE_SCALP":
+            whale_list: list[dict[str, Any]] = json.loads(curr_row[1]) if (curr_row and curr_row[1]) else []
+            is_whale_active = isinstance(active_position, dict) and str(active_position.get("strategy") or "").upper() == "WHALE_SCALP"
+            if isinstance(active_position, dict) and not is_whale_active:
                 a_mint = active_position.get("mint")
-                if focus_state == FocusState.IN_POSITION.value:
+                if focus_state == FocusState.IN_POSITION.value and int(active_position.get("token_amount") or 0) > 0:
                     replaced = False
                     for idx, cp in enumerate(chart_list):
                         if isinstance(cp, dict) and cp.get("mint") == a_mint:
@@ -493,8 +504,11 @@ class AgentDatabase:
                         chart_list.append(active_position)
                 else:
                     chart_list = [cp for cp in chart_list if isinstance(cp, dict) and cp.get("mint") != a_mint]
-            elif active_position is None and focus_state == FocusState.SCANNING.value and len(chart_list) <= 1:
-                chart_list = []
+            elif active_position is None:
+                # Never wipe open chart positions (token_amount > 0) when WATCHING_REENTRY abandons to SCANNING
+                chart_list = [cp for cp in chart_list if isinstance(cp, dict) and int(cp.get("token_amount") or 0) > 0]
+            any_whale_shadow = any(bool(wp.get("whale_shadow_exit_flag", False)) for wp in whale_list if isinstance(wp, dict))
+            shadow_flag = (shadow_flag or any_whale_shadow) if is_whale_active else any_whale_shadow
             chart_list_json = json.dumps(chart_list)
             if last_decision_rationale is None:
                 self._conn.execute(
@@ -578,6 +592,18 @@ class AgentDatabase:
             if isinstance(p, dict) and p.get("mint"):
                 mints.add(str(p["mint"]))
         return mints
+
+    def reserve_buy_slot(self, **kwargs: Any) -> tuple[Optional[str], Optional[str]]:
+        return reserve_buy_slot(self, **kwargs)
+
+    def release_buy_reservation(self, reservation_id: Optional[str]) -> None:
+        release_buy_reservation(self, reservation_id)
+
+    def apply_trade_settlement(self, **kwargs: Any) -> dict[str, Any]:
+        return apply_trade_settlement(self, **kwargs)
+
+    def update_lane_positions_only(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return update_lane_positions_only(self, **kwargs)
 
     def save_lane_positions(
         self,
@@ -1255,6 +1281,10 @@ class AgentDatabase:
         breakout_ema_ext_pct: Optional[float] = None,
         breakout_failed_gates: Optional[str] = None,
         jupiter_price_impact_raw: Optional[str] = None,
+        monitor_sol_value: Optional[float] = None,
+        price_source: Optional[str] = None,
+        position_mfe_pct: Optional[float] = None,
+        position_mae_pct: Optional[float] = None,
     ) -> None:
         """Append a structured board action row to DuckDB action_log."""
         ts = timestamp_utc or utc_now_iso()
@@ -1288,7 +1318,8 @@ class AgentDatabase:
                     peak_pnl_pct, hold_seconds, triggering_whales, whale_sol_flow,
                     breakout_score, breakout_state, breakout_timeframe,
                     breakout_vol_ratio, breakout_ema_ext_pct, breakout_failed_gates,
-                    jupiter_price_impact_raw,
+                    jupiter_price_impact_raw, monitor_sol_value, price_source,
+                    position_mfe_pct, position_mae_pct,
                 ],
             )
 

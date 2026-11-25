@@ -15,24 +15,13 @@ from solders.transaction import VersionedTransaction
 from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
 from db import AgentDatabase, utc_now, utc_now_iso
 from state import ActivePosition, AgentGraphState, FocusState, PendingOrder
+from state_ledger import acquire_exit_guard, clear_sell_guard, finalize_exit_guard
 
 logger = logging.getLogger(__name__)
-_SELL_GUARD_TTL_SEC, _SELL_GUARD_MAX = 60.0, 64
-_inflight_sells: set[tuple[str, str, str, str]] = set()
-_recently_closed_sells: dict[tuple[str, str, str, str], float] = {}
 
 
 def clear_sell_idempotency_guard() -> None:
-    _inflight_sells.clear()
-    _recently_closed_sells.clear()
-
-
-def _prune_closed_sells(now_ts: float) -> None:
-    for k, ts in list(_recently_closed_sells.items()):
-        if (now_ts - ts) >= _SELL_GUARD_TTL_SEC:
-            _recently_closed_sells.pop(k, None)
-    while len(_recently_closed_sells) > _SELL_GUARD_MAX:
-        _recently_closed_sells.pop(min(_recently_closed_sells, key=_recently_closed_sells.get), None)
+    clear_sell_guard()
 
 
 def extract_raw_price_impact(order_resp: dict[str, Any]) -> Optional[str]:
@@ -130,54 +119,70 @@ async def executor_node(
         or str(order.strategy or "").upper() == "WHALE_SCALP"
     )
 
-    # Shared Guards on BUY: No Duplicate Mint, 3+3 Lane Capacity, Global Cap (6), and Free SOL Check
+    # Atomic Pre-Trade Reservation & Shared Guards on BUY (under db._lock)
     st_live = db.get_state()
-    chart_positions: list[dict[str, Any]] = list(state.get("chart_positions") if "chart_positions" in state else (st_live.get("chart_positions") or []))
-    whale_positions: list[dict[str, Any]] = list(state.get("whale_positions") if "whale_positions" in state else (st_live.get("whale_positions") or []))
+    chart_positions: list[dict[str, Any]] = list(st_live.get("chart_positions") or state.get("chart_positions") or [])
+    whale_positions: list[dict[str, Any]] = list(st_live.get("whale_positions") or state.get("whale_positions") or [])
+    tx_fee_sol = float(config.PAPER_TX_FEE_SOL) if config.EXECUTION_MODE == "paper" else 0.0
+    lane_tag = "whale" if is_whale_slot else "chart"
+    reservation_id: Optional[str] = None
     if is_buy:
         active_pos_for_reentry = state.get("active_position") or st_live.get("active_position")
         is_reentry_same_mint = (
-            not is_whale_slot
-            and order.reason == "LEG_2_REENTRY"
-            and isinstance(active_pos_for_reentry, dict)
-            and active_pos_for_reentry.get("mint") == order.mint
+            not is_whale_slot and order.reason == "LEG_2_REENTRY"
+            and isinstance(active_pos_for_reentry, dict) and active_pos_for_reentry.get("mint") == order.mint
             and state.get("focus_state") == FocusState.WATCHING_REENTRY.value
         )
-        open_mints = db.get_all_open_mints()
-        for p in chart_positions + whale_positions + [state.get("active_position"), state.get("whale_position")]:
-            if isinstance(p, dict) and p.get("mint"):
-                open_mints.add(str(p["mint"]))
-        if order.mint in open_mints and not is_reentry_same_mint:
-            logger.warning("[Executor] Duplicate mint guard blocked %s BUY of %s", "whale_slot" if is_whale_slot else "chart_slot", order.symbol)
+        # Also block if caller passed in-memory open mints not yet persisted
+        caller_open = {
+            str(p["mint"]) for p in (state.get("chart_positions") or []) + (state.get("whale_positions") or []) + [state.get("active_position"), state.get("whale_position")]
+            if isinstance(p, dict) and p.get("mint")
+        }
+        if order.mint in caller_open and not is_reentry_same_mint:
+            logger.warning("[Executor] Duplicate mint guard blocked %s BUY of %s", f"{lane_tag}_slot", order.symbol)
             return {"pending_order": None}
-
-        lane_count = len(whale_positions) if is_whale_slot else len(chart_positions)
-        lane_cap = config.MAX_WHALE_POSITIONS if is_whale_slot else config.MAX_CHART_POSITIONS
-        total_open = len(chart_positions) + len(whale_positions)
-        if lane_count >= lane_cap or total_open >= config.MAX_OPEN_POSITIONS:
-            logger.warning("[Executor] Lane capacity reached (chart=%d/%d, whale=%d/%d, total=%d/%d) — skipping %s", len(chart_positions), config.MAX_CHART_POSITIONS, len(whale_positions), config.MAX_WHALE_POSITIONS, total_open, config.MAX_OPEN_POSITIONS, order.symbol)
-            return {"pending_order": None}
-
         req_sol = order.amount_atomic / LAMPORTS_PER_SOL
-        avail_sol = float(state.get("sol_balance") or 0.0)
-        if avail_sol + 1e-9 < req_sol:
-            logger.warning("[Executor] Insufficient free SOL (%.4f < %.4f) for %s BUY", avail_sol, req_sol, order.symbol)
+        lane_cap = config.MAX_WHALE_POSITIONS if is_whale_slot else config.MAX_CHART_POSITIONS
+        fb_sol_state = float(state["sol_balance"]) if "sol_balance" in state and state["sol_balance"] is not None else None
+        reservation_id, rej_reason = db.reserve_buy_slot(
+            lane=lane_tag, mint=order.mint, required_sol=req_sol, tx_fee_sol=tx_fee_sol,
+            max_lane_positions=lane_cap, max_open_positions=config.MAX_OPEN_POSITIONS,
+            is_reentry_same_mint=is_reentry_same_mint, fallback_state_sol=fb_sol_state,
+        )
+        if rej_reason is not None:
+            logger.warning("[Executor] Pre-trade reservation blocked %s BUY of %s: %s", f"{lane_tag}_slot", order.symbol, rej_reason)
             return {"pending_order": None}
 
-    is_full_sell = (not is_buy) and (not is_partial_sell)
-    existing_for_fallback = (
+    is_exit = not is_buy
+    live_lane_for_fb = whale_positions if is_whale_slot else chart_positions
+    candidate_pos = (
         state.get("whale_position") if is_whale_slot else state.get("active_position")
     ) or (state.get("active_position") if is_whale_slot else None)
-    sell_key: Optional[tuple[str, str, str, str]] = None
-    if is_full_sell:
-        lane_tag = "whale" if is_whale_slot else "chart"
-        opened_tag = str(existing_for_fallback.get("opened_at") or "") if isinstance(existing_for_fallback, dict) else ""
-        sell_key = (str(db.db_path), lane_tag, order.mint, opened_tag)
-        _prune_closed_sells(time.monotonic())
-        live_lane_list = whale_positions if is_whale_slot else chart_positions
-        in_live_db = any(isinstance(p, dict) and p.get("mint") == order.mint for p in live_lane_list)
-        if sell_key in _inflight_sells or sell_key in _recently_closed_sells or (existing_for_fallback is None and not in_live_db):
-            logger.warning("[Executor] Duplicate/already-closed full SELL skipped for %s (%s)", order.symbol, order.reason)
+    existing_for_fallback: Optional[dict[str, Any]] = None
+    if isinstance(candidate_pos, dict) and candidate_pos.get("mint") == order.mint:
+        if not order.opened_at or not candidate_pos.get("opened_at") or candidate_pos.get("opened_at") == order.opened_at:
+            existing_for_fallback = candidate_pos
+    if existing_for_fallback is None:
+        existing_for_fallback = next(
+            (
+                p for p in live_lane_for_fb
+                if isinstance(p, dict) and p.get("mint") == order.mint
+                and (not order.opened_at or not p.get("opened_at") or p.get("opened_at") == order.opened_at)
+            ),
+            None,
+        )
+
+    sell_key: Optional[tuple[str, str, str, str, str]] = None
+    exit_committed = False
+    if is_exit:
+        opened_tag = str(order.opened_at or (existing_for_fallback.get("opened_at") if isinstance(existing_for_fallback, dict) else "") or "")
+        caller_partial = bool(existing_for_fallback.get("partial_tp_taken", False)) if isinstance(existing_for_fallback, dict) else False
+        sell_key, is_dup = acquire_exit_guard(
+            db, lane=lane_tag, side_up=side_up, mint=order.mint, opened_at=opened_tag,
+            has_caller_pos=(existing_for_fallback is not None), caller_partial_taken=caller_partial,
+        )
+        if is_dup:
+            logger.warning("[Executor] Duplicate/already-closed %s skipped for %s (%s)", side_up, order.symbol, order.reason)
             return {
                 "focus_state": st_live["focus_state"], "sol_balance": float(st_live["sol_balance"]),
                 "daily_pnl_sol": float(st_live["daily_pnl_sol"]), "active_position": st_live["active_position"],
@@ -185,7 +190,6 @@ async def executor_node(
                 "whale_positions": st_live["whale_positions"], "pending_order": None,
                 "last_execution": state.get("last_execution"),
             }
-        _inflight_sells.add(sell_key)
 
     input_mint = SOL_MINT if is_buy else order.mint
     output_mint = order.mint if is_buy else SOL_MINT
@@ -200,28 +204,22 @@ async def executor_node(
     try:
         try:
             order_resp = await fetch_jupiter_order(
-                input_mint=input_mint,
-                output_mint=output_mint,
-                amount_atomic=order.amount_atomic,
-                config=config,
-                client=client,
-                taker=taker,
+                input_mint=input_mint, output_mint=output_mint,
+                amount_atomic=order.amount_atomic, config=config, client=client, taker=taker,
             )
             out_amount = int(order_resp["outAmount"])
         except Exception as exc:
             if not is_buy and config.EXECUTION_MODE != "live":
-                fb_sol = (
-                    float(existing_for_fallback.get("current_sol_value") or existing_for_fallback.get("entry_sol") or 0.0)
-                    if isinstance(existing_for_fallback, dict)
-                    else 0.0
-                )
+                fb_sol = float(existing_for_fallback.get("current_sol_value") or existing_for_fallback.get("entry_sol") or 0.0) if isinstance(existing_for_fallback, dict) else 0.0
+                if is_partial_sell:
+                    fb_frac = float((config.WHALE_PARTIAL_TP_SELL_FRACTION or config.PARTIAL_TP_SELL_FRACTION) if is_whale_slot else config.PARTIAL_TP_SELL_FRACTION)
+                    fb_sol = round(fb_sol * fb_frac, 6)
                 logger.warning("[Executor] Jupiter quote failed on %s %s (%s); falling back to live SOL quote %.4f", order.side, order.symbol, exc, fb_sol)
                 order_resp = {"outAmount": str(max(1, int(round(fb_sol * LAMPORTS_PER_SOL)))), "transaction": None}
                 out_amount = int(order_resp["outAmount"])
             else:
                 raise
         tx_signature: Optional[str] = None
-
         if config.EXECUTION_MODE == "live":
             tx_b64 = order_resp.get("transaction")
             request_id = str(order_resp.get("requestId") or "")
@@ -229,38 +227,34 @@ async def executor_node(
                 raise RuntimeError("Jupiter /swap/v2/order returned no transaction in live mode")
             signed_b64 = sign_jupiter_transaction(tx_b64, config.SOLANA_PRIVATE_KEY_BS58)
             exec_resp = await execute_jupiter_signed_order(
-                signed_tx_base64=signed_b64,
-                request_id=request_id,
-                config=config,
-                client=client,
+                signed_tx_base64=signed_b64, request_id=request_id, config=config, client=client,
             )
             tx_signature = str(exec_resp.get("signature") or exec_resp.get("txid") or "")
             if exec_resp.get("outputAmountResult"):
                 out_amount = int(exec_resp["outputAmountResult"])
         else:
             tx_signature = f"paper-{order.side.lower()}-{order.mint[:8]}"
+    except BaseException:
+        if reservation_id:
+            db.release_buy_reservation(reservation_id)
+        finalize_exit_guard(db, sell_key, committed=False)
+        raise
     finally:
-        if sell_key is not None:
-            _inflight_sells.discard(sell_key)
         if owns_client:
             await client.aclose()
 
-    sol_balance = float(state.get("sol_balance") or 0.0)
-    daily_pnl_sol = float(state.get("daily_pnl_sol") or 0.0)
-    tx_fee_sol = float(config.PAPER_TX_FEE_SOL) if config.EXECUTION_MODE == "paper" else 0.0
+    fb_base_sol = float(state["sol_balance"]) if "sol_balance" in state and state["sol_balance"] is not None else None
+    fb_base_pnl = float(state["daily_pnl_sol"]) if "daily_pnl_sol" in state and state["daily_pnl_sol"] is not None else None
     raw_price_impact = extract_raw_price_impact(order_resp)
-    existing_pos_dict = (
-        state.get("whale_position") if is_whale_slot else state.get("active_position")
-    )
-    if existing_pos_dict is None and is_whale_slot:
-        existing_pos_dict = state.get("active_position")
+    existing_pos_dict = existing_for_fallback
     new_pos_dict: Optional[dict[str, Any]] = None
     next_state = order.target_state_after_fill.value
+    rationale_out = order.rationale or state.get("last_decision_rationale")
 
     if is_buy:
         spent_sol = order.amount_atomic / LAMPORTS_PER_SOL
-        sol_balance = round(max(0.0, sol_balance - spent_sol - tx_fee_sol), 6)
-        daily_pnl_sol = round(daily_pnl_sol - tx_fee_sol, 6)
+        sol_delta = -(spent_sol + tx_fee_sol)
+        pnl_delta = -tx_fee_sol
         pos_strategy = order.strategy or "SCALPER"
         prev_reentries = (
             int(existing_pos_dict.get("reentry_count") or 0)
@@ -283,6 +277,13 @@ async def executor_node(
         )
         new_pos_dict = pos.model_dump()
         db.remove_from_watchlist(order.mint)
+        settled = db.apply_trade_settlement(
+            lane=lane_tag, side="BUY", mint=order.mint, opened_at=pos.opened_at, new_pos_dict=new_pos_dict,
+            sol_delta=sol_delta, pnl_delta=pnl_delta, focus_state=next_state,
+            last_decision_rationale=rationale_out, reservation_id=reservation_id,
+            fallback_base_sol=fb_base_sol, fallback_base_pnl=fb_base_pnl,
+        )
+        sol_balance, daily_pnl_sol = settled["sol_balance"], settled["daily_pnl_sol"]
 
         db.log_trade(
             mode=config.EXECUTION_MODE, side="BUY", mint=order.mint, symbol=order.symbol,
@@ -314,17 +315,13 @@ async def executor_node(
         default_entry = config.WHALE_POSITION_SOL if is_whale_slot else config.TRADE_SIZE_SOL
         pos_obj = ActivePosition.model_validate(existing_pos_dict) if isinstance(existing_pos_dict, dict) else ActivePosition(mint=order.mint, symbol=order.symbol, entry_sol=default_entry, token_amount=order.amount_atomic * 2)
         frac = float((config.WHALE_PARTIAL_TP_SELL_FRACTION or config.PARTIAL_TP_SELL_FRACTION) if is_whale_slot else config.PARTIAL_TP_SELL_FRACTION)
-        # If a naive test mock returned full-position lamports ignoring `amount`, scale to sold fraction
-        if pos_obj.current_sol_value > 0 and received_sol >= pos_obj.current_sol_value * 0.90 and frac <= 0.60:
-            received_sol = round(received_sol * frac, 6)
         cost_of_sold = round(pos_obj.initial_entry_sol * frac, 6)
         partial_pnl = round(received_sol - cost_of_sold - tx_fee_sol, 6)
         partial_pnl_pct = (partial_pnl / cost_of_sold) if cost_of_sold > 0 else 0.0
-        sol_balance = round(max(0.0, sol_balance + received_sol - tx_fee_sol), 6)
-        daily_pnl_sol = round(daily_pnl_sol + partial_pnl, 6)
+        sol_delta = received_sol - tx_fee_sol
 
         rem_tokens = max(0, int(pos_obj.token_amount) - int(order.amount_atomic))
-        rem_basis = round(pos_obj.entry_sol * (1.0 - frac), 6)
+        rem_basis = round(max(0.0, pos_obj.remaining_cost_basis_sol - cost_of_sold), 6)
         rem_sol_val = round(max(0.0, pos_obj.current_sol_value - received_sol), 6) if pos_obj.current_sol_value > received_sol else round(received_sol * ((1.0 - frac) / max(frac, 1e-9)), 6)
         pos_obj.token_amount = rem_tokens
         pos_obj.remaining_cost_basis_sol = rem_basis
@@ -340,13 +337,21 @@ async def executor_node(
         next_state = FocusState.IN_POSITION.value
         pos_strategy = pos_obj.strategy or order.strategy or "SCALPER"
         bt = pos_obj.breakout_telemetry or order.breakout_telemetry or {}
+        settled = db.apply_trade_settlement(
+            lane=lane_tag, side="PARTIAL_SELL", mint=order.mint, opened_at=pos_obj.opened_at, new_pos_dict=new_pos_dict,
+            sol_delta=sol_delta, pnl_delta=partial_pnl, focus_state=next_state,
+            last_decision_rationale=rationale_out, fallback_base_sol=fb_base_sol, fallback_base_pnl=fb_base_pnl,
+        )
+        sol_balance, daily_pnl_sol = settled["sol_balance"], settled["daily_pnl_sol"]
+        new_pos_dict = next((p for p in settled["whale_positions" if is_whale_slot else "chart_positions"] if p.get("mint") == order.mint), new_pos_dict)
 
         db.log_trade(
             mode=config.EXECUTION_MODE, side="PARTIAL_SELL", mint=order.mint, symbol=order.symbol,
-            in_amount=order.amount_atomic, out_amount=int(round(received_sol * LAMPORTS_PER_SOL)),
+            in_amount=order.amount_atomic, out_amount=out_amount,
             sol_value=received_sol, pnl_sol=partial_pnl, pnl_pct=partial_pnl_pct,
             reason=order.reason, tx_signature=tx_signature, rationale=order.rationale,
             strategy=pos_strategy, triggering_wallets=list(pos_obj.triggering_wallets), opened_at=pos_obj.opened_at,
+            jupiter_price_impact_raw=raw_price_impact,
         )
         db.log_action(
             mode=config.EXECUTION_MODE, action="PARTIAL_SELL", symbol=order.symbol, asset_id=order.mint,
@@ -361,37 +366,33 @@ async def executor_node(
             breakout_score=bt.get("score"), breakout_state=bt.get("state"), breakout_timeframe=bt.get("timeframe"),
             breakout_vol_ratio=bt.get("vol_ratio"), breakout_ema_ext_pct=bt.get("ema_ext_pct"),
             breakout_failed_gates="; ".join(bt.get("failed_gates") or []) if bt else None,
+            jupiter_price_impact_raw=raw_price_impact, monitor_sol_value=order.monitor_sol_value,
+            price_source=order.price_source or pos_obj.last_price_source,
+            position_mfe_pct=pos_obj.position_mfe_pct, position_mae_pct=pos_obj.position_mae_pct,
         )
+        exit_committed = True
+        finalize_exit_guard(db, sell_key, committed=True)
         logger.info(
             "[%s] PARTIAL_SELL %s: %d tokens -> %.4f SOL (banked %+.4f SOL / %+.2f%%, rem_tokens=%d, rem_basis=%.4f SOL)",
             config.EXECUTION_MODE.upper(), order.symbol, order.amount_atomic, received_sol, partial_pnl, partial_pnl_pct * 100.0, rem_tokens, rem_basis,
         )
     else:
         received_sol = out_amount / LAMPORTS_PER_SOL
-        sol_balance = round(max(0.0, sol_balance + received_sol - tx_fee_sol), 6)
+        sol_delta = received_sol - tx_fee_sol
         ex_dict = existing_pos_dict if isinstance(existing_pos_dict, dict) else {}
         entry_sol = float(ex_dict.get("entry_sol", 0.0))
         partial_taken = bool(ex_dict.get("partial_tp_taken", False))
         rem_basis_val = float(ex_dict.get("remaining_cost_basis_sol") or 0.0)
         cost_basis = rem_basis_val if (partial_taken and rem_basis_val > 0) else entry_sol
-        if partial_taken and entry_sol > 0 and cost_basis < entry_sol and received_sol > entry_sol * 0.80:
-            received_sol = round(received_sol * (cost_basis / entry_sol), 6)
-            sol_balance = round(max(0.0, float(state.get("sol_balance") or 0.0) + received_sol - tx_fee_sol), 6)
         pnl_sol = round((received_sol - cost_basis - tx_fee_sol) if cost_basis > 0 else -tx_fee_sol, 6)
         pnl_pct = (pnl_sol / cost_basis) if cost_basis > 0 else 0.0
-        daily_pnl_sol = round(daily_pnl_sol + pnl_sol, 6)
 
         existing_strat = str(ex_dict.get("strategy") or "").strip()
         db_buy_strat = db.get_latest_buy_strategy(order.mint)
-        if order.strategy and order.strategy != "SCALPER":
-            pos_strategy = order.strategy
-        elif existing_strat and existing_strat != "SCALPER":
-            pos_strategy = existing_strat
-        elif db_buy_strat:
-            pos_strategy = db_buy_strat
-        else:
-            pos_strategy = existing_strat or order.strategy or "SCALPER"
-
+        pos_strategy = (
+            order.strategy if (order.strategy and order.strategy != "SCALPER")
+            else (existing_strat if (existing_strat and existing_strat != "SCALPER") else (db_buy_strat or existing_strat or order.strategy or "SCALPER"))
+        )
         pos_trig_wallets = list(ex_dict.get("triggering_wallets") or order.triggering_wallets or [])
         pos_opened_at = ex_dict.get("opened_at")
         peak_sol_val = float(ex_dict.get("peak_sol_value") or 0.0)
@@ -406,32 +407,6 @@ async def executor_node(
             except ValueError:
                 hold_sec_val = None
         pos_liq_usd = float(ex_dict.get("last_liquidity_usd") or ex_dict.get("entry_liquidity_usd") or 0.0)
-        db.log_trade(
-            mode=config.EXECUTION_MODE, side="SELL", mint=order.mint, symbol=order.symbol,
-            in_amount=order.amount_atomic, out_amount=out_amount, sol_value=received_sol,
-            pnl_sol=pnl_sol, pnl_pct=pnl_pct, reason=order.reason, tx_signature=tx_signature,
-            rationale=order.rationale, strategy=pos_strategy,
-            triggering_wallets=pos_trig_wallets, opened_at=pos_opened_at,
-        )
-        pos_mc_usd = order.entry_mc_usd if order.entry_mc_usd is not None else ex_dict.get("entry_mc_usd")
-        pos_whale_flow = order.whale_sol_flow if order.whale_sol_flow is not None else ex_dict.get("whale_sol_flow")
-        sell_bt = order.breakout_telemetry or ex_dict.get("breakout_telemetry") or {}
-        db.log_action(
-            mode=config.EXECUTION_MODE, action="SELL", symbol=order.symbol, asset_id=order.mint,
-            qty=float(order.amount_atomic), notional=round(received_sol, 6), price_or_value=round(received_sol, 6),
-            pnl_amount=round(pnl_sol, 6), pnl_pct=round(pnl_pct * 100.0, 2),
-            strategy=pos_strategy, reason=order.reason,
-            sol_equity=round(sol_balance, 6), daily_realized_sol=round(daily_pnl_sol, 6),
-            mc_usd=pos_mc_usd, liq_usd=round(pos_liq_usd, 2) if pos_liq_usd else None,
-            peak_pnl_pct=peak_pnl_pct_val, hold_seconds=hold_sec_val,
-            triggering_whales=",".join(pos_trig_wallets) if pos_trig_wallets else None,
-            whale_sol_flow=pos_whale_flow,
-            breakout_score=sell_bt.get("score"), breakout_state=sell_bt.get("state"),
-            breakout_timeframe=sell_bt.get("timeframe"), breakout_vol_ratio=sell_bt.get("vol_ratio"),
-            breakout_ema_ext_pct=sell_bt.get("ema_ext_pct"),
-            breakout_failed_gates="; ".join(sell_bt.get("failed_gates") or []) if sell_bt else None,
-        )
-
         if order.target_state_after_fill == FocusState.WATCHING_REENTRY:
             prev_peak = order.run_peak_sol or float(ex_dict.get("peak_sol_value", received_sol))
             prev_liq = float(ex_dict.get("entry_liquidity_usd", 0.0))
@@ -450,9 +425,45 @@ async def executor_node(
             if order.apply_cooldown:
                 db.set_cooldown(order.mint, hours=config.COOLDOWN_HOURS, reason=order.reason)
 
-        if sell_key is not None:
-            _recently_closed_sells[sell_key] = time.monotonic()
-            _prune_closed_sells(time.monotonic())
+        settled = db.apply_trade_settlement(
+            lane=lane_tag, side="SELL", mint=order.mint, opened_at=str(pos_opened_at or ""), new_pos_dict=new_pos_dict,
+            sol_delta=sol_delta, pnl_delta=pnl_sol, focus_state=next_state,
+            last_decision_rationale=rationale_out, fallback_base_sol=fb_base_sol, fallback_base_pnl=fb_base_pnl,
+        )
+        sol_balance, daily_pnl_sol = settled["sol_balance"], settled["daily_pnl_sol"]
+        next_state = settled["focus_state"]
+
+        db.log_trade(
+            mode=config.EXECUTION_MODE, side="SELL", mint=order.mint, symbol=order.symbol,
+            in_amount=order.amount_atomic, out_amount=out_amount, sol_value=received_sol,
+            pnl_sol=pnl_sol, pnl_pct=pnl_pct, reason=order.reason, tx_signature=tx_signature,
+            rationale=order.rationale, strategy=pos_strategy,
+            triggering_wallets=pos_trig_wallets, opened_at=pos_opened_at,
+            jupiter_price_impact_raw=raw_price_impact,
+        )
+        pos_mc_usd = order.entry_mc_usd if order.entry_mc_usd is not None else ex_dict.get("entry_mc_usd")
+        pos_whale_flow = order.whale_sol_flow if order.whale_sol_flow is not None else ex_dict.get("whale_sol_flow")
+        sell_bt = order.breakout_telemetry or ex_dict.get("breakout_telemetry") or {}
+        db.log_action(
+            mode=config.EXECUTION_MODE, action="SELL", symbol=order.symbol, asset_id=order.mint,
+            qty=float(order.amount_atomic), notional=round(received_sol, 6), price_or_value=round(received_sol, 6),
+            pnl_amount=round(pnl_sol, 6), pnl_pct=round(pnl_pct * 100.0, 2),
+            strategy=pos_strategy, reason=order.reason,
+            sol_equity=round(sol_balance, 6), daily_realized_sol=round(daily_pnl_sol, 6),
+            mc_usd=pos_mc_usd, liq_usd=round(pos_liq_usd, 2) if pos_liq_usd else None,
+            peak_pnl_pct=peak_pnl_pct_val, hold_seconds=hold_sec_val,
+            triggering_whales=",".join(pos_trig_wallets) if pos_trig_wallets else None,
+            whale_sol_flow=pos_whale_flow,
+            breakout_score=sell_bt.get("score"), breakout_state=sell_bt.get("state"),
+            breakout_timeframe=sell_bt.get("timeframe"), breakout_vol_ratio=sell_bt.get("vol_ratio"),
+            breakout_ema_ext_pct=sell_bt.get("ema_ext_pct"),
+            breakout_failed_gates="; ".join(sell_bt.get("failed_gates") or []) if sell_bt else None,
+            jupiter_price_impact_raw=raw_price_impact, monitor_sol_value=order.monitor_sol_value,
+            price_source=order.price_source or ex_dict.get("last_price_source"),
+            position_mfe_pct=ex_dict.get("position_mfe_pct"), position_mae_pct=ex_dict.get("position_mae_pct"),
+        )
+        exit_committed = True
+        finalize_exit_guard(db, sell_key, committed=True)
         logger.info("[%s] SELL %s: %d tokens -> %.4f SOL (PnL %+.4f SOL / %+.2f%%, reason=%s -> %s)", config.EXECUTION_MODE.upper(), order.symbol, order.amount_atomic, received_sol, pnl_sol, pnl_pct * 100.0, order.reason, next_state)
 
     last_exec = {
@@ -462,33 +473,14 @@ async def executor_node(
         "jupiter_price_impact_raw": raw_price_impact,
     }
     if is_whale_slot:
-        updated_whales = [p for p in whale_positions if isinstance(p, dict) and p.get("mint") != order.mint]
-        if (is_buy or is_partial_sell) and new_pos_dict is not None:
-            updated_whales.append(new_pos_dict)
-        db.save_lane_positions(
-            lane="whale", positions=updated_whales, sol_balance=sol_balance,
-            daily_pnl_sol=daily_pnl_sol, last_decision_rationale=order.rationale or state.get("last_decision_rationale"),
-        )
         return {
-            "focus_state": state.get("focus_state", FocusState.SCANNING.value),
+            "focus_state": state.get("focus_state", settled["focus_state"]),
             "sol_balance": sol_balance, "daily_pnl_sol": daily_pnl_sol,
-            "whale_position": new_pos_dict if (is_buy or is_partial_sell) else (updated_whales[0] if updated_whales else None),
-            "whale_positions": updated_whales, "pending_order": None, "last_execution": last_exec,
+            "whale_position": settled["whale_position"], "whale_positions": settled["whale_positions"],
+            "pending_order": None, "last_execution": last_exec,
         }
-
-    updated_charts = [p for p in chart_positions if isinstance(p, dict) and p.get("mint") != order.mint]
-    if (is_buy or is_partial_sell) and new_pos_dict is not None:
-        updated_charts.append(new_pos_dict)
-    elif new_pos_dict is None and updated_charts and next_state == FocusState.SCANNING.value:
-        new_pos_dict = updated_charts[0]
-        next_state = FocusState.IN_POSITION.value
-    db.save_lane_positions(
-        lane="chart", positions=updated_charts, sol_balance=sol_balance, daily_pnl_sol=daily_pnl_sol,
-        focus_state=next_state, active_position=new_pos_dict,
-        last_decision_rationale=order.rationale or state.get("last_decision_rationale"),
-    )
     return {
-        "focus_state": next_state, "sol_balance": sol_balance, "daily_pnl_sol": daily_pnl_sol,
-        "active_position": new_pos_dict, "chart_positions": updated_charts,
+        "focus_state": settled["focus_state"], "sol_balance": sol_balance, "daily_pnl_sol": daily_pnl_sol,
+        "active_position": settled["active_position"], "chart_positions": settled["chart_positions"],
         "pending_order": None, "last_execution": last_exec,
     }
