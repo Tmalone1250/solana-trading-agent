@@ -203,15 +203,16 @@ async def test_disabled_watching_reentry_abandons_early_without_http_and_preserv
     assert out_solo["monitor_event"] == "LEG2_ENTRY_DISABLED"
     assert db.is_on_cooldown("MintWatchEarly")
 
-    # Now test WATCHING_REENTRY coexisting with an open Chart position that hits HARD_STOP_LOSS:
-    # Watcher mint must NOT be queried, while open Chart position still executes its exit normally!
+    # 2. WATCHING_REENTRY coexisting with 1 open Chart position that hits HARD_STOP_LOSS:
+    # Watcher mint must NOT be queried, receives LEG2_ENTRY_DISABLED cooldown, and final state is SCANNING.
+    watcher2 = {**watcher, "mint": "MintWatchCoexist1", "symbol": "WCX1"}
     open_pos = ActivePosition(
         mint="MintOpenExit", symbol="OPEX", entry_sol=0.50, token_amount=1_000_000,
         entry_liquidity_usd=80_000.0, current_sol_value=0.50, peak_sol_value=0.50,
         opened_at=(now_dt - timedelta(minutes=2)).isoformat(), strategy="BREAKOUT_IGNITION",
     ).model_dump()
-    db.save_state(focus_state=FocusState.WATCHING_REENTRY.value, sol_balance=0.50, daily_pnl_sol=0.0, active_position=watcher)
-    update_lane_positions_only(db, lane="chart", positions=[open_pos], focus_state=FocusState.WATCHING_REENTRY.value, active_position=watcher)
+    db.save_state(focus_state=FocusState.WATCHING_REENTRY.value, sol_balance=0.50, daily_pnl_sol=0.0, active_position=watcher2)
+    update_lane_positions_only(db, lane="chart", positions=[open_pos], focus_state=FocusState.WATCHING_REENTRY.value, active_position=watcher2)
 
     coexist_urls: list[str] = []
 
@@ -219,22 +220,66 @@ async def test_disabled_watching_reentry_abandons_early_without_http_and_preserv
         url = str(request.url)
         coexist_urls.append(url)
         if "/tokens/v1/solana/" in url:
-            return httpx.Response(200, json=[{
-                "chainId": "solana", "baseToken": {"address": "MintOpenExit", "symbol": "OPEX"},
-                "priceNative": "0.43", "priceUsd": "0.086", "liquidity": {"usd": 80_000.0},
-                "txns": {"m5": {"buys": 5, "sells": 15}},
-            }])
+            return httpx.Response(200, json=[
+                {
+                    "chainId": "solana", "baseToken": {"address": "MintOpenExit", "symbol": "OPEX"},
+                    "priceNative": "0.43", "priceUsd": "0.086", "liquidity": {"usd": 80_000.0},
+                    "txns": {"m5": {"buys": 5, "sells": 15}},
+                },
+                {
+                    "chainId": "solana", "baseToken": {"address": "MintOpenHold", "symbol": "OPHD"},
+                    "priceNative": "0.52", "priceUsd": "0.104", "liquidity": {"usd": 85_000.0},
+                    "txns": {"m5": {"buys": 16, "sells": 10}},
+                },
+            ])
         if "/swap/v2/order" in url:
             return httpx.Response(200, json={"outAmount": str(int(0.43 * LAMPORTS_PER_SOL)), "priceImpactPct": "-0.4", "transaction": None})
         return httpx.Response(404)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(_coexist_handler)) as client:
         out_co = await position_monitor_node(
-            {"focus_state": FocusState.WATCHING_REENTRY.value, "sol_balance": 0.50, "daily_pnl_sol": 0.0, "active_position": watcher, "chart_positions": [open_pos]},
+            {"focus_state": FocusState.WATCHING_REENTRY.value, "sol_balance": 0.50, "daily_pnl_sol": 0.0, "active_position": watcher2, "chart_positions": [open_pos]},
             config=cfg, db=db, decision_client=dec, http_client=client, now=now_dt,  # type: ignore[arg-type]
         )
-    assert not any("MintWatchEarly" in u for u in coexist_urls)
+    assert not any("MintWatchCoexist1" in u for u in coexist_urls)
     assert dec.calls == 0
     assert out_co.get("_hard_stop_already_executed") is True
-    assert db.get_state()["chart_positions"] == []
+    assert out_co["focus_state"] == FocusState.SCANNING.value
+    assert out_co["active_position"] is None
+    assert out_co["chart_positions"] == []
+    st_after_last = db.get_state()
+    assert st_after_last["focus_state"] == FocusState.SCANNING.value
+    assert st_after_last["active_position"] is None
+    assert st_after_last["chart_positions"] == []
+    assert db.is_on_cooldown("MintWatchCoexist1")
+
+    # 3. WATCHING_REENTRY coexisting with 2 open Chart positions: 1 exits via HARD_STOP_LOSS, 1 remains open -> IN_POSITION
+    clear_sell_guard()
+    watcher3 = {**watcher, "mint": "MintWatchCoexist2", "symbol": "WCX2"}
+    open_exit_2 = {**open_pos, "opened_at": (now_dt - timedelta(minutes=1)).isoformat()}
+    open_hold = ActivePosition(
+        mint="MintOpenHold", symbol="OPHD", entry_sol=0.50, token_amount=1_000_000,
+        entry_liquidity_usd=85_000.0, current_sol_value=0.52, peak_sol_value=0.52,
+        opened_at=(now_dt - timedelta(minutes=3)).isoformat(), strategy="BREAKOUT_IGNITION",
+    ).model_dump()
+    db.save_state(focus_state=FocusState.WATCHING_REENTRY.value, sol_balance=0.50, daily_pnl_sol=0.0, active_position=watcher3)
+    update_lane_positions_only(db, lane="chart", positions=[open_exit_2, open_hold], focus_state=FocusState.WATCHING_REENTRY.value, active_position=watcher3)
+    coexist_urls.clear()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_coexist_handler)) as client:
+        out_co2 = await position_monitor_node(
+            {"focus_state": FocusState.WATCHING_REENTRY.value, "sol_balance": 0.50, "daily_pnl_sol": 0.0, "active_position": watcher3, "chart_positions": [open_exit_2, open_hold]},
+            config=cfg, db=db, decision_client=dec, http_client=client, now=now_dt,  # type: ignore[arg-type]
+        )
+    assert not any("MintWatchCoexist2" in u for u in coexist_urls)
+    assert dec.calls == 0
+    assert out_co2.get("_hard_stop_already_executed") is True
+    assert out_co2["focus_state"] == FocusState.IN_POSITION.value
+    assert out_co2["active_position"]["mint"] == "MintOpenHold"
+    assert [p["mint"] for p in out_co2["chart_positions"]] == ["MintOpenHold"]
+    st_after_rem = db.get_state()
+    assert st_after_rem["focus_state"] == FocusState.IN_POSITION.value
+    assert st_after_rem["active_position"]["mint"] == "MintOpenHold"
+    assert [p["mint"] for p in st_after_rem["chart_positions"]] == ["MintOpenHold"]
+    assert db.is_on_cooldown("MintWatchCoexist2")
     db.close()

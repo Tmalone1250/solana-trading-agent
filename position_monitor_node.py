@@ -125,12 +125,15 @@ async def position_monitor_node(
             if order is not None:
                 triggered_exits.append((prio, slot_idx, cp, order, ev))
 
+        keep_watch = primary_is_watch and leg2_enabled
+        if primary_is_watch and not leg2_enabled:
+            db.set_cooldown(primary_pos.mint, hours=config.COOLDOWN_HOURS, reason="LEG2_ENTRY_DISABLED")
         updated_open_dicts = [cp.model_dump() for cp in open_chart_positions]
         if open_chart_positions:
             db.update_lane_positions_only(
                 lane="chart", positions=updated_open_dicts,
-                focus_state=FocusState.WATCHING_REENTRY.value if primary_is_watch else FocusState.IN_POSITION.value,
-                active_position=primary_pos.model_dump() if primary_is_watch else updated_open_dicts[0],
+                focus_state=FocusState.WATCHING_REENTRY.value if keep_watch else FocusState.IN_POSITION.value,
+                active_position=primary_pos.model_dump() if keep_watch else updated_open_dicts[0],
             )
 
         if triggered_exits:
