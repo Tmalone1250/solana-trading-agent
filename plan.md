@@ -1,15 +1,9 @@
-# Plan — Repo-Native DuckDB Soak Audit Report Exporter
+# Phase 1 Plan — BREAKOUT_IGNITION-Only Chart Isolation (Directive 02)
 
-## Files (< 500 lines each)
-1. `scripts/soak_report_sections.py`:
-   - Section 3: Trades Performance (`trades` + `action_log` MFE/MAE enrichment, Pre-Soak vs. Active Soak side-by-side table, setup & exit-reason breakdowns, MFE/MAE stats, full Active Soak trade ledger).
-   - Section 4: Alpha Decisions & Stage 3 Verification (`decisions_log` action/setup counts, score distributions, Top-25 Stage 3 Unfrozen-Momentum Verification table, Complete Breakout Log capped at 150 rows).
-   - Section 5: Candidate Outcomes & Missed-Opportunity Telemetry (`candidate_outcomes` Pre-Soak vs. Soak MFE/MAE/1m/5m/15m/30m distributions, Top-25 soak candidates by MFE highlighting missed runners).
-   - Section 6: Pipeline Activity, Slot Churn & Phase 0 Baseline (`action_log` event/eviction/block breakdown, Top-20 most active tokens, slot churn & cadence metrics).
-   - Section 7: Whale Pipeline (`whale_events`, `whale_signals`, `whale_decisions` counts, unique wallets, top mints, status/reason breakdown, latest 20 soak rows).
-   - Section 8: Live State & Social Signals (`agent_state`, `active_watchlist`, `cooldowns`, `x_worker_state`, `social_signals`, `x_seen_tweets`).
-2. `scripts/export_soak_report.py`:
-   - Read-only CLI supporting `--csv-dir` and `--db` (copies `.duckdb` + `.duckdb.wal` to temporary dir and cleans up in `finally:`), `--since` (default `2026-11-25T20:51:57Z`), and `--out` (default `./soak_audit_report.md`).
-   - Renders Section 1 (Header & Executive Summary) and Section 2 (Table Inventory & Schema Overview).
-3. `tests/test_export_soak_report.py`:
-   - Tests `--csv-dir` and `--db` modes, `--since` splitting, missing/empty tables, and Stage 3 momentum-variance + breakout log rendering.
+1. `config.py` + `.env.example`: Add `VALID_CHART_STRATEGIES`, `CHART_ENABLED_STRATEGIES` (default all 4 Chart strategies for backward compatibility), validation rejecting unknown names, `chart_enabled_strategies()`, and `is_chart_strategy_enabled()`.
+2. `scalper_entry_engine.py`: Gate `SWEEP_RECLAIM`, `DISPLACEMENT_RETEST`, and `BREAKOUT_IGNITION` in `evaluate_scalper_entry` on `config.chart_enabled_strategies()` so disabled setups cannot fire or shadow `BREAKOUT_IGNITION`.
+3. `alpha_helpers.py` + `alpha_node.py`: Gate `leg2_fast_track`, cached momentum `BUY` promotion, and final `approved`/order strategy on `config.chart_enabled_strategies()`.
+4. `chart_exit_engine.py` + `position_monitor_node.py`: Prevent `TRAILING_TP` from entering `WATCHING_REENTRY` and abandon any existing `WATCHING_REENTRY` without emitting `LEG_2_REENTRY` when `LEG2_ENTRY` is disabled.
+5. `executor_node.py`: Add final Chart `BUY` authorization check against `config.is_chart_strategy_enabled(order.strategy)` and Whale `BUY` check against `config.WHALE_STRATEGY_ENABLED` (never blocking `SELL` / `PARTIAL_SELL`).
+6. `telemetry_api.py`, `scanner_node.py`, `alpha_node.py`: Block Helius webhook ingestion and skip `active_whales` discovery/prompt injection when both `WHALE_STRATEGY_ENABLED` and `ENABLE_HELIUS_WHALE_WEBHOOK` are `False`.
+7. `tests/test_breakout_isolation.py`: Cover all categories A–F and run full `./venv/bin/pytest -v`.

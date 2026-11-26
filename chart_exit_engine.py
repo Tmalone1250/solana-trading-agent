@@ -160,9 +160,14 @@ def evaluate_chart_position_exit(
         active_trail_pb = runner_pb_frac if pos.partial_tp_taken else config.TRAIL_PULLBACK_PCT
         pullback_pct = (pos.peak_sol_value - current_sol_value) / pos.peak_sol_value
         if pullback_pct + EPS >= active_trail_pb:
-            at_reentry_cap = pos.reentry_count >= config.MAX_REENTRIES_PER_MINT
+            leg2_enabled = config.is_chart_strategy_enabled("LEG2_ENTRY")
+            at_reentry_cap = (not leg2_enabled) or (pos.reentry_count >= config.MAX_REENTRIES_PER_MINT)
             target_state = FocusState.SCANNING if at_reentry_cap else FocusState.WATCHING_REENTRY
-            cap_suffix = f" [MAX_REENTRIES={pos.reentry_count}/{config.MAX_REENTRIES_PER_MINT} -> COOLDOWN]" if at_reentry_cap else ""
+            cap_suffix = (
+                " [LEG2_ENTRY_DISABLED -> COOLDOWN]"
+                if not leg2_enabled
+                else (f" [MAX_REENTRIES={pos.reentry_count}/{config.MAX_REENTRIES_PER_MINT} -> COOLDOWN]" if at_reentry_cap else "")
+            )
             reason = (
                 f"TRAILING_TP (peak {peak_pnl_pct * 100:+.2f}%, "
                 f"pullback -{pullback_pct * 100:.2f}% >= -{active_trail_pb * 100:.0f}%){cap_suffix}"

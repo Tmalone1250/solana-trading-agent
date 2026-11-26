@@ -433,6 +433,8 @@ def create_telemetry_app(
         request: Request,
         authorization: Optional[str] = Header(default=None),
     ) -> dict[str, Any]:
+        if not cfg.ENABLE_HELIUS_WHALE_WEBHOOK and not cfg.WHALE_STRATEGY_ENABLED:
+            return {"status": "disabled", "received": 0, "recorded": 0, "duplicates": 0, "ignored": 0}
         if not verify_helius_auth(authorization, cfg.HELIUS_AUTH_HEADER):
             raise HTTPException(status_code=401, detail="Invalid Authorization header")
         try:

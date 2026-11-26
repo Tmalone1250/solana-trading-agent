@@ -124,6 +124,11 @@ def compute_live_momentum_and_action(
         raw_mom = min(raw_mom, 1.40)
     mom_score = round(max(0.0, min(5.0, raw_mom)), 2)
 
+    enabled_strats = config.chart_enabled_strategies()
+    setup_allowed = scalper.setup_type in enabled_strats
+    leg2_allowed = "LEG2_ENTRY" in enabled_strats
+    bo_allowed = "BREAKOUT_IGNITION" in enabled_strats
+
     # Live execution decision from cached narrative/vamp + fresh live momentum/setup
     if (
         vamp_score >= config.VAMP_EVICT_THRESHOLD
@@ -133,9 +138,9 @@ def compute_live_momentum_and_action(
         choice = "REJECT"
         conf = 0.80
     elif vamp_score <= config.MAX_VAMP_ENTRY and (
-        (scalper.eligible and narrative_score >= config.MIN_NARRATIVE_SCORE and mom_score >= config.MIN_MOMENTUM_SCORE)
-        or (bt_state == "IGNITION" and narrative_score >= config.MIN_NARRATIVE_SCORE and mom_score >= config.MIN_MOMENTUM_SCORE)
-        or (leg2_score >= config.LEG2_FAST_TRACK_MIN_SCORE and mom_score >= config.LEG2_FAST_TRACK_MIN_MOM)
+        (scalper.eligible and setup_allowed and narrative_score >= config.MIN_NARRATIVE_SCORE and mom_score >= config.MIN_MOMENTUM_SCORE)
+        or (bo_allowed and bt_state == "IGNITION" and narrative_score >= config.MIN_NARRATIVE_SCORE and mom_score >= config.MIN_MOMENTUM_SCORE)
+        or (leg2_allowed and setup_allowed and leg2_score >= config.LEG2_FAST_TRACK_MIN_SCORE and mom_score >= config.LEG2_FAST_TRACK_MIN_MOM)
     ):
         choice = "BUY"
         conf = round(

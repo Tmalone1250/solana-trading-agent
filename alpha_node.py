@@ -131,7 +131,12 @@ async def alpha_node(
         scalper_results.append(sc_entry)
 
     active_social = db.get_active_social_signals(ttl_minutes=config.X_SIGNAL_TTL_MINUTES, now=now_dt)
-    active_whales = db.get_active_whale_signals(ttl_minutes=config.WHALE_SIGNAL_TTL_MINUTES, min_buys=0, now=now_dt)
+    whale_active = config.WHALE_STRATEGY_ENABLED or config.ENABLE_HELIUS_WHALE_WEBHOOK
+    active_whales = (
+        db.get_active_whale_signals(ttl_minutes=config.WHALE_SIGNAL_TTL_MINUTES, min_buys=0, now=now_dt)
+        if whale_active
+        else {}
+    )
 
     cache_ttl = float(getattr(config, "NARRATIVE_CACHE_TTL_SECONDS", 1800.0))
     now_ts = now_dt.timestamp()
@@ -190,6 +195,8 @@ async def alpha_node(
             )
             cache_meta_by_idx[orig_idx] = (False, str(stored["cached_at"]))
 
+    enabled_strats = config.chart_enabled_strategies()
+    leg2_enabled = "LEG2_ENTRY" in enabled_strats
     decisions: list[AlphaDecision] = []
     approved_pairs: list[tuple[AlphaDecision, dict[str, Any], bool, float, str, Optional[dict[str, Any]]]] = []
 
@@ -211,7 +218,8 @@ async def alpha_node(
             and mom >= config.MIN_MOMENTUM_SCORE
         )
         leg2_fast_track = (
-            leg2_score >= config.LEG2_FAST_TRACK_MIN_SCORE
+            leg2_enabled
+            and leg2_score >= config.LEG2_FAST_TRACK_MIN_SCORE
             and vamp <= config.MAX_VAMP_ENTRY
             and mom >= config.LEG2_FAST_TRACK_MIN_MOM
             and (
@@ -219,8 +227,9 @@ async def alpha_node(
                 or (action == "WATCH" and leg2_score >= config.LEG2_FAST_TRACK_WATCH_SCORE)
             )
         )
+        setup_enabled = scalper.setup_type in enabled_strats
         decision1_wants_buy = standard_approved or leg2_fast_track
-        approved = decision1_wants_buy and scalper.eligible
+        approved = decision1_wants_buy and scalper.eligible and setup_enabled
 
         dec = AlphaDecision(
             mint=cand["mint"], symbol=cand.get("symbol", "UNKNOWN"),
@@ -428,6 +437,7 @@ async def alpha_node(
     if open_mints:
         approved_pairs = [item for item in approved_pairs if item[0].mint not in open_mints]
 
+    approved_pairs = [item for item in approved_pairs if ("LEG2_ENTRY" if item[2] else item[4]) in enabled_strats]
     if not approved_pairs:
         return {
             "alpha_decisions": [d.model_dump() for d in decisions],

@@ -426,11 +426,16 @@ async def scanner_node(
     kept_entries = _evict_stale_or_cooled_watchlist(config=config, db=db, now_dt=now_dt)
     kept_mints = [e["mint"] for e in kept_entries]
 
-    # 1b. Query active Helius whale signals (for Chart confluence only; whale_lane.py is sole WHALE_SCALP entry authority)
-    active_whales = db.get_active_whale_signals(
-        ttl_minutes=config.WHALE_SIGNAL_TTL_MINUTES,
-        min_buys=1,
-        now=now_dt,
+    # 1b. Query active Helius whale signals only when Whale strategy or webhook is enabled
+    whale_active = config.WHALE_STRATEGY_ENABLED or config.ENABLE_HELIUS_WHALE_WEBHOOK
+    active_whales = (
+        db.get_active_whale_signals(
+            ttl_minutes=config.WHALE_SIGNAL_TTL_MINUTES,
+            min_buys=1,
+            now=now_dt,
+        )
+        if whale_active
+        else {}
     )
     whale_mints = list(active_whales.keys())
 

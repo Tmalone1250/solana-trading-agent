@@ -10,6 +10,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 SOL_MINT = "So11111111111111111111111111111111111111112"
 LAMPORTS_PER_SOL = 1_000_000_000
 
+VALID_CHART_STRATEGIES: frozenset[str] = frozenset(
+    {"BREAKOUT_IGNITION", "SWEEP_RECLAIM", "DISPLACEMENT_RETEST", "LEG2_ENTRY"}
+)
+DEFAULT_CHART_ENABLED_STRATEGIES: str = "BREAKOUT_IGNITION,SWEEP_RECLAIM,DISPLACEMENT_RETEST,LEG2_ENTRY"
+
 DEFAULT_WHALE_WALLET_LABELS: dict[str, str] = {
     "862TYS3qj1vRGWo2": "Wugi",
     "J9TYAsWWidbrcZybmLSfrLzryANf4CgJBLdvwdGuC8MB": "Johnson",
@@ -33,6 +38,7 @@ class AgentConfig(BaseSettings):
     # Core modes
     EXECUTION_MODE: Literal["paper", "live"] = "paper"
     HUNTING_LANE: Literal["momentum_runners", "graduations"] = "momentum_runners"
+    CHART_ENABLED_STRATEGIES: str = DEFAULT_CHART_ENABLED_STRATEGIES
 
     # API Keys
     GEMINI_API_KEY: str = ""
@@ -199,7 +205,34 @@ class AgentConfig(BaseSettings):
             self.WHALE_PARTIAL_TP_SELL_FRACTION = float(self.PARTIAL_TP_SELL_FRACTION)
         if self.WHALE_RUNNER_TRAIL_PULLBACK_PCT is None:
             self.WHALE_RUNNER_TRAIL_PULLBACK_PCT = float(self.RUNNER_TRAIL_PULLBACK_PCT)
+        self.chart_enabled_strategies()
         return self
+
+    def chart_enabled_strategies(self) -> set[str]:
+        """Return normalized uppercase set of enabled Chart strategies; reject unknown names."""
+        parsed = {item.strip().upper() for item in self.CHART_ENABLED_STRATEGIES.split(",") if item.strip()}
+        unknown = sorted(parsed - VALID_CHART_STRATEGIES)
+        if unknown:
+            raise ValueError(
+                f"Unknown CHART_ENABLED_STRATEGIES value(s): {', '.join(unknown)}. "
+                f"Valid strategies: {', '.join(sorted(VALID_CHART_STRATEGIES))}."
+            )
+        return parsed
+
+    def is_chart_strategy_enabled(
+        self,
+        strategy: str | None,
+        *,
+        allow_legacy_scalper_when_all_enabled: bool = False,
+    ) -> bool:
+        """Return True iff `strategy` is a recognized and enabled Chart strategy."""
+        norm = str(strategy or "").strip().upper()
+        enabled = self.chart_enabled_strategies()
+        if norm in enabled:
+            return True
+        if allow_legacy_scalper_when_all_enabled and norm == "SCALPER" and enabled == VALID_CHART_STRATEGIES:
+            return True
+        return False
 
     def lane_bounds(self) -> tuple[float, float, float]:
         """Return (min_mc_usd, max_mc_usd, min_age_seconds) for HUNTING_LANE."""

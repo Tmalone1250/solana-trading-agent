@@ -223,7 +223,9 @@ async def position_monitor_node(
             "pending_order": None, "monitor_event": reason, "last_decision_rationale": rationale,
         }
 
-    # Abandonment 0: Max re-entries per mint reached -> cooldown + SCANNING
+    # Abandonment 0: LEG2_ENTRY disabled or max re-entries per mint reached -> cooldown + SCANNING
+    if not config.is_chart_strategy_enabled("LEG2_ENTRY"):
+        return _abandon_watch("LEG2_ENTRY_DISABLED")
     if pos.reentry_count >= config.MAX_REENTRIES_PER_MINT:
         return _abandon_watch(f"MAX_REENTRIES_PER_MINT ({pos.reentry_count}/{config.MAX_REENTRIES_PER_MINT})")
 

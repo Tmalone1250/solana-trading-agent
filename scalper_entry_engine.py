@@ -7,7 +7,7 @@ from typing import Any, Optional, Sequence
 from pydantic import BaseModel
 
 from breakout_ignition import detect_breakout_ignition
-from config import AgentConfig
+from config import VALID_CHART_STRATEGIES, AgentConfig
 
 
 class ScalperEntryResult(BaseModel):
@@ -197,6 +197,7 @@ def evaluate_scalper_entry(
     breakout_max_rsi = 78.0
     min_buy_ratio = config.SCALPER_MIN_BUY_RATIO_5M if config else 0.58
     min_txns = config.SCALPER_MIN_TXNS_5M if config else 15
+    enabled_strats = config.chart_enabled_strategies() if config is not None else set(VALID_CHART_STRATEGIES)
 
     candles = _normalize_candles(candles_5m)
     norm_1m = _normalize_candles(candles_1m) if candles_1m else []
@@ -213,6 +214,9 @@ def evaluate_scalper_entry(
             curr_p = float(pair_data.get("price_usd") or pair_data.get("priceUsd") or closes_1m[-1])
             dist_1m = max(0.0, (high_1m - curr_p) / high_1m) if high_1m > 0 else 0.0
             fb_reasons: list[str] = []
+            bo_enabled = "BREAKOUT_IGNITION" in enabled_strats
+            if not bo_enabled:
+                fb_reasons.append("BREAKOUT_IGNITION disabled by CHART_ENABLED_STRATEGIES")
             if time_in_slot_min < min_soak:
                 fb_reasons.append(f"soak {time_in_slot_min:.1f}m < {min_soak:.0f}m")
             if total_5m < min_txns:
@@ -222,8 +226,8 @@ def evaluate_scalper_entry(
             elif rsi_1m > breakout_max_rsi:
                 fb_reasons.append(f"RSI={rsi_1m:.1f} > {breakout_max_rsi:.0f}")
             return ScalperEntryResult(
-                eligible=bi_1m.detected and len(fb_reasons) == 0,
-                setup_type="BREAKOUT_IGNITION" if bi_1m.detected else "NONE",
+                eligible=bo_enabled and bi_1m.detected and len(fb_reasons) == 0,
+                setup_type="BREAKOUT_IGNITION" if (bo_enabled and bi_1m.detected) else "NONE",
                 rsi_5m=round(rsi_1m, 2),
                 dist_from_1h_high_pct=round(dist_1m, 4),
                 rejection_reason=" / ".join(fb_reasons) if fb_reasons else None,
@@ -261,13 +265,13 @@ def evaluate_scalper_entry(
     # Always compute breakout telemetry for live watchlist Breakout Meter
     breakout_res = detect_breakout_ignition(candles, pair_data, bar_minutes=5, rsi_val=rsi_5m, config=config)
 
-    # Gate 3: Core Market-Physics Setup (SWEEP_RECLAIM / DISPLACEMENT_RETEST unchanged; BREAKOUT_IGNITION added)
+    # Gate 3: Core Market-Physics Setup (only evaluate strategies enabled in CHART_ENABLED_STRATEGIES)
     setup_type = "NONE"
-    if _detect_sweep_reclaim(candles):
+    if "SWEEP_RECLAIM" in enabled_strats and _detect_sweep_reclaim(candles):
         setup_type = "SWEEP_RECLAIM"
-    elif _detect_displacement_retest(candles, rsi_5m):
+    elif "DISPLACEMENT_RETEST" in enabled_strats and _detect_displacement_retest(candles, rsi_5m):
         setup_type = "DISPLACEMENT_RETEST"
-    elif breakout_res.detected:
+    elif "BREAKOUT_IGNITION" in enabled_strats and breakout_res.detected:
         setup_type = "BREAKOUT_IGNITION"
 
     reasons: list[str] = []

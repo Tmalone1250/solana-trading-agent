@@ -127,6 +127,16 @@ async def executor_node(
     lane_tag = "whale" if is_whale_slot else "chart"
     reservation_id: Optional[str] = None
     if is_buy:
+        if is_whale_slot:
+            if not config.WHALE_STRATEGY_ENABLED:
+                logger.warning("[Executor] Strategy gate blocked whale_slot BUY of %s: WHALE_STRATEGY_ENABLED=False", order.symbol)
+                return {"pending_order": None}
+        elif not config.is_chart_strategy_enabled(order.strategy, allow_legacy_scalper_when_all_enabled=True):
+            logger.warning(
+                "[Executor] Strategy allowlist blocked chart_slot BUY of %s: strategy=%s not in CHART_ENABLED_STRATEGIES (%s)",
+                order.symbol, order.strategy, ",".join(sorted(config.chart_enabled_strategies())),
+            )
+            return {"pending_order": None}
         active_pos_for_reentry = state.get("active_position") or st_live.get("active_position")
         is_reentry_same_mint = (
             not is_whale_slot and order.reason == "LEG_2_REENTRY"
