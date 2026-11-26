@@ -54,6 +54,7 @@ async def position_monitor_node(
 
     primary_pos = ActivePosition.model_validate(raw_pos)
     primary_is_watch = (primary_pos.token_amount <= 0) and (focus_state == FocusState.WATCHING_REENTRY.value)
+    leg2_enabled = config.is_chart_strategy_enabled("LEG2_ENTRY")
 
     # Deduplicate open token-holding Chart positions by (mint, opened_at) while preserving order
     open_chart_positions: list[ActivePosition] = []
@@ -66,7 +67,21 @@ async def position_monitor_node(
         if not any(pos_matches(existing.model_dump(), cp_cand.mint, cp_cand.opened_at) for existing in open_chart_positions):
             open_chart_positions.append(cp_cand)
 
-    all_mints = list(dict.fromkeys([cp.mint for cp in open_chart_positions] + ([primary_pos.mint] if primary_is_watch else [])))
+    # Early abandonment when LEG2_ENTRY is disabled and no open token-holding Chart positions need monitoring
+    if primary_is_watch and not leg2_enabled and not open_chart_positions:
+        db.set_cooldown(primary_pos.mint, hours=config.COOLDOWN_HOURS, reason="LEG2_ENTRY_DISABLED")
+        rationale = f"[WATCH ABANDON] {primary_pos.symbol}: LEG2_ENTRY_DISABLED -> SCANNING"
+        kept_charts = db.update_lane_positions_only(
+            lane="chart", positions=[], focus_state=FocusState.SCANNING.value,
+            active_position=None, last_decision_rationale=rationale,
+        )
+        return {
+            "focus_state": FocusState.SCANNING.value, "active_position": None, "chart_positions": kept_charts,
+            "pending_order": None, "monitor_event": "LEG2_ENTRY_DISABLED", "last_decision_rationale": rationale,
+        }
+
+    # Only fetch market data for active positions (+ watcher ONLY if LEG2_ENTRY is enabled)
+    all_mints = list(dict.fromkeys([cp.mint for cp in open_chart_positions] + ([primary_pos.mint] if (primary_is_watch and leg2_enabled) else [])))
     now_dt = now or utc_now()
     owns_client = http_client is None
     client = http_client or httpx.AsyncClient()
@@ -171,6 +186,21 @@ async def position_monitor_node(
                 "chart_positions": updated_open_dicts,
                 "pending_order": None,
                 "monitor_event": "HOLD_IN_POSITION",
+            }
+
+        # If LEG2_ENTRY is disabled while open Chart positions coexist, abandon watcher without market/Jupiter calls
+        if not leg2_enabled:
+            db.set_cooldown(primary_pos.mint, hours=config.COOLDOWN_HOURS, reason="LEG2_ENTRY_DISABLED")
+            rationale = f"[WATCH ABANDON] {primary_pos.symbol}: LEG2_ENTRY_DISABLED -> IN_POSITION"
+            next_act = updated_open_dicts[0] if updated_open_dicts else None
+            next_fs = FocusState.IN_POSITION.value if next_act is not None else FocusState.SCANNING.value
+            kept_charts = db.update_lane_positions_only(
+                lane="chart", positions=list(updated_open_dicts),
+                focus_state=next_fs, active_position=next_act, last_decision_rationale=rationale,
+            )
+            return {
+                "focus_state": next_fs, "active_position": next_act, "chart_positions": kept_charts,
+                "pending_order": None, "monitor_event": "LEG2_ENTRY_DISABLED", "last_decision_rationale": rationale,
             }
 
         # Refresh primary WATCHING_REENTRY quote while client is open

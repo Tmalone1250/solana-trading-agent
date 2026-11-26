@@ -131,10 +131,9 @@ async def alpha_node(
         scalper_results.append(sc_entry)
 
     active_social = db.get_active_social_signals(ttl_minutes=config.X_SIGNAL_TTL_MINUTES, now=now_dt)
-    whale_active = config.WHALE_STRATEGY_ENABLED or config.ENABLE_HELIUS_WHALE_WEBHOOK
     active_whales = (
         db.get_active_whale_signals(ttl_minutes=config.WHALE_SIGNAL_TTL_MINUTES, min_buys=0, now=now_dt)
-        if whale_active
+        if config.WHALE_STRATEGY_ENABLED
         else {}
     )
 

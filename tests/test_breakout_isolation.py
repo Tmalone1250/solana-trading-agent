@@ -320,7 +320,7 @@ async def test_whale_isolation_blocks_webhook_and_prevents_chart_discovery_or_al
         {"focus_state": FocusState.SCANNING.value, "sol_balance": 1.5, "safe_candidates": [{"mint": "HistWhaleMint111111111111111111111111111111", "symbol": "HWM", "added_at": (now_dt - timedelta(minutes=5)).isoformat(), "candles_5m": []}]},
         config=cfg, db=db, decision_client=dec, now=now_dt,  # type: ignore[arg-type]
     )
-    assert "whales=" not in dec.last_input
+    assert "whale_buy_count=" not in dec.last_input
     assert tc.get("/api/telemetry").status_code == 200
     db.close()
 
