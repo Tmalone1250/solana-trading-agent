@@ -155,10 +155,17 @@ async def alpha_node(
         p_addr = str(cand.get("pair_address") or (watchlist_by_mint.get(cand["mint"]) or {}).get("pair_address") or "")
         candles_5m = cand.get("candles_5m") if cand.get("candles_5m") is not None else ohlcv_by_pair.get(p_addr, [])
         candles_1m = cand.get("candles_1m")
-        if candles_1m is None and len(candles_5m) < 12:
+        if candles_1m is None:
             candles_1m = ohlcv_1m_by_pair.get(p_addr, [])
 
-        sc_entry = evaluate_scalper_entry(candles_5m, cand, time_in_slot_min, config=config, candles_1m=candles_1m)
+        sc_entry = evaluate_scalper_entry(
+            candles_5m,
+            cand,
+            time_in_slot_min,
+            config=config,
+            candles_1m=candles_1m,
+            decision_timestamp=now_dt.timestamp(),
+        )
         if (candles_5m or candles_1m) and sc_entry.breakout_telemetry:
             cache_breakout_telemetry(cand["mint"], sc_entry.breakout_telemetry, now_ts=now_dt.timestamp())
         scalper_results.append(sc_entry)

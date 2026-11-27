@@ -1,0 +1,455 @@
+diff --git a/alpha_node.py b/alpha_node.py
+index 47f434d..c684150 100644
+--- a/alpha_node.py
++++ b/alpha_node.py
+@@ -155,10 +155,17 @@ async def alpha_node(
+         p_addr = str(cand.get("pair_address") or (watchlist_by_mint.get(cand["mint"]) or {}).get("pair_address") or "")
+         candles_5m = cand.get("candles_5m") if cand.get("candles_5m") is not None else ohlcv_by_pair.get(p_addr, [])
+         candles_1m = cand.get("candles_1m")
+-        if candles_1m is None and len(candles_5m) < 12:
++        if candles_1m is None:
+             candles_1m = ohlcv_1m_by_pair.get(p_addr, [])
+ 
+-        sc_entry = evaluate_scalper_entry(candles_5m, cand, time_in_slot_min, config=config, candles_1m=candles_1m)
++        sc_entry = evaluate_scalper_entry(
++            candles_5m,
++            cand,
++            time_in_slot_min,
++            config=config,
++            candles_1m=candles_1m,
++            decision_timestamp=now_dt.timestamp(),
++        )
+         if (candles_5m or candles_1m) and sc_entry.breakout_telemetry:
+             cache_breakout_telemetry(cand["mint"], sc_entry.breakout_telemetry, now_ts=now_dt.timestamp())
+         scalper_results.append(sc_entry)
+diff --git a/breakout_ignition.py b/breakout_ignition.py
+index 1a185ce..fd035bb 100644
+--- a/breakout_ignition.py
++++ b/breakout_ignition.py
+@@ -2,6 +2,8 @@
+ 
+ from __future__ import annotations
+ 
++import math
++import time
+ from typing import Any, Optional, Sequence
+ 
+ from pydantic import BaseModel
+@@ -66,26 +68,135 @@ def compute_vwap(candles: Sequence[dict[str, float]]) -> float:
+     return sum((c["high"] + c["low"] + c["close"]) / 3.0 for c in candles) / len(candles)
+ 
+ 
++def validate_decision_timestamp(decision_timestamp: Optional[float]) -> tuple[Optional[float], Optional[str]]:
++    """Validate an explicit decision_timestamp or default fail-closed to current UTC time."""
++    if decision_timestamp is None:
++        return time.time(), None
++    if isinstance(decision_timestamp, bool) or not isinstance(decision_timestamp, (int, float)):
++        return None, "invalid decision_timestamp"
++    ts = float(decision_timestamp)
++    if not math.isfinite(ts) or ts <= 0.0:
++        return None, "invalid decision_timestamp"
++    return ts, None
++
++
++def _parse_candle_timestamp(raw_ts: Any) -> Optional[float]:
++    """Parse a Unix epoch timestamp (seconds or >=1e12 ms -> seconds); return None if invalid."""
++    if raw_ts is None or isinstance(raw_ts, bool) or not isinstance(raw_ts, (int, float)):
++        return None
++    ts = float(raw_ts)
++    if not math.isfinite(ts) or ts <= 0.0:
++        return None
++    if ts >= 1e12:
++        ts /= 1000.0
++    return ts
++
++
++def _parse_valid_candle(raw: Any) -> Optional[dict[str, float]]:
++    """Parse a dict or [ts, o, h, l, c, v] sequence into a validated candle dict, else None."""
++    if isinstance(raw, dict):
++        if "timestamp" not in raw:
++            return None
++        ts = _parse_candle_timestamp(raw.get("timestamp"))
++        if ts is None:
++            return None
++        raw_o, raw_h, raw_l, raw_c = raw.get("open"), raw.get("high"), raw.get("low"), raw.get("close")
++        raw_v = raw.get("volume", 0.0)
++    elif isinstance(raw, (list, tuple)) and len(raw) >= 5:
++        ts = _parse_candle_timestamp(raw[0])
++        if ts is None:
++            return None
++        raw_o, raw_h, raw_l, raw_c = raw[1], raw[2], raw[3], raw[4]
++        raw_v = raw[5] if len(raw) > 5 else 0.0
++    else:
++        return None
++
++    ohlc: list[float] = []
++    for val in (raw_o, raw_h, raw_l, raw_c):
++        if isinstance(val, bool) or not isinstance(val, (int, float)):
++            return None
++        fval = float(val)
++        if not math.isfinite(fval) or fval <= 0.0:
++            return None
++        ohlc.append(fval)
++    o, h, l, c = ohlc
++    if h < l or h < max(o, c) or l > min(o, c):
++        return None
++
++    if isinstance(raw_v, bool) or not isinstance(raw_v, (int, float)):
++        return None
++    v = float(raw_v)
++    if not math.isfinite(v) or v < 0.0:
++        return None
++
++    return {"timestamp": ts, "open": o, "high": h, "low": l, "close": c, "volume": v}
++
++
++def normalize_and_filter_candles(
++    raw_candles: Sequence[Any],
++    *,
++    bar_minutes: int,
++    decision_timestamp: Optional[float] = None,
++) -> tuple[list[dict[str, float]], Optional[str], dict[str, Any]]:
++    """Normalize, deduplicate, sort, and filter candles to closed bars with diagnostic gap telemetry."""
++    ref_ts, err = validate_decision_timestamp(decision_timestamp)
++    if err is not None or ref_ts is None:
++        return [], err or "invalid decision_timestamp", {}
++
++    if not isinstance(raw_candles, Sequence) or isinstance(raw_candles, (str, bytes, bytearray)):
++        return [], None, {"recent_gap_count": 0, "max_recent_gap_seconds": 0.0}
++
++    dedup: dict[float, dict[str, float]] = {}
++    for row in raw_candles:
++        parsed = _parse_valid_candle(row)
++        if parsed is not None:
++            dedup[parsed["timestamp"]] = parsed
++
++    sorted_candles = sorted(dedup.values(), key=lambda x: x["timestamp"])
++    bar_seconds = float(max(1, bar_minutes) * 60)
++    closed = [c for c in sorted_candles if c["timestamp"] + bar_seconds <= ref_ts]
++
++    recent = closed[-6:]
++    gap_count = 0
++    max_gap = 0.0
++    for i in range(1, len(recent)):
++        delta = recent[i]["timestamp"] - recent[i - 1]["timestamp"]
++        if delta > bar_seconds:
++            gap_count += 1
++            if delta > max_gap:
++                max_gap = delta
++
++    return closed, None, {"recent_gap_count": gap_count, "max_recent_gap_seconds": max_gap}
++
++
+ def _aggregate_to_15m(candles: Sequence[dict[str, float]], bar_minutes: int) -> list[dict[str, float]]:
+-    """Aggregate 5m (3 bars) or 1m (15 bars) candles into 15m OHLCV bars."""
+-    group_size = max(1, 15 // max(1, bar_minutes))
++    """Aggregate contiguous closed 5m (3 bars) or 1m (15 bars) candles into wall-clock 15m bars."""
++    step = max(1, bar_minutes) * 60
++    group_size = max(1, 900 // step)
++    buckets: dict[int, dict[int, dict[str, float]]] = {}
++    for c in candles:
++        ts_val = c["timestamp"]
++        ts_int = int(round(ts_val))
++        if abs(ts_val - ts_int) > 1e-6:
++            continue
++        bucket_ts = (ts_int // 900) * 900
++        buckets.setdefault(bucket_ts, {})[ts_int] = c
++
+     bars: list[dict[str, float]] = []
+-    # Align from the newest candle backward so the latest 15m bar is complete/current
+-    n = len(candles)
+-    remainder = n % group_size
+-    start = remainder if remainder > 0 and n >= group_size * 2 else 0
+-    for i in range(start, n, group_size):
+-        chunk = candles[i : i + group_size]
+-        if not chunk:
++    for bucket_ts in sorted(buckets.keys()):
++        expected = [bucket_ts + k * step for k in range(group_size)]
++        bucket_map = buckets[bucket_ts]
++        if not all(t in bucket_map for t in expected):
+             continue
++        chunk = [bucket_map[t] for t in expected]
+         bars.append(
+             {
+-                "timestamp": chunk[0]["timestamp"],
++                "timestamp": float(bucket_ts),
+                 "open": chunk[0]["open"],
+-                "high": max(c["high"] for c in chunk),
+-                "low": min(c["low"] for c in chunk),
++                "high": max(x["high"] for x in chunk),
++                "low": min(x["low"] for x in chunk),
+                 "close": chunk[-1]["close"],
+-                "volume": sum(c.get("volume", 0.0) for c in chunk),
++                "volume": sum(x.get("volume", 0.0) for x in chunk),
+             }
+         )
+     return bars
+@@ -132,11 +243,30 @@ def detect_breakout_ignition(
+     min_vol_ratio: Optional[float] = None,
+     max_coil_range_pct: Optional[float] = None,
+     min_score: Optional[int] = None,
++    decision_timestamp: Optional[float] = None,
+ ) -> BreakoutIgnitionResult:
+-    """Detect BREAKOUT_IGNITION on 5m (>=12 bars) or 1m fallback (>=15 bars) with 0-100 telemetry."""
++    """Detect BREAKOUT_IGNITION on closed 5m (>=12 bars) or 1m fallback (>=15 bars) with 0-100 telemetry."""
+     tf = "5m" if bar_minutes == 5 else "1m"
+     tf_label = "5m" if bar_minutes == 5 else "1m_fallback"
+     min_bars = 12 if bar_minutes == 5 else 15
++    candles, err_reason, _gap_diag = normalize_and_filter_candles(
++        candles, bar_minutes=bar_minutes, decision_timestamp=decision_timestamp
++    )
++    if err_reason is not None:
++        return BreakoutIgnitionResult(
++            detected=False,
++            timeframe=tf,
++            rejection_reason=err_reason,
++            telemetry=BreakoutTelemetry(
++                score=0,
++                state="FORMING",
++                timeframe=tf_label,
++                vol_ratio=0.0,
++                ema_ext_pct=0.0,
++                passed_gates=[],
++                failed_gates=["INVALID_DECISION_TS"],
++            ),
++        )
+     if len(candles) < min_bars:
+         fail_msg = f"BARS({len(candles)}<{min_bars})"
+         return BreakoutIgnitionResult(
+diff --git a/ohlcv_client.py b/ohlcv_client.py
+index a14a7eb..4ee1864 100644
+--- a/ohlcv_client.py
++++ b/ohlcv_client.py
+@@ -9,6 +9,7 @@ from typing import Any, Optional
+ 
+ import httpx
+ 
++from breakout_ignition import normalize_and_filter_candles
+ from config import AgentConfig
+ from memory_guard import prune_timestamped_cache
+ 
+@@ -121,11 +122,18 @@ def should_fetch_1m_fallback(
+     *,
+     now_ts: Optional[float] = None,
+ ) -> bool:
+-    """Return True ONLY when 5m succeeded (200 OK) with < 12 candles and global backoff is not active."""
++    """Return True ONLY when 5m succeeded (200 OK) with < 12 closed candles and global backoff is not active."""
+     addr = (pair_address or "").strip()
+-    if not addr or len(candles_5m) >= 12:
++    if not addr:
+         return False
+     current_ts = now_ts if now_ts is not None else time.time()
++    closed_5m, err, _ = normalize_and_filter_candles(
++        candles_5m if candles_5m is not None else [],
++        bar_minutes=5,
++        decision_timestamp=current_ts,
++    )
++    if err is not None or len(closed_5m) >= 12:
++        return False
+     if current_ts < _global_backoff_until:
+         return False
+     entry_5m = _ohlcv_cache.get(addr)
+diff --git a/scalper_entry_engine.py b/scalper_entry_engine.py
+index 52ffb6c..636cf6c 100644
+--- a/scalper_entry_engine.py
++++ b/scalper_entry_engine.py
+@@ -6,7 +6,12 @@ from typing import Any, Optional, Sequence
+ 
+ from pydantic import BaseModel
+ 
+-from breakout_ignition import detect_breakout_ignition
++from breakout_ignition import (
++    _parse_valid_candle,
++    detect_breakout_ignition,
++    normalize_and_filter_candles,
++    validate_decision_timestamp,
++)
+ from config import VALID_CHART_STRATEGIES, AgentConfig
+ 
+ 
+@@ -23,33 +28,13 @@ class ScalperEntryResult(BaseModel):
+ 
+ 
+ def _normalize_candles(raw_candles: Sequence[Any]) -> list[dict[str, float]]:
+-    """Normalize candle dicts or [ts, o, h, l, c, v] rows into oldest-first dicts."""
+-    normalized: list[dict[str, float]] = []
+-    for idx, c in enumerate(raw_candles):
+-        if isinstance(c, dict):
+-            normalized.append(
+-                {
+-                    "timestamp": float(c.get("timestamp", idx)),
+-                    "open": float(c["open"]),
+-                    "high": float(c["high"]),
+-                    "low": float(c["low"]),
+-                    "close": float(c["close"]),
+-                    "volume": float(c.get("volume", 0.0)),
+-                }
+-            )
+-        elif isinstance(c, (list, tuple)) and len(c) >= 5:
+-            normalized.append(
+-                {
+-                    "timestamp": float(c[0]),
+-                    "open": float(c[1]),
+-                    "high": float(c[2]),
+-                    "low": float(c[3]),
+-                    "close": float(c[4]),
+-                    "volume": float(c[5]) if len(c) > 5 else 0.0,
+-                }
+-            )
+-    normalized.sort(key=lambda x: x["timestamp"])
+-    return normalized
++    """Normalize validated candle dicts or [ts, o, h, l, c, v] rows into deduplicated oldest-first dicts."""
++    dedup: dict[float, dict[str, float]] = {}
++    for c in raw_candles:
++        parsed = _parse_valid_candle(c)
++        if parsed is not None:
++            dedup[parsed["timestamp"]] = parsed
++    return sorted(dedup.values(), key=lambda x: x["timestamp"])
+ 
+ 
+ def compute_rsi(closes: Sequence[float], period: int = 14) -> float:
+@@ -189,8 +174,17 @@ def evaluate_scalper_entry(
+     *,
+     config: Optional[AgentConfig] = None,
+     candles_1m: Optional[Sequence[Any]] = None,
++    decision_timestamp: Optional[float] = None,
+ ) -> ScalperEntryResult:
+     """Run all 4 deterministic gates of the Scalper Expert Entry Engine (+ BREAKOUT_IGNITION)."""
++    ref_ts, ts_err = validate_decision_timestamp(decision_timestamp)
++    if ts_err is not None or ref_ts is None:
++        return ScalperEntryResult(
++            eligible=False,
++            setup_type="NONE",
++            rejection_reason=ts_err or "invalid decision_timestamp",
++        )
++
+     min_soak = config.MIN_WATCHLIST_SOAK_MINUTES if config else 3.0
+     high_buf = config.ANTI_CHASE_HIGH_BUFFER_PCT if config else 0.05
+     max_rsi = config.SCALPER_MAX_RSI_5M if config else 70.0
+@@ -199,17 +193,23 @@ def evaluate_scalper_entry(
+     min_txns = config.SCALPER_MIN_TXNS_5M if config else 15
+     enabled_strats = config.chart_enabled_strategies() if config is not None else set(VALID_CHART_STRATEGIES)
+ 
+-    candles = _normalize_candles(candles_5m)
+-    norm_1m = _normalize_candles(candles_1m) if candles_1m else []
++    candles, _, _ = normalize_and_filter_candles(candles_5m, bar_minutes=5, decision_timestamp=ref_ts)
++    norm_1m, _, _ = (
++        normalize_and_filter_candles(candles_1m, bar_minutes=1, decision_timestamp=ref_ts)
++        if candles_1m
++        else ([], None, {})
++    )
+     buys_5m, sells_5m, buy_ratio_5m = _extract_order_flow(pair_data)
+     total_5m = buys_5m + sells_5m
+ 
+-    # 1m Candle Fallback: when < 12 5m candles exist, evaluate BREAKOUT_IGNITION on >= 15 1m bars
++    # 1m Candle Fallback: when < 12 closed 5m candles exist, evaluate BREAKOUT_IGNITION on >= 15 closed 1m bars
+     if len(candles) < 12:
+         if len(norm_1m) >= 15:
+             closes_1m = [c["close"] for c in norm_1m]
+             rsi_1m = compute_rsi(closes_1m, period=14)
+-            bi_1m = detect_breakout_ignition(norm_1m, pair_data, bar_minutes=1, rsi_val=rsi_1m, config=config)
++            bi_1m = detect_breakout_ignition(
++                norm_1m, pair_data, bar_minutes=1, rsi_val=rsi_1m, config=config, decision_timestamp=ref_ts
++            )
+             high_1m = max(c["high"] for c in norm_1m)
+             curr_p = float(pair_data.get("price_usd") or pair_data.get("priceUsd") or closes_1m[-1])
+             dist_1m = max(0.0, (high_1m - curr_p) / high_1m) if high_1m > 0 else 0.0
+@@ -235,7 +235,9 @@ def evaluate_scalper_entry(
+                 breakout_telemetry=bi_1m.telemetry.model_dump(),
+             )
+ 
+-        bi_short = detect_breakout_ignition(candles, pair_data, bar_minutes=5, config=config)
++        bi_short = detect_breakout_ignition(
++            candles, pair_data, bar_minutes=5, config=config, decision_timestamp=ref_ts
++        )
+         reasons_short: list[str] = []
+         if time_in_slot_min < min_soak:
+             reasons_short.append(f"soak {time_in_slot_min:.1f}m < {min_soak:.0f}m")
+@@ -263,7 +265,9 @@ def evaluate_scalper_entry(
+     )
+ 
+     # Always compute breakout telemetry for live watchlist Breakout Meter
+-    breakout_res = detect_breakout_ignition(candles, pair_data, bar_minutes=5, rsi_val=rsi_5m, config=config)
++    breakout_res = detect_breakout_ignition(
++        candles, pair_data, bar_minutes=5, rsi_val=rsi_5m, config=config, decision_timestamp=ref_ts
++    )
+ 
+     # Gate 3: Core Market-Physics Setup (only evaluate strategies enabled in CHART_ENABLED_STRATEGIES)
+     setup_type = "NONE"
+diff --git a/tests/test_breakout_ignition.py b/tests/test_breakout_ignition.py
+index 705bf9c..bf085b3 100644
+--- a/tests/test_breakout_ignition.py
++++ b/tests/test_breakout_ignition.py
+@@ -29,7 +29,7 @@ def _make_breakout_candles(
+ ) -> list[dict[str, float]]:
+     """Build a realistic uptrend with pullbacks (RSI ~72) coiling under 1.08, then breaking out."""
+     candles: list[dict[str, float]] = []
+-    t0 = 1_760_000_000
++    t0 = 1_760_000_400
+     base_len = count - 1
+     # Alternating impulse + small red pullback bars into a tight 4-bar coil under 1.08
+     for i in range(base_len):
+@@ -101,7 +101,7 @@ def test_breakout_ignition_valid_5m_bypasses_near_1h_high_and_allows_rsi_up_to_7
+ def test_breakout_ignition_rejects_over_extended_chase_above_12_pct():
+     # Huge parabolic spike to 1.35 (> 12% above EMA9 ~1.08 and VWAP ~1.05) -> rejected!
+     candles = _make_breakout_candles(
+-        count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.07, breakout_vol=3500.0
++        count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.06, breakout_vol=3500.0
+     )
+     res = evaluate_scalper_entry(candles, _strong_flow_pair(1.34), time_in_slot_min=5.0)
+     assert res.eligible is False
+@@ -263,7 +263,7 @@ def test_breakout_telemetry_score_states_and_failed_gates_formatting():
+ 
+     # Over-extended breakout -> state == EXTENDED and hard-blocked even though score >= 75
+     candles_ext = _make_breakout_candles(
+-        count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.07, breakout_vol=3500.0
++        count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.06, breakout_vol=3500.0
+     )
+     res_ext = evaluate_scalper_entry(candles_ext, _strong_flow_pair(1.34), time_in_slot_min=5.0)
+     assert res_ext.eligible is False
+diff --git a/tests/test_dual_lane_3x3_and_whale_breakout.py b/tests/test_dual_lane_3x3_and_whale_breakout.py
+index 015e865..48ef7a8 100644
+--- a/tests/test_dual_lane_3x3_and_whale_breakout.py
++++ b/tests/test_dual_lane_3x3_and_whale_breakout.py
+@@ -184,7 +184,7 @@ async def test_whale_breakout_gate_blocks_extended_and_low_score_and_logs_csv(tm
+         db.record_whale_event(signature=f"{tag}-2", wallet=f"W{tag}2", mint=m, side="BUY", sol_amount=2.0, token_amount=100.0, timestamp_utc=(now_dt - timedelta(seconds=10)).isoformat())
+         db.recompute_whale_signal(m, ttl_minutes=30, now=now_dt)
+ 
+-    ext_candles = _make_breakout_candles(count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.07, breakout_vol=3500.0)
++    ext_candles = _make_breakout_candles(count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.06, breakout_vol=3500.0)
+     ign_candles = _make_breakout_candles(count=18, breakout_close=1.12, breakout_high=1.13, breakout_low=1.06, breakout_vol=3000.0)
+ 
+     def _to_gecko(cs: list[dict[str, float]]) -> dict[str, Any]:
+diff --git a/tests/test_e1_pool_identity.py b/tests/test_e1_pool_identity.py
+index 29cda1e..b28147a 100644
+--- a/tests/test_e1_pool_identity.py
++++ b/tests/test_e1_pool_identity.py
+@@ -50,7 +50,7 @@ class _StubDecision:
+ 
+ def _make_breakout_candles(count: int = 18) -> list[dict[str, float]]:
+     """Construct realistic 5m candles with alternating pullbacks (RSI ~60) + tight coil + breakout."""
+-    base_ts = 1_795_700_000.0
++    base_ts = 1_795_680_000.0
+     candles: list[dict[str, float]] = []
+     prices = [
+         0.96, 0.99, 0.97, 1.01, 0.98, 1.02, 0.99, 1.03,
+diff --git a/whale_lane.py b/whale_lane.py
+index 0efc95d..569c6a1 100644
+--- a/whale_lane.py
++++ b/whale_lane.py
+@@ -378,7 +378,14 @@ async def run_whale_lane_tick(
+             c5 = pair.get("candles_5m") if isinstance(pair.get("candles_5m"), list) else ohlcv_5m.get(p_addr, [])
+             c1 = pair.get("candles_1m") if isinstance(pair.get("candles_1m"), list) else ohlcv_1m.get(p_addr, [])
+             has_ohlcv = bool(c5 or c1)
+-            sc_res = evaluate_scalper_entry(c5, pair, time_in_slot_min=5.0, config=config, candles_1m=c1)
++            sc_res = evaluate_scalper_entry(
++                c5,
++                pair,
++                time_in_slot_min=5.0,
++                config=config,
++                candles_1m=c1,
++                decision_timestamp=now_dt.timestamp(),
++            )
+             bt = sc_res.breakout_telemetry if (has_ohlcv and sc_res.breakout_telemetry) else (cached_bt or sc_res.breakout_telemetry or {})
+             if has_ohlcv and sc_res.breakout_telemetry:
+                 cache_breakout_telemetry(mint, sc_res.breakout_telemetry, now_ts=now_dt.timestamp())

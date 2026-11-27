@@ -29,7 +29,7 @@ def _make_breakout_candles(
 ) -> list[dict[str, float]]:
     """Build a realistic uptrend with pullbacks (RSI ~72) coiling under 1.08, then breaking out."""
     candles: list[dict[str, float]] = []
-    t0 = 1_760_000_000
+    t0 = 1_760_000_400
     base_len = count - 1
     # Alternating impulse + small red pullback bars into a tight 4-bar coil under 1.08
     for i in range(base_len):
@@ -101,7 +101,7 @@ def test_breakout_ignition_valid_5m_bypasses_near_1h_high_and_allows_rsi_up_to_7
 def test_breakout_ignition_rejects_over_extended_chase_above_12_pct():
     # Huge parabolic spike to 1.35 (> 12% above EMA9 ~1.08 and VWAP ~1.05) -> rejected!
     candles = _make_breakout_candles(
-        count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.07, breakout_vol=3500.0
+        count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.06, breakout_vol=3500.0
     )
     res = evaluate_scalper_entry(candles, _strong_flow_pair(1.34), time_in_slot_min=5.0)
     assert res.eligible is False
@@ -263,7 +263,7 @@ def test_breakout_telemetry_score_states_and_failed_gates_formatting():
 
     # Over-extended breakout -> state == EXTENDED and hard-blocked even though score >= 75
     candles_ext = _make_breakout_candles(
-        count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.07, breakout_vol=3500.0
+        count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.06, breakout_vol=3500.0
     )
     res_ext = evaluate_scalper_entry(candles_ext, _strong_flow_pair(1.34), time_in_slot_min=5.0)
     assert res_ext.eligible is False

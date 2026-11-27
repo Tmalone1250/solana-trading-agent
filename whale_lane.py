@@ -378,7 +378,14 @@ async def run_whale_lane_tick(
             c5 = pair.get("candles_5m") if isinstance(pair.get("candles_5m"), list) else ohlcv_5m.get(p_addr, [])
             c1 = pair.get("candles_1m") if isinstance(pair.get("candles_1m"), list) else ohlcv_1m.get(p_addr, [])
             has_ohlcv = bool(c5 or c1)
-            sc_res = evaluate_scalper_entry(c5, pair, time_in_slot_min=5.0, config=config, candles_1m=c1)
+            sc_res = evaluate_scalper_entry(
+                c5,
+                pair,
+                time_in_slot_min=5.0,
+                config=config,
+                candles_1m=c1,
+                decision_timestamp=now_dt.timestamp(),
+            )
             bt = sc_res.breakout_telemetry if (has_ohlcv and sc_res.breakout_telemetry) else (cached_bt or sc_res.breakout_telemetry or {})
             if has_ohlcv and sc_res.breakout_telemetry:
                 cache_breakout_telemetry(mint, sc_res.breakout_telemetry, now_ts=now_dt.timestamp())

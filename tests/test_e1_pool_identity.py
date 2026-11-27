@@ -50,7 +50,7 @@ class _StubDecision:
 
 def _make_breakout_candles(count: int = 18) -> list[dict[str, float]]:
     """Construct realistic 5m candles with alternating pullbacks (RSI ~60) + tight coil + breakout."""
-    base_ts = 1_795_700_000.0
+    base_ts = 1_795_680_000.0
     candles: list[dict[str, float]] = []
     prices = [
         0.96, 0.99, 0.97, 1.01, 0.98, 1.02, 0.99, 1.03,

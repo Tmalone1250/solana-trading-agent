@@ -184,7 +184,7 @@ async def test_whale_breakout_gate_blocks_extended_and_low_score_and_logs_csv(tm
         db.record_whale_event(signature=f"{tag}-2", wallet=f"W{tag}2", mint=m, side="BUY", sol_amount=2.0, token_amount=100.0, timestamp_utc=(now_dt - timedelta(seconds=10)).isoformat())
         db.recompute_whale_signal(m, ttl_minutes=30, now=now_dt)
 
-    ext_candles = _make_breakout_candles(count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.07, breakout_vol=3500.0)
+    ext_candles = _make_breakout_candles(count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.06, breakout_vol=3500.0)
     ign_candles = _make_breakout_candles(count=18, breakout_close=1.12, breakout_high=1.13, breakout_low=1.06, breakout_vol=3000.0)
 
     def _to_gecko(cs: list[dict[str, float]]) -> dict[str, Any]:

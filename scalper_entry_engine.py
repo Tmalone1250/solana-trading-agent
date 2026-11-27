@@ -6,7 +6,12 @@ from typing import Any, Optional, Sequence
 
 from pydantic import BaseModel
 
-from breakout_ignition import detect_breakout_ignition
+from breakout_ignition import (
+    _parse_valid_candle,
+    detect_breakout_ignition,
+    normalize_and_filter_candles,
+    validate_decision_timestamp,
+)
 from config import VALID_CHART_STRATEGIES, AgentConfig
 
 
@@ -23,33 +28,13 @@ class ScalperEntryResult(BaseModel):
 
 
 def _normalize_candles(raw_candles: Sequence[Any]) -> list[dict[str, float]]:
-    """Normalize candle dicts or [ts, o, h, l, c, v] rows into oldest-first dicts."""
-    normalized: list[dict[str, float]] = []
-    for idx, c in enumerate(raw_candles):
-        if isinstance(c, dict):
-            normalized.append(
-                {
-                    "timestamp": float(c.get("timestamp", idx)),
-                    "open": float(c["open"]),
-                    "high": float(c["high"]),
-                    "low": float(c["low"]),
-                    "close": float(c["close"]),
-                    "volume": float(c.get("volume", 0.0)),
-                }
-            )
-        elif isinstance(c, (list, tuple)) and len(c) >= 5:
-            normalized.append(
-                {
-                    "timestamp": float(c[0]),
-                    "open": float(c[1]),
-                    "high": float(c[2]),
-                    "low": float(c[3]),
-                    "close": float(c[4]),
-                    "volume": float(c[5]) if len(c) > 5 else 0.0,
-                }
-            )
-    normalized.sort(key=lambda x: x["timestamp"])
-    return normalized
+    """Normalize validated candle dicts or [ts, o, h, l, c, v] rows into deduplicated oldest-first dicts."""
+    dedup: dict[float, dict[str, float]] = {}
+    for c in raw_candles:
+        parsed = _parse_valid_candle(c)
+        if parsed is not None:
+            dedup[parsed["timestamp"]] = parsed
+    return sorted(dedup.values(), key=lambda x: x["timestamp"])
 
 
 def compute_rsi(closes: Sequence[float], period: int = 14) -> float:
@@ -189,8 +174,17 @@ def evaluate_scalper_entry(
     *,
     config: Optional[AgentConfig] = None,
     candles_1m: Optional[Sequence[Any]] = None,
+    decision_timestamp: Optional[float] = None,
 ) -> ScalperEntryResult:
     """Run all 4 deterministic gates of the Scalper Expert Entry Engine (+ BREAKOUT_IGNITION)."""
+    ref_ts, ts_err = validate_decision_timestamp(decision_timestamp)
+    if ts_err is not None or ref_ts is None:
+        return ScalperEntryResult(
+            eligible=False,
+            setup_type="NONE",
+            rejection_reason=ts_err or "invalid decision_timestamp",
+        )
+
     min_soak = config.MIN_WATCHLIST_SOAK_MINUTES if config else 3.0
     high_buf = config.ANTI_CHASE_HIGH_BUFFER_PCT if config else 0.05
     max_rsi = config.SCALPER_MAX_RSI_5M if config else 70.0
@@ -199,17 +193,23 @@ def evaluate_scalper_entry(
     min_txns = config.SCALPER_MIN_TXNS_5M if config else 15
     enabled_strats = config.chart_enabled_strategies() if config is not None else set(VALID_CHART_STRATEGIES)
 
-    candles = _normalize_candles(candles_5m)
-    norm_1m = _normalize_candles(candles_1m) if candles_1m else []
+    candles, _, _ = normalize_and_filter_candles(candles_5m, bar_minutes=5, decision_timestamp=ref_ts)
+    norm_1m, _, _ = (
+        normalize_and_filter_candles(candles_1m, bar_minutes=1, decision_timestamp=ref_ts)
+        if candles_1m
+        else ([], None, {})
+    )
     buys_5m, sells_5m, buy_ratio_5m = _extract_order_flow(pair_data)
     total_5m = buys_5m + sells_5m
 
-    # 1m Candle Fallback: when < 12 5m candles exist, evaluate BREAKOUT_IGNITION on >= 15 1m bars
+    # 1m Candle Fallback: when < 12 closed 5m candles exist, evaluate BREAKOUT_IGNITION on >= 15 closed 1m bars
     if len(candles) < 12:
         if len(norm_1m) >= 15:
             closes_1m = [c["close"] for c in norm_1m]
             rsi_1m = compute_rsi(closes_1m, period=14)
-            bi_1m = detect_breakout_ignition(norm_1m, pair_data, bar_minutes=1, rsi_val=rsi_1m, config=config)
+            bi_1m = detect_breakout_ignition(
+                norm_1m, pair_data, bar_minutes=1, rsi_val=rsi_1m, config=config, decision_timestamp=ref_ts
+            )
             high_1m = max(c["high"] for c in norm_1m)
             curr_p = float(pair_data.get("price_usd") or pair_data.get("priceUsd") or closes_1m[-1])
             dist_1m = max(0.0, (high_1m - curr_p) / high_1m) if high_1m > 0 else 0.0
@@ -235,7 +235,9 @@ def evaluate_scalper_entry(
                 breakout_telemetry=bi_1m.telemetry.model_dump(),
             )
 
-        bi_short = detect_breakout_ignition(candles, pair_data, bar_minutes=5, config=config)
+        bi_short = detect_breakout_ignition(
+            candles, pair_data, bar_minutes=5, config=config, decision_timestamp=ref_ts
+        )
         reasons_short: list[str] = []
         if time_in_slot_min < min_soak:
             reasons_short.append(f"soak {time_in_slot_min:.1f}m < {min_soak:.0f}m")
@@ -263,7 +265,9 @@ def evaluate_scalper_entry(
     )
 
     # Always compute breakout telemetry for live watchlist Breakout Meter
-    breakout_res = detect_breakout_ignition(candles, pair_data, bar_minutes=5, rsi_val=rsi_5m, config=config)
+    breakout_res = detect_breakout_ignition(
+        candles, pair_data, bar_minutes=5, rsi_val=rsi_5m, config=config, decision_timestamp=ref_ts
+    )
 
     # Gate 3: Core Market-Physics Setup (only evaluate strategies enabled in CHART_ENABLED_STRATEGIES)
     setup_type = "NONE"

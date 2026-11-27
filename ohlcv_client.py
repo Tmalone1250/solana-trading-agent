@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 import httpx
 
+from breakout_ignition import normalize_and_filter_candles
 from config import AgentConfig
 from memory_guard import prune_timestamped_cache
 
@@ -121,11 +122,18 @@ def should_fetch_1m_fallback(
     *,
     now_ts: Optional[float] = None,
 ) -> bool:
-    """Return True ONLY when 5m succeeded (200 OK) with < 12 candles and global backoff is not active."""
+    """Return True ONLY when 5m succeeded (200 OK) with < 12 closed candles and global backoff is not active."""
     addr = (pair_address or "").strip()
-    if not addr or len(candles_5m) >= 12:
+    if not addr:
         return False
     current_ts = now_ts if now_ts is not None else time.time()
+    closed_5m, err, _ = normalize_and_filter_candles(
+        candles_5m if candles_5m is not None else [],
+        bar_minutes=5,
+        decision_timestamp=current_ts,
+    )
+    if err is not None or len(closed_5m) >= 12:
+        return False
     if current_ts < _global_backoff_until:
         return False
     entry_5m = _ohlcv_cache.get(addr)
