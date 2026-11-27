@@ -137,6 +137,8 @@ async def test_alpha_isolation_blocks_leg2_fast_track_and_cached_promotion_while
     # 2. Enabled BREAKOUT_IGNITION approves normally
     bo_cand = {
         "mint": "MintBOAllowed", "symbol": "BO1", "added_at": soaked,
+        "pair_address": "PoolBOAllowed11111111111111111111111111111",
+        "dex_id": "pumpswap",
         "candles_5m": _make_breakout_candles(count=18), **_strong_flow_pair(1.12),
     }
     dec_buy = _StubDecision({
@@ -229,6 +231,7 @@ async def test_executor_final_guard_blocks_unauthorized_chart_buy_allows_sells_a
         # 2. Authorized BREAKOUT_IGNITION BUY is accepted
         ok_order = PendingOrder(
             side="BUY", mint="MintGoodBO", symbol="GBO", amount_atomic=int(0.50 * LAMPORTS_PER_SOL),
+            pair_address="PoolGoodBO11111111111111111111111111111111", dex_id="pumpswap",
             reason="DECISION_1_ENTRY", target_state_after_fill=FocusState.IN_POSITION,
             entry_liquidity_usd=80_000.0, entry_mc_usd=500_000.0, strategy="BREAKOUT_IGNITION",
         ).model_dump()

@@ -12,7 +12,7 @@ import httpx
 from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
 from db import AgentDatabase, utc_now
 from executor_node import executor_node, fetch_jupiter_order
-from state import ActivePosition, FocusState, PendingOrder
+from state import ActivePosition, FocusState, PendingOrder, is_valid_pool_address
 
 logger = logging.getLogger(__name__)
 EPS = 1e-9
@@ -61,15 +61,132 @@ def _in_backoff(key: str, now_ts: float) -> bool:
     return True
 
 
+def select_pinned_dexscreener_pair(
+    pairs: list[dict[str, Any]],
+    *,
+    expected_mint: str,
+    expected_pair_address: Optional[str],
+) -> dict[str, Any]:
+    """Strictly match a DexScreener pair by (expected_pair_address, expected_mint).
+
+    Never substitutes a different highest-liquidity pool. Distinguishes valid zero
+    flow/liquidity from missing, migrated, incomplete, or mismatched provider responses.
+    """
+    exp_mint = str(expected_mint or "").strip()
+    if not is_valid_pool_address(expected_pair_address, mint=exp_mint):
+        return {
+            "pool_status": "UNKNOWN_POOL_IDENTITY",
+            "flow_available": False,
+            "pair_address": None,
+            "dex_id": None,
+            "buys_5m": None,
+            "sells_5m": None,
+            "liquidity_usd": None,
+            "price_native": 0.0,
+            "pair": None,
+        }
+
+    exp_pair = str(expected_pair_address).strip()
+    solana_pairs = [
+        p for p in (pairs or [])
+        if isinstance(p, dict) and str(p.get("chainId") or "").lower() == "solana"
+    ]
+    matched = next(
+        (p for p in solana_pairs if str(p.get("pairAddress") or "").strip() == exp_pair),
+        None,
+    )
+    if matched is not None:
+        base_mint = str((matched.get("baseToken") or {}).get("address") or "").strip()
+        if base_mint != exp_mint:
+            logger.warning(
+                "[BatchedPrice] Rejected DexScreener pool %s: baseToken mint %s != expected %s",
+                exp_pair[:8], base_mint[:8], exp_mint[:8],
+            )
+            return {
+                "pool_status": "MISMATCHED_MINT",
+                "flow_available": False,
+                "pair_address": exp_pair,
+                "dex_id": None,
+                "buys_5m": None,
+                "sells_5m": None,
+                "liquidity_usd": None,
+                "price_native": 0.0,
+                "pair": None,
+            }
+
+        dex_id = str(matched.get("dexId") or "").strip() or None
+        native_p = float(matched.get("priceNative") or 0.0)
+        txns = matched.get("txns")
+        m5 = txns.get("m5") if isinstance(txns, dict) else None
+        liq_obj = matched.get("liquidity")
+        has_m5 = isinstance(m5, dict) and m5.get("buys") is not None and m5.get("sells") is not None
+        has_liq = isinstance(liq_obj, dict) and liq_obj.get("usd") is not None
+        if not (has_m5 and has_liq):
+            return {
+                "pool_status": "INCOMPLETE_DATA",
+                "flow_available": False,
+                "pair_address": exp_pair,
+                "dex_id": dex_id,
+                "buys_5m": None,
+                "sells_5m": None,
+                "liquidity_usd": float(liq_obj["usd"]) if has_liq else None,
+                "price_native": native_p,
+                "pair": matched,
+            }
+
+        buys_5m = int(m5["buys"])
+        sells_5m = int(m5["sells"])
+        liq_usd = float(liq_obj["usd"])
+        status = "ZERO_LIQUIDITY" if liq_usd <= 0.0 else "MATCHED"
+        return {
+            "pool_status": status,
+            "flow_available": True,
+            "pair_address": exp_pair,
+            "dex_id": dex_id,
+            "buys_5m": buys_5m,
+            "sells_5m": sells_5m,
+            "liquidity_usd": liq_usd,
+            "price_native": native_p,
+            "pair": matched,
+        }
+
+    # Pinned pool was NOT returned: classify without substituting any other pool
+    other_for_mint = [
+        p for p in solana_pairs
+        if str((p.get("baseToken") or {}).get("address") or "").strip() == exp_mint
+    ]
+    if other_for_mint:
+        status = "POOL_MIGRATED_OR_MISSING"
+    elif solana_pairs:
+        status = "MISMATCHED_PAIR"
+    else:
+        status = "POOL_UNAVAILABLE"
+
+    return {
+        "pool_status": status,
+        "flow_available": False,
+        "pair_address": exp_pair,
+        "dex_id": None,
+        "buys_5m": None,
+        "sells_5m": None,
+        "liquidity_usd": None,
+        "price_native": 0.0,
+        "pair": None,
+    }
+
+
 async def fetch_batched_sol_prices(
     mints: list[str],
     config: AgentConfig,
     client: httpx.AsyncClient,
     *,
     now_ts: Optional[float] = None,
+    pinned_pools: Optional[dict[str, Optional[str]]] = None,
 ) -> tuple[dict[str, float], dict[str, dict[str, Any]]]:
     """Fetch USD-derived SOL prices for all active mints in 1 Jupiter /price/v3 + 1 DexScreener batch.
 
+    When `pinned_pools` is provided (`{mint: pair_address}`), DexScreener flow and liquidity
+    observations are strictly pinned to each mint's stored `pair_address` without silent pool switching.
     Returns (sol_per_token_by_mint, dex_flow_by_mint).
     """
     unique_mints = list(dict.fromkeys(m.strip() for m in mints if m and m.strip()))
@@ -125,7 +242,9 @@ async def fetch_batched_sol_prices(
         except Exception as exc:
             logger.warning("[BatchedPrice] Jupiter /price/v3 failed: %s", exc)
 
-    # 2. Single batched DexScreener lookup for 5m flow, liquidity & mandatory priceNative fallback
+    # 2. Single batched DexScreener lookup for 5m flow, liquidity & priceNative fallback
+    all_solana_pairs: list[dict[str, Any]] = []
+    dex_fetch_ok = False
     if not _in_backoff("dex_batch", ts):
         for idx in range(0, len(unique_mints), 30):
             chunk = unique_mints[idx : idx + 30]
@@ -137,40 +256,90 @@ async def fetch_batched_sol_prices(
                     break
                 resp.raise_for_status()
                 _clear_429("dex_batch")
+                dex_fetch_ok = True
                 payload = resp.json()
                 pairs = payload if isinstance(payload, list) else (payload.get("pairs") or [])
-                best_by_mint: dict[str, dict[str, Any]] = {}
                 for p in pairs:
-                    if not isinstance(p, dict) or str(p.get("chainId") or "").lower() != "solana":
-                        continue
-                    m = str(
-                        (p.get("baseToken") or {}).get("address")
-                        or (chunk[0] if len(chunk) == 1 else "")
-                    ).strip()
-                    if not m:
-                        continue
-                    liq = float((p.get("liquidity") or {}).get("usd") or 0.0)
-                    prev_liq = float((best_by_mint.get(m, {}).get("liquidity") or {}).get("usd") or 0.0)
-                    if m not in best_by_mint or liq > prev_liq:
-                        best_by_mint[m] = p
-                for m, p in best_by_mint.items():
-                    m5 = (p.get("txns") or {}).get("m5") or {}
-                    native_p = float(p.get("priceNative") or 0.0)
-                    if m not in sol_per_token and native_p > 0:
-                        sol_per_token[m] = native_p
-                        price_source_by_mint[m] = "dexscreener_native"
-                    dex_flow[m] = {
-                        "buys_5m": int(m5.get("buys") or 0), "sells_5m": int(m5.get("sells") or 0),
-                        "liquidity_usd": float((p.get("liquidity") or {}).get("usd") or 0.0),
-                        "price_native": native_p, "decimals": decimals_by_mint.get(m),
-                        "price_source": price_source_by_mint.get(m), "pair": p,
-                    }
+                    if isinstance(p, dict) and str(p.get("chainId") or "").lower() == "solana":
+                        all_solana_pairs.append(p)
             except Exception as exc:
                 logger.warning("[BatchedPrice] DexScreener batch failed: %s", exc)
 
-    for m, dec in decimals_by_mint.items():
-        if m not in dex_flow:
-            dex_flow[m] = {"decimals": dec, "price_source": price_source_by_mint.get(m)}
+    if pinned_pools is not None:
+        for m in unique_mints:
+            exp_pair = pinned_pools.get(m)
+            if not dex_fetch_ok and is_valid_pool_address(exp_pair, mint=m):
+                obs = {
+                    "pool_status": "POOL_UNAVAILABLE",
+                    "flow_available": False,
+                    "pair_address": str(exp_pair).strip(),
+                    "dex_id": None,
+                    "buys_5m": None,
+                    "sells_5m": None,
+                    "liquidity_usd": None,
+                    "price_native": 0.0,
+                    "pair": None,
+                }
+            else:
+                obs = select_pinned_dexscreener_pair(
+                    all_solana_pairs,
+                    expected_mint=m,
+                    expected_pair_address=exp_pair,
+                )
+            native_p = float(obs.get("price_native") or 0.0)
+            if (
+                m not in sol_per_token
+                and native_p > 0
+                and obs["pool_status"] in ("MATCHED", "ZERO_LIQUIDITY", "INCOMPLETE_DATA")
+            ):
+                sol_per_token[m] = native_p
+                price_source_by_mint[m] = "dexscreener_native"
+            dex_flow[m] = {
+                **obs,
+                "decimals": decimals_by_mint.get(m),
+                "price_source": price_source_by_mint.get(m),
+                "all_solana_pairs": all_solana_pairs,
+            }
+    else:
+        best_by_mint: dict[str, dict[str, Any]] = {}
+        for p in all_solana_pairs:
+            m = str(
+                (p.get("baseToken") or {}).get("address")
+                or (unique_mints[0] if len(unique_mints) == 1 else "")
+            ).strip()
+            if not m:
+                continue
+            liq = float((p.get("liquidity") or {}).get("usd") or 0.0)
+            prev_liq = float((best_by_mint.get(m, {}).get("liquidity") or {}).get("usd") or 0.0)
+            if m not in best_by_mint or liq > prev_liq:
+                best_by_mint[m] = p
+        for m, p in best_by_mint.items():
+            m5 = (p.get("txns") or {}).get("m5") or {}
+            native_p = float(p.get("priceNative") or 0.0)
+            if m not in sol_per_token and native_p > 0:
+                sol_per_token[m] = native_p
+                price_source_by_mint[m] = "dexscreener_native"
+            dex_flow[m] = {
+                "buys_5m": int(m5.get("buys") or 0),
+                "sells_5m": int(m5.get("sells") or 0),
+                "liquidity_usd": float((p.get("liquidity") or {}).get("usd") or 0.0),
+                "price_native": native_p,
+                "pair_address": str(p.get("pairAddress") or "").strip() or None,
+                "dex_id": str(p.get("dexId") or "").strip() or None,
+                "decimals": decimals_by_mint.get(m),
+                "price_source": price_source_by_mint.get(m),
+                "pair": p,
+                "all_solana_pairs": all_solana_pairs,
+            }
+        for m in unique_mints:
+            if m not in dex_flow:
+                dex_flow[m] = {
+                    "decimals": decimals_by_mint.get(m),
+                    "price_source": price_source_by_mint.get(m),
+                    "all_solana_pairs": all_solana_pairs,
+                    "flow_available": False,
+                    "pool_status": "POOL_UNAVAILABLE",
+                }
 
     return sol_per_token, dex_flow
 
@@ -236,30 +405,82 @@ def apply_dex_flow_and_pnl(
     lane_label: str = "chart_slot",
     used_exact_quote: bool = False,
 ) -> tuple[int, int, float, float]:
-    """Update current/peak SOL, PnL, and DexScreener 5m flow/liquidity in-place and log 1-line status."""
+    """Update current/peak SOL, PnL, and pool-pinned DexScreener 5m flow/liquidity in-place.
+
+    Never silently substitutes another pool or retroactively assigns a pool identity to an
+    unknown-pool position. When pinned pool data is unavailable/mismatched/unknown, returns
+    (0, 0, last_buy_ratio, 0.0) so downstream exit checks do not fabricate a liquidity collapse
+    or unrelated sell-flow exit.
+    """
     buys_5m = 0
     sells_5m = 0
-    current_liq = float(pos.last_liquidity_usd or pos.entry_liquidity_usd or 0.0)
+    current_liq = 0.0
     buy_ratio_5m = float(pos.last_5m_buy_ratio or 0.0)
 
     if isinstance(flow, dict):
         if flow.get("decimals") is not None:
             pos.decimals = int(flow["decimals"])
-        if "buys_5m" in flow or "sells_5m" in flow:
-            buys_5m = int(flow.get("buys_5m") or 0)
-            sells_5m = int(flow.get("sells_5m") or 0)
+        if flow.get("price_source"):
+            pos.last_price_source = str(flow["price_source"])
+    if used_exact_quote:
+        pos.last_price_source = "jupiter_exact_quote"
+
+    if not is_valid_pool_address(pos.pair_address, mint=pos.mint):
+        pos.pool_identity_status = "UNKNOWN"
+        pos.pool_observation_status = "UNKNOWN_POOL_IDENTITY"
+    else:
+        pos.pool_identity_status = "PINNED"
+        obs: Optional[dict[str, Any]] = None
+        if isinstance(flow, dict):
+            if isinstance(flow.get("all_solana_pairs"), list):
+                obs = select_pinned_dexscreener_pair(
+                    flow["all_solana_pairs"],
+                    expected_mint=pos.mint,
+                    expected_pair_address=pos.pair_address,
+                )
+            elif "pool_status" in flow:
+                f_pair = str(flow.get("pair_address") or "").strip()
+                if f_pair and f_pair != str(pos.pair_address).strip():
+                    obs = {"pool_status": "MISMATCHED_PAIR", "flow_available": False}
+                else:
+                    obs = flow
+            elif isinstance(flow.get("pair"), dict) and flow["pair"]:
+                obs = select_pinned_dexscreener_pair(
+                    [flow["pair"]],
+                    expected_mint=pos.mint,
+                    expected_pair_address=pos.pair_address,
+                )
+            elif ("buys_5m" in flow or "sells_5m" in flow) and flow.get("flow_available", True) is not False:
+                obs = {
+                    "pool_status": "ZERO_LIQUIDITY" if float(flow.get("liquidity_usd") or 0.0) <= 0.0 else "MATCHED",
+                    "flow_available": True,
+                    "buys_5m": int(flow.get("buys_5m") or 0),
+                    "sells_5m": int(flow.get("sells_5m") or 0),
+                    "liquidity_usd": float(flow.get("liquidity_usd") or 0.0),
+                    "dex_id": flow.get("dex_id"),
+                }
+
+        if obs is not None and obs.get("flow_available") is True:
+            buys_5m = int(obs.get("buys_5m") or 0)
+            sells_5m = int(obs.get("sells_5m") or 0)
             total_5m = buys_5m + sells_5m
             buy_ratio_5m = round(buys_5m / total_5m, 4) if total_5m > 0 else 0.0
             sell_ratio_5m = round(sells_5m / total_5m, 4) if total_5m > 0 else 0.0
             pos.last_5m_buy_ratio = buy_ratio_5m
             pos.last_5m_sell_ratio = sell_ratio_5m
-        if "liquidity_usd" in flow:
-            current_liq = round(float(flow.get("liquidity_usd") or 0.0), 2)
-            pos.last_liquidity_usd = current_liq
-        if flow.get("price_source"):
-            pos.last_price_source = str(flow["price_source"])
-    if used_exact_quote:
-        pos.last_price_source = "jupiter_exact_quote"
+            if obs.get("liquidity_usd") is not None:
+                current_liq = round(float(obs["liquidity_usd"]), 2)
+                pos.last_liquidity_usd = current_liq
+            if not pos.dex_id and isinstance(obs.get("dex_id"), str) and obs["dex_id"].strip():
+                pos.dex_id = obs["dex_id"].strip()
+            pos.pool_observation_status = str(obs.get("pool_status") or "MATCHED")
+        else:
+            status = str((obs or {}).get("pool_status") or "POOL_UNAVAILABLE")
+            pos.pool_observation_status = status
+            logger.warning(
+                "[Monitor] [%s] $%s pinned pool %s observation=%s (preserving original pool identity; no substitution)",
+                lane_label, pos.symbol, str(pos.pair_address)[:8], status,
+            )
 
     basis = active_cost_basis_sol(pos)
     pos.current_sol_value = round(current_sol_value, 6)
@@ -273,7 +494,7 @@ def apply_dex_flow_and_pnl(
     pos.position_mae_pct = pos.pnl_pct if pos.position_mae_pct is None else min(pos.position_mae_pct, pos.pnl_pct)
 
     logger.info(
-        "[Monitor] [%s] $%s (%s..): val=%.4f SOL (basis=%.4f, peak=%.4f, PnL=%+.4f SOL / %+.2f%%) | liq=$%.0f | 5m_buy=%.0f%%",
+        "[Monitor] [%s] $%s (%s..): val=%.4f SOL (basis=%.4f, peak=%.4f, PnL=%+.4f SOL / %+.2f%%) | pool=%s(%s) | liq=$%.0f | 5m_buy=%.0f%%",
         lane_label,
         pos.symbol,
         pos.mint[:6],
@@ -282,6 +503,8 @@ def apply_dex_flow_and_pnl(
         pos.peak_sol_value,
         pos.pnl_sol,
         pos.pnl_pct,
+        str(pos.pair_address)[:8] if pos.pair_address else "UNKNOWN",
+        pos.pool_observation_status or pos.pool_identity_status,
         current_liq,
         buy_ratio_5m * 100.0,
     )
@@ -468,7 +691,14 @@ async def monitor_and_enforce_hard_stops(
     if not all_mints:
         return []
 
-    sol_prices, dex_flow = await fetch_batched_sol_prices(all_mints, config, client, now_ts=dt.timestamp())
+    pinned_pools = {
+        str(p["mint"]): p.get("pair_address")
+        for p in chart_list + whale_list
+        if isinstance(p, dict) and p.get("mint")
+    }
+    sol_prices, dex_flow = await fetch_batched_sol_prices(
+        all_mints, config, client, now_ts=dt.timestamp(), pinned_pools=pinned_pools
+    )
     executed: list[dict[str, Any]] = []
 
     for lane_name, raw_list in (("chart", chart_list), ("whale", whale_list)):

@@ -37,6 +37,7 @@ from state import (
     AlphaDecision,
     FocusState,
     PendingOrder,
+    is_valid_pool_address,
 )
 
 __all__ = [
@@ -226,9 +227,22 @@ async def alpha_node(
                 or (action == "WATCH" and leg2_score >= config.LEG2_FAST_TRACK_WATCH_SCORE)
             )
         )
+        wl_entry = watchlist_by_mint.get(cand["mint"]) or {}
+        cand_pair_address = str(
+            cand.get("pair_address") or wl_entry.get("pair_address") or ""
+        ).strip()
+        cand_dex_id = str(
+            cand.get("dex_id") or wl_entry.get("dex_id") or ""
+        ).strip() or None
+
         setup_enabled = scalper.setup_type in enabled_strats
         decision1_wants_buy = standard_approved or leg2_fast_track
         approved = decision1_wants_buy and scalper.eligible and setup_enabled
+        strat_name = "LEG2_ENTRY" if (approved and leg2_fast_track and not standard_approved) else scalper.setup_type
+        pool_identity_rejected = False
+        if approved and strat_name == "BREAKOUT_IGNITION" and not is_valid_pool_address(cand_pair_address, mint=cand["mint"]):
+            approved = False
+            pool_identity_rejected = True
 
         dec = AlphaDecision(
             mint=cand["mint"], symbol=cand.get("symbol", "UNKNOWN"),
@@ -236,7 +250,9 @@ async def alpha_node(
             action=action, action_confidence=conf, approved=approved, rationale="",
         )
         base_rationale = format_entry_rationale(dec)
-        if approved and leg2_fast_track and not standard_approved:
+        if pool_identity_rejected:
+            dec.rationale = f"{base_rationale} [BLOCKED: MISSING_OR_INVALID_POOL_IDENTITY]"
+        elif approved and leg2_fast_track and not standard_approved:
             dec.rationale = f"{base_rationale} [LEG2_ENTRY leg2={leg2_score:.0f}/100 setup={scalper.setup_type} rsi={scalper.rsi_5m:.1f}]"
         elif decision1_wants_buy and not scalper.eligible:
             dec.rationale = f"{base_rationale} [BLOCKED: {scalper.rejection_reason}]"
@@ -259,6 +275,9 @@ async def alpha_node(
             "dist_from_1h_high_pct": scalper.dist_from_1h_high_pct,
             "breakout_metrics": scalper.breakout_metrics,
             "breakout_telemetry": scalper.breakout_telemetry,
+            "pair_address": cand_pair_address or None,
+            "dex_id": cand_dex_id,
+            "pool_identity_rejected": pool_identity_rejected,
             "narrative_cache_hit": c_hit,
             "narrative_cached_at": c_at,
             "momentum_source": "live_metrics" if c_hit else "gemini_decision_1",
@@ -292,6 +311,8 @@ async def alpha_node(
             )
         if approved:
             dec_reason = f"{dec.action} -> APPROVE{bi_suffix}"
+        elif pool_identity_rejected:
+            dec_reason = "BLOCKED: MISSING_OR_INVALID_POOL_IDENTITY (pair_address absent or invalid)"
         elif dec.action == "BUY" or decision1_wants_buy:
             block_reasons: list[str] = []
             if not scalper.eligible and scalper.rejection_reason:
@@ -310,7 +331,6 @@ async def alpha_node(
         else:
             dec_reason = f"{dec.action} -> {dec.action}"
 
-        strat_name = "LEG2_ENTRY" if (approved and leg2_fast_track and not standard_approved) else scalper.setup_type
         db.log_action(
             mode=config.EXECUTION_MODE, action="DECISION_1", symbol=dec.symbol, asset_id=dec.mint,
             strategy=strat_name, reason=dec_reason, timestamp_utc=now_iso,
@@ -318,6 +338,7 @@ async def alpha_node(
             rsi=round(scalper.rsi_5m, 2), leg2_score=round(leg2_score, 2),
             narrative_score=round(dec.narrative_strength, 2), momentum_score=round(dec.momentum_quality, 2),
             vamp_score=round(dec.is_copycat_vamp, 3), buy_confidence=round(dec.action_confidence, 3),
+            pair_address=cand_pair_address or None, dex_id=cand_dex_id,
             **bt_log_kwargs,
         )
         out_decision = "ENTERED" if approved else ("BLOCKED" if (dec.action == "BUY" or decision1_wants_buy) else ("WATCH" if dec.action == "WATCH" else "REJECTED"))
@@ -455,11 +476,16 @@ async def alpha_node(
     )
     winner, winner_cand, is_leg2_only, _, winner_setup, winner_bt = approved_pairs[0]
     winner_mc = round(float(winner_cand.get("market_cap_usd") or 0.0), 2) or None
+    winner_wl = watchlist_by_mint.get(winner.mint) or {}
+    winner_pair = str(winner_cand.get("pair_address") or winner_wl.get("pair_address") or "").strip() or None
+    winner_dex = str(winner_cand.get("dex_id") or winner_wl.get("dex_id") or "").strip() or None
 
     order = PendingOrder(
         side="BUY",
         mint=winner.mint,
         symbol=winner.symbol,
+        pair_address=winner_pair,
+        dex_id=winner_dex,
         amount_atomic=int(round(config.TRADE_SIZE_SOL * LAMPORTS_PER_SOL)),
         reason="LEG2_ENTRY" if is_leg2_only else "DECISION_1_ENTRY",
         target_state_after_fill=FocusState.IN_POSITION,

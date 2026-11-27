@@ -152,17 +152,32 @@ def _merge_monotonic_shadow_flags(
     incoming: list[dict[str, Any]],
     existing_db: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Preserve whale_shadow_exit_flag=True monotonically from live DB rows."""
+    """Preserve whale_shadow_exit_flag=True and original pool identity monotonically from live DB rows."""
     merged: list[dict[str, Any]] = []
     for p in incoming:
         if not isinstance(p, dict):
             continue
         copy_p = dict(p)
-        if not copy_p.get("whale_shadow_exit_flag"):
-            for db_p in existing_db:
-                if isinstance(db_p, dict) and _pos_identity_match(copy_p, db_p) and db_p.get("whale_shadow_exit_flag"):
-                    copy_p["whale_shadow_exit_flag"] = True
-                    break
+        for db_p in existing_db:
+            if not (isinstance(db_p, dict) and _pos_identity_match(copy_p, db_p)):
+                continue
+            if not copy_p.get("whale_shadow_exit_flag") and db_p.get("whale_shadow_exit_flag"):
+                copy_p["whale_shadow_exit_flag"] = True
+            db_pair = db_p.get("pair_address")
+            db_dex = db_p.get("dex_id")
+            if isinstance(db_pair, str) and db_pair.strip():
+                # Never allow a position update to silently overwrite or drop its original pool identity
+                copy_p["pair_address"] = db_pair.strip()
+                copy_p["pool_identity_status"] = "PINNED"
+                if isinstance(db_dex, str) and db_dex.strip():
+                    copy_p["dex_id"] = db_dex.strip()
+            else:
+                # Never retroactively assign a pool identity to a historical position without one
+                copy_p["pair_address"] = None
+                copy_p["pool_identity_status"] = "UNKNOWN"
+                if not (isinstance(db_dex, str) and db_dex.strip()):
+                    copy_p["dex_id"] = None
+            break
         merged.append(copy_p)
     return merged
 

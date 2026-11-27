@@ -51,6 +51,9 @@ ACTION_LOG_COLUMNS: list[str] = [
     "price_source",
     "position_mfe_pct",
     "position_mae_pct",
+    # E1 pool identity continuity columns
+    "pair_address",
+    "dex_id",
 ]
 
 ACTION_LOG_MIGRATIONS: list[tuple[str, str]] = [
@@ -81,6 +84,8 @@ ACTION_LOG_MIGRATIONS: list[tuple[str, str]] = [
     ("price_source", "VARCHAR"),
     ("position_mfe_pct", "DOUBLE"),
     ("position_mae_pct", "DOUBLE"),
+    ("pair_address", "VARCHAR"),
+    ("dex_id", "VARCHAR"),
 ]
 
 EXPORT_TYPE_ACTIONS: dict[str, Optional[list[str]]] = {

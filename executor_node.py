@@ -14,7 +14,7 @@ from solders.transaction import VersionedTransaction
 
 from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
 from db import AgentDatabase, utc_now, utc_now_iso
-from state import ActivePosition, AgentGraphState, FocusState, PendingOrder
+from state import ActivePosition, AgentGraphState, FocusState, PendingOrder, is_valid_pool_address
 from state_ledger import acquire_exit_guard, clear_sell_guard, finalize_exit_guard
 
 logger = logging.getLogger(__name__)
@@ -135,6 +135,15 @@ async def executor_node(
             logger.warning(
                 "[Executor] Strategy allowlist blocked chart_slot BUY of %s: strategy=%s not in CHART_ENABLED_STRATEGIES (%s)",
                 order.symbol, order.strategy, ",".join(sorted(config.chart_enabled_strategies())),
+            )
+            return {"pending_order": None}
+        elif str(order.strategy or "").upper() == "BREAKOUT_IGNITION" and not is_valid_pool_address(order.pair_address, mint=order.mint):
+            rej_msg = "BLOCKED: MISSING_OR_INVALID_POOL_IDENTITY (pair_address absent or invalid at executor)"
+            logger.warning("[Executor] Pool identity guard blocked BREAKOUT_IGNITION BUY of %s: %s", order.symbol, rej_msg)
+            db.log_action(
+                mode=config.EXECUTION_MODE, action="DECISION_1", symbol=order.symbol, asset_id=order.mint,
+                strategy="BREAKOUT_IGNITION", reason=rej_msg,
+                pair_address=None, dex_id=order.dex_id,
             )
             return {"pending_order": None}
         active_pos_for_reentry = state.get("active_position") or st_live.get("active_position")
@@ -274,6 +283,7 @@ async def executor_node(
         next_reentry_count = (prev_reentries + 1) if order.reason == "LEG_2_REENTRY" else 0
         pos = ActivePosition(
             mint=order.mint, symbol=order.symbol, entry_sol=spent_sol, token_amount=out_amount,
+            pair_address=order.pair_address, dex_id=order.dex_id,
             strategy=pos_strategy, triggering_wallets=list(order.triggering_wallets),
             whale_shadow_exit_flag=False, opened_at=utc_now_iso(),
             entry_liquidity_usd=order.entry_liquidity_usd, entry_mc_usd=order.entry_mc_usd,
@@ -301,6 +311,7 @@ async def executor_node(
             reason=order.reason, tx_signature=tx_signature, rationale=order.rationale,
             strategy=pos_strategy, triggering_wallets=list(order.triggering_wallets),
             jupiter_price_impact_raw=raw_price_impact,
+            pair_address=pos.pair_address, dex_id=pos.dex_id,
         )
         action_type = "REENTRY_BUY" if order.reason == "LEG_2_REENTRY" else "BUY"
         bt = order.breakout_telemetry or {}
@@ -318,6 +329,7 @@ async def executor_node(
             breakout_ema_ext_pct=bt.get("ema_ext_pct"),
             breakout_failed_gates="; ".join(bt.get("failed_gates") or []) if bt else None,
             jupiter_price_impact_raw=raw_price_impact,
+            pair_address=pos.pair_address, dex_id=pos.dex_id,
         )
         logger.info("[%s] BUY %s: %.4f SOL -> %d tokens (reason=%s)", config.EXECUTION_MODE.upper(), order.symbol, spent_sol, out_amount, order.reason)
     elif is_partial_sell:
@@ -362,6 +374,7 @@ async def executor_node(
             reason=order.reason, tx_signature=tx_signature, rationale=order.rationale,
             strategy=pos_strategy, triggering_wallets=list(pos_obj.triggering_wallets), opened_at=pos_obj.opened_at,
             jupiter_price_impact_raw=raw_price_impact,
+            pair_address=pos_obj.pair_address, dex_id=pos_obj.dex_id,
         )
         db.log_action(
             mode=config.EXECUTION_MODE, action="PARTIAL_SELL", symbol=order.symbol, asset_id=order.mint,
@@ -379,6 +392,7 @@ async def executor_node(
             jupiter_price_impact_raw=raw_price_impact, monitor_sol_value=order.monitor_sol_value,
             price_source=order.price_source or pos_obj.last_price_source,
             position_mfe_pct=pos_obj.position_mfe_pct, position_mae_pct=pos_obj.position_mae_pct,
+            pair_address=pos_obj.pair_address, dex_id=pos_obj.dex_id,
         )
         exit_committed = True
         finalize_exit_guard(db, sell_key, committed=True)
@@ -417,12 +431,19 @@ async def executor_node(
             except ValueError:
                 hold_sec_val = None
         pos_liq_usd = float(ex_dict.get("last_liquidity_usd") or ex_dict.get("entry_liquidity_usd") or 0.0)
+        pos_pair_address = (
+            str(ex_dict.get("pair_address") or order.pair_address or "").strip() or None
+        )
+        pos_dex_id = (
+            str(ex_dict.get("dex_id") or order.dex_id or "").strip() or None
+        )
         if order.target_state_after_fill == FocusState.WATCHING_REENTRY:
             prev_peak = order.run_peak_sol or float(ex_dict.get("peak_sol_value", received_sol))
             prev_liq = float(ex_dict.get("entry_liquidity_usd", 0.0))
             prev_reentry_count = int(ex_dict.get("reentry_count") or 0)
             watch_pos = ActivePosition(
                 mint=order.mint, symbol=order.symbol, entry_sol=entry_sol, token_amount=0,
+                pair_address=pos_pair_address, dex_id=pos_dex_id,
                 strategy=pos_strategy, entry_liquidity_usd=prev_liq, current_sol_value=received_sol,
                 peak_sol_value=prev_peak, breakeven_armed=False, trail_armed=False,
                 retrace_low_sol=received_sol, run_peak_sol=prev_peak, watch_started_at=utc_now_iso(),
@@ -450,6 +471,7 @@ async def executor_node(
             rationale=order.rationale, strategy=pos_strategy,
             triggering_wallets=pos_trig_wallets, opened_at=pos_opened_at,
             jupiter_price_impact_raw=raw_price_impact,
+            pair_address=pos_pair_address, dex_id=pos_dex_id,
         )
         pos_mc_usd = order.entry_mc_usd if order.entry_mc_usd is not None else ex_dict.get("entry_mc_usd")
         pos_whale_flow = order.whale_sol_flow if order.whale_sol_flow is not None else ex_dict.get("whale_sol_flow")
@@ -471,6 +493,7 @@ async def executor_node(
             jupiter_price_impact_raw=raw_price_impact, monitor_sol_value=order.monitor_sol_value,
             price_source=order.price_source or ex_dict.get("last_price_source"),
             position_mfe_pct=ex_dict.get("position_mfe_pct"), position_mae_pct=ex_dict.get("position_mae_pct"),
+            pair_address=pos_pair_address, dex_id=pos_dex_id,
         )
         exit_committed = True
         finalize_exit_guard(db, sell_key, committed=True)

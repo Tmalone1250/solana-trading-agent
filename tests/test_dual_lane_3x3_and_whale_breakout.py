@@ -47,6 +47,7 @@ async def test_3x3_dual_lane_caps_and_duplicate_mint_rejection(tmp_path):
             st = db.get_state()
             order = PendingOrder(
                 side="BUY", mint=f"MintChart{i}", symbol=f"CH{i}",
+                pair_address=f"PoolChart{i}", dex_id="pumpswap",
                 amount_atomic=int(0.5 * LAMPORTS_PER_SOL), reason="DECISION_1_ENTRY",
                 target_state_after_fill=FocusState.IN_POSITION, strategy="BREAKOUT_IGNITION",
             )
@@ -272,6 +273,8 @@ async def test_jupiter_v3_flat_schema_dexscreener_pricenative_fallback_and_telem
                     },
                     {
                         "chainId": "solana",
+                        "pairAddress": "PoolShit1111111111111111111111111111111111",
+                        "dexId": "pumpswap",
                         "baseToken": {"address": mint_meme, "symbol": "SHIT"},
                         "priceNative": "0.0000535",  # 10,000 tokens * 0.0000535 = 0.535 SOL (+7.0% vs 0.50 entry)
                         "liquidity": {"usd": 131_250.5},
@@ -299,6 +302,8 @@ async def test_jupiter_v3_flat_schema_dexscreener_pricenative_fallback_and_telem
             side="BUY",
             mint=mint_meme,
             symbol="SHIT",
+            pair_address="PoolShit1111111111111111111111111111111111",
+            dex_id="pumpswap",
             amount_atomic=int(0.50 * LAMPORTS_PER_SOL),
             reason="DECISION_1_ENTRY",
             target_state_after_fill=FocusState.IN_POSITION,

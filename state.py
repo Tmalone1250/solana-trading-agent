@@ -7,6 +7,28 @@ from typing import Any, Optional, TypedDict
 
 from pydantic import BaseModel, Field, model_validator
 
+_INVALID_POOL_PLACEHOLDERS: frozenset[str] = frozenset(
+    {"", "none", "null", "unknown", "n/a", "na", "undefined"}
+)
+
+
+def is_valid_pool_address(
+    pair_address: Optional[str],
+    *,
+    mint: Optional[str] = None,
+) -> bool:
+    """Return True iff `pair_address` is a non-empty, non-placeholder pool identifier distinct from `mint`."""
+    if not isinstance(pair_address, str):
+        return False
+    cleaned = pair_address.strip()
+    if len(cleaned) < 4 or cleaned.lower() in _INVALID_POOL_PLACEHOLDERS:
+        return False
+    if any(ch.isspace() for ch in cleaned):
+        return False
+    if mint and cleaned == str(mint).strip():
+        return False
+    return True
+
 
 class FocusState(str, Enum):
     """3-State Focus Machine states."""
@@ -84,6 +106,8 @@ class PendingOrder(BaseModel):
     side: str  # "BUY", "PARTIAL_SELL", or "SELL"
     mint: str
     symbol: str
+    pair_address: Optional[str] = None
+    dex_id: Optional[str] = None
     opened_at: Optional[str] = None
     amount_atomic: int  # lamports for BUY, token atomic units for SELL
     reason: str
@@ -109,6 +133,10 @@ class ActivePosition(BaseModel):
     entry_sol: float
     token_amount: int
     decimals: int = 6
+    pair_address: Optional[str] = None
+    dex_id: Optional[str] = None
+    pool_identity_status: str = "UNKNOWN"  # PINNED | UNKNOWN
+    pool_observation_status: Optional[str] = None
     strategy: str = "SCALPER"
     triggering_wallets: list[str] = Field(default_factory=list)
     whale_shadow_exit_flag: bool = False
@@ -145,6 +173,14 @@ class ActivePosition(BaseModel):
             self.initial_entry_sol = self.entry_sol
         if self.remaining_cost_basis_sol <= 0.0 and self.entry_sol > 0.0:
             self.remaining_cost_basis_sol = self.entry_sol
+        cleaned_pair = self.pair_address.strip() if isinstance(self.pair_address, str) else ""
+        self.pair_address = cleaned_pair or None
+        cleaned_dex = self.dex_id.strip() if isinstance(self.dex_id, str) else ""
+        self.dex_id = cleaned_dex or None
+        if is_valid_pool_address(self.pair_address, mint=self.mint):
+            self.pool_identity_status = "PINNED"
+        else:
+            self.pool_identity_status = "UNKNOWN"
         return self
 
 
@@ -154,6 +190,7 @@ class WatchlistEntry(BaseModel):
     mint: str
     symbol: str
     pair_address: str = ""
+    dex_id: Optional[str] = None
     added_at: str
     safety_passed: bool = False
     entry_liquidity_usd: float = 0.0

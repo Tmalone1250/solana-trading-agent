@@ -108,7 +108,9 @@ class AgentDatabase:
                     strategy VARCHAR DEFAULT 'SCALPER',
                     triggering_wallets_json VARCHAR DEFAULT '[]',
                     opened_at VARCHAR,
-                    jupiter_price_impact_raw VARCHAR
+                    jupiter_price_impact_raw VARCHAR,
+                    pair_address VARCHAR,
+                    dex_id VARCHAR
                 )
                 """
             )
@@ -147,6 +149,7 @@ class AgentDatabase:
                     mint VARCHAR PRIMARY KEY,
                     symbol VARCHAR NOT NULL,
                     pair_address VARCHAR DEFAULT '',
+                    dex_id VARCHAR,
                     added_at VARCHAR NOT NULL,
                     safety_passed BOOLEAN DEFAULT FALSE,
                     entry_liquidity_usd DOUBLE DEFAULT 0.0,
@@ -283,6 +286,7 @@ class AgentDatabase:
         }
         migrations = [
             ("pair_address", "VARCHAR DEFAULT ''"),
+            ("dex_id", "VARCHAR"),
             ("safety_passed", "BOOLEAN DEFAULT FALSE"),
             ("entry_liquidity_usd", "DOUBLE DEFAULT 0.0"),
             ("peak_mc", "DOUBLE DEFAULT 0.0"),
@@ -325,6 +329,8 @@ class AgentDatabase:
             ("triggering_wallets_json", "VARCHAR DEFAULT '[]'"),
             ("opened_at", "VARCHAR"),
             ("jupiter_price_impact_raw", "VARCHAR"),
+            ("pair_address", "VARCHAR"),
+            ("dex_id", "VARCHAR"),
         ]:
             if col not in trade_cols:
                 self._conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type}")
@@ -767,7 +773,7 @@ class AgentDatabase:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT mint, symbol, pair_address, added_at, safety_passed, entry_liquidity_usd,
+                SELECT mint, symbol, pair_address, dex_id, added_at, safety_passed, entry_liquidity_usd,
                        peak_mc, low_mc, leg2_score, leg2_breakdown_json, vamp_strikes,
                        rsi_5m, setup_type, scalper_eligible, dist_from_1h_high_pct,
                        discovery_source, jup_organic_score, jup_meta_json,
@@ -781,6 +787,7 @@ class AgentDatabase:
             mint,
             symbol,
             pair_address,
+            dex_id,
             added_at,
             safety_passed,
             entry_liq,
@@ -800,11 +807,14 @@ class AgentDatabase:
             scores_json,
             cand_json,
         ) in rows:
+            cand_obj = json.loads(cand_json) if cand_json else {}
+            resolved_dex = dex_id or (str(cand_obj.get("dex_id") or "").strip() or None)
             result.append(
                 {
                     "mint": mint,
                     "symbol": symbol,
                     "pair_address": pair_address or "",
+                    "dex_id": resolved_dex,
                     "added_at": added_at,
                     "safety_passed": bool(safety_passed),
                     "entry_liquidity_usd": float(entry_liq or 0.0),
@@ -822,7 +832,7 @@ class AgentDatabase:
                     "jup_meta": json.loads(jup_meta_json) if jup_meta_json else None,
                     "last_evaluated_at": last_eval,
                     "latest_scores": json.loads(scores_json) if scores_json else None,
-                    "candidate": json.loads(cand_json) if cand_json else {},
+                    "candidate": cand_obj,
                 }
             )
         return result
@@ -834,6 +844,7 @@ class AgentDatabase:
         symbol: str,
         candidate: dict[str, Any],
         pair_address: Optional[str] = None,
+        dex_id: Optional[str] = None,
         added_at: Optional[str] = None,
         safety_passed: bool = False,
         entry_liquidity_usd: Optional[float] = None,
@@ -846,7 +857,9 @@ class AgentDatabase:
         jup_meta: Optional[dict[str, Any]] = None,
     ) -> None:
         ts = added_at or utc_now_iso()
-        p_addr = str(pair_address if pair_address is not None else (candidate.get("pair_address") or ""))
+        p_addr = str(pair_address if pair_address is not None else (candidate.get("pair_address") or "")).strip()
+        raw_dex = dex_id if dex_id is not None else candidate.get("dex_id")
+        d_id = str(raw_dex).strip() if isinstance(raw_dex, str) and raw_dex.strip() else None
         src = str(discovery_source or candidate.get("discovery_source") or "DEXSCREENER").upper()
         mc = float(candidate.get("market_cap_usd") or 0.0)
         liq = float(entry_liquidity_usd if entry_liquidity_usd is not None else (candidate.get("liquidity_usd") or 0.0))
@@ -859,17 +872,19 @@ class AgentDatabase:
             self._conn.execute(
                 """
                 INSERT INTO active_watchlist (
-                    mint, symbol, pair_address, added_at, safety_passed, entry_liquidity_usd,
+                    mint, symbol, pair_address, dex_id, added_at, safety_passed, entry_liquidity_usd,
                     peak_mc, low_mc, leg2_score, leg2_breakdown_json, discovery_source,
                     jup_organic_score, jup_meta_json,
                     last_evaluated_at, latest_scores_json, candidate_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
                 ON CONFLICT (mint) DO UPDATE SET
                     symbol = excluded.symbol,
                     pair_address = CASE
-                        WHEN excluded.pair_address <> '' THEN excluded.pair_address
-                        ELSE active_watchlist.pair_address
+                        WHEN active_watchlist.pair_address IS NOT NULL AND active_watchlist.pair_address <> ''
+                            THEN active_watchlist.pair_address
+                        ELSE excluded.pair_address
                     END,
+                    dex_id = COALESCE(active_watchlist.dex_id, excluded.dex_id),
                     discovery_source = CASE
                         WHEN excluded.discovery_source = 'WHALE' THEN 'WHALE'
                         WHEN active_watchlist.discovery_source = 'WHALE' THEN 'WHALE'
@@ -893,6 +908,7 @@ class AgentDatabase:
                     mint,
                     symbol,
                     p_addr,
+                    d_id,
                     ts,
                     bool(safety_passed),
                     liq,
@@ -1002,15 +1018,20 @@ class AgentDatabase:
         triggering_wallets: Optional[list[str]] = None,
         opened_at: Optional[str] = None,
         jupiter_price_impact_raw: Optional[str] = None,
+        pair_address: Optional[str] = None,
+        dex_id: Optional[str] = None,
     ) -> None:
+        clean_pair = pair_address.strip() if isinstance(pair_address, str) and pair_address.strip() else None
+        clean_dex = dex_id.strip() if isinstance(dex_id, str) and dex_id.strip() else None
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO trades (
                     timestamp, mode, side, mint, symbol, in_amount, out_amount,
                     sol_value, pnl_sol, pnl_pct, reason, tx_signature, rationale,
-                    strategy, triggering_wallets_json, opened_at, jupiter_price_impact_raw
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    strategy, triggering_wallets_json, opened_at, jupiter_price_impact_raw,
+                    pair_address, dex_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     utc_now_iso(),
@@ -1030,6 +1051,8 @@ class AgentDatabase:
                     json.dumps(triggering_wallets or []),
                     opened_at,
                     jupiter_price_impact_raw,
+                    clean_pair,
+                    clean_dex,
                 ],
             )
 
@@ -1038,7 +1061,8 @@ class AgentDatabase:
             rows = self._conn.execute(
                 """
                 SELECT id, timestamp, mode, side, mint, symbol, in_amount, out_amount,
-                       sol_value, pnl_sol, pnl_pct, reason, tx_signature, rationale
+                       sol_value, pnl_sol, pnl_pct, reason, tx_signature, rationale,
+                       pair_address, dex_id
                 FROM trades ORDER BY id DESC LIMIT ?
                 """,
                 [limit],
@@ -1058,6 +1082,8 @@ class AgentDatabase:
             "reason",
             "tx_signature",
             "rationale",
+            "pair_address",
+            "dex_id",
         ]
         return [dict(zip(keys, r)) for r in rows]
 
@@ -1285,9 +1311,13 @@ class AgentDatabase:
         price_source: Optional[str] = None,
         position_mfe_pct: Optional[float] = None,
         position_mae_pct: Optional[float] = None,
+        pair_address: Optional[str] = None,
+        dex_id: Optional[str] = None,
     ) -> None:
         """Append a structured board action row to DuckDB action_log."""
         ts = timestamp_utc or utc_now_iso()
+        clean_pair = pair_address.strip() if isinstance(pair_address, str) and pair_address.strip() else None
+        clean_dex = dex_id.strip() if isinstance(dex_id, str) and dex_id.strip() else None
         with self._lock:
             if sol_equity is None or daily_realized_sol is None or circuit_breaker is None:
                 st_row = self._conn.execute(
@@ -1320,6 +1350,7 @@ class AgentDatabase:
                     breakout_vol_ratio, breakout_ema_ext_pct, breakout_failed_gates,
                     jupiter_price_impact_raw, monitor_sol_value, price_source,
                     position_mfe_pct, position_mae_pct,
+                    clean_pair, clean_dex,
                 ],
             )
 
