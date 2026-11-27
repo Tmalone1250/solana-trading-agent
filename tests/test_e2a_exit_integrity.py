@@ -65,6 +65,9 @@ def _mk_pos(
         opened_at=opened_at,
         exodus_confirm_count=exodus_confirm_count,
         exodus_last_confirmed_at=exodus_last_confirmed_at,
+        entry_fee_sol=0.001,
+        accumulated_fees_sol=0.001,
+        fee_accounting_status="PAPER_ASSUMED",
     )
 
 

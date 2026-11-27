@@ -581,7 +581,13 @@ def needs_exact_jupiter_quote(
         return True
     be_floor_100 = config.BREAKEVEN_FLOOR_PCT * 100.0
     be_arm_100 = config.BREAKEVEN_ARM_PCT * 100.0
-    if (pos.breakeven_armed or peak_pct_100 >= be_arm_100) and pnl_pct_100 <= be_floor_100 + proximity_pct:
+    # Account for known paper round-trip fee buffer when deciding whether to fetch exact exit quote
+    fee_buf_100 = (
+        ((2.0 * float(config.PAPER_TX_FEE_SOL)) / basis) * 100.0
+        if (config.EXECUTION_MODE == "paper" and basis > 0)
+        else 0.0
+    )
+    if (pos.breakeven_armed or peak_pct_100 >= be_arm_100) and pnl_pct_100 <= be_floor_100 + fee_buf_100 + proximity_pct:
         return True
     trail_arm_100 = config.TRAIL_ARM_PCT * 100.0
     raw_runner_drop = float(config.RUNNER_TRAIL_PULLBACK_PCT)

@@ -161,6 +161,12 @@ class ActivePosition(BaseModel):
     initial_entry_sol: float = 0.0
     remaining_cost_basis_sol: float = 0.0
     realized_partial_pnl_sol: float = 0.0
+    # Fee accounting convention: `entry_fee_sol` is the BUY fee (None if unknown);
+    # `accumulated_fees_sol` is cumulative known lifecycle fees INCLUDING `entry_fee_sol`.
+    entry_fee_sol: Optional[float] = None
+    accumulated_fees_sol: float = 0.0
+    fee_accounting_status: str = "UNKNOWN"  # PAPER_ASSUMED | OBSERVED | UNKNOWN
+    last_breakeven_status: Optional[str] = None
     breakeven_armed: bool = False
     trail_armed: bool = False
     retrace_low_sol: Optional[float] = None

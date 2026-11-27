@@ -123,7 +123,14 @@ async def executor_node(
     st_live = db.get_state()
     chart_positions: list[dict[str, Any]] = list(st_live.get("chart_positions") or state.get("chart_positions") or [])
     whale_positions: list[dict[str, Any]] = list(st_live.get("whale_positions") or state.get("whale_positions") or [])
-    tx_fee_sol = float(config.PAPER_TX_FEE_SOL) if config.EXECUTION_MODE == "paper" else 0.0
+    if config.EXECUTION_MODE == "paper":
+        tx_fee_opt: Optional[float] = float(config.PAPER_TX_FEE_SOL)
+        tx_fee_sol = float(tx_fee_opt)
+        tx_fee_status = "PAPER_ASSUMED"
+    else:
+        tx_fee_opt = None
+        tx_fee_sol = 0.0
+        tx_fee_status = "UNKNOWN"
     lane_tag = "whale" if is_whale_slot else "chart"
     reservation_id: Optional[str] = None
     if is_buy:
@@ -291,6 +298,9 @@ async def executor_node(
             current_sol_value=spent_sol, peak_sol_value=spent_sol,
             partial_tp_taken=False, initial_entry_sol=spent_sol,
             remaining_cost_basis_sol=spent_sol, realized_partial_pnl_sol=0.0,
+            entry_fee_sol=tx_fee_opt,
+            accumulated_fees_sol=round(tx_fee_opt, 6) if tx_fee_opt is not None else 0.0,
+            fee_accounting_status=tx_fee_status,
             breakeven_armed=False, trail_armed=False, retrace_low_sol=None, run_peak_sol=None,
             watch_started_at=None, reference_token_amount=out_amount,
             reentry_count=next_reentry_count, last_liquidity_usd=order.entry_liquidity_usd,
@@ -312,6 +322,7 @@ async def executor_node(
             strategy=pos_strategy, triggering_wallets=list(order.triggering_wallets),
             jupiter_price_impact_raw=raw_price_impact,
             pair_address=pos.pair_address, dex_id=pos.dex_id,
+            tx_fee_sol=tx_fee_opt, fee_status=tx_fee_status,
         )
         action_type = "REENTRY_BUY" if order.reason == "LEG_2_REENTRY" else "BUY"
         bt = order.breakout_telemetry or {}
@@ -349,6 +360,10 @@ async def executor_node(
         pos_obj.remaining_cost_basis_sol = rem_basis
         pos_obj.partial_tp_taken = True
         pos_obj.realized_partial_pnl_sol = round(pos_obj.realized_partial_pnl_sol + partial_pnl, 6)
+        if pos_obj.fee_accounting_status == tx_fee_status and tx_fee_opt is not None:
+            pos_obj.accumulated_fees_sol = round(float(pos_obj.accumulated_fees_sol or 0.0) + tx_fee_opt, 6)
+        else:
+            pos_obj.fee_accounting_status = "UNKNOWN"
         pos_obj.breakeven_armed = True
         pos_obj.trail_armed = True
         pos_obj.current_sol_value = rem_sol_val
@@ -375,6 +390,7 @@ async def executor_node(
             strategy=pos_strategy, triggering_wallets=list(pos_obj.triggering_wallets), opened_at=pos_obj.opened_at,
             jupiter_price_impact_raw=raw_price_impact,
             pair_address=pos_obj.pair_address, dex_id=pos_obj.dex_id,
+            tx_fee_sol=tx_fee_opt, fee_status=tx_fee_status,
         )
         db.log_action(
             mode=config.EXECUTION_MODE, action="PARTIAL_SELL", symbol=order.symbol, asset_id=order.mint,
@@ -473,6 +489,7 @@ async def executor_node(
             triggering_wallets=pos_trig_wallets, opened_at=pos_opened_at,
             jupiter_price_impact_raw=raw_price_impact,
             pair_address=pos_pair_address, dex_id=pos_dex_id,
+            tx_fee_sol=tx_fee_opt, fee_status=tx_fee_status,
         )
         pos_mc_usd = order.entry_mc_usd if order.entry_mc_usd is not None else ex_dict.get("entry_mc_usd")
         pos_whale_flow = order.whale_sol_flow if order.whale_sol_flow is not None else ex_dict.get("whale_sol_flow")
@@ -505,6 +522,7 @@ async def executor_node(
         "in_amount": order.amount_atomic, "out_amount": out_amount,
         "tx_signature": tx_signature, "reason": order.reason,
         "jupiter_price_impact_raw": raw_price_impact,
+        "tx_fee_sol": tx_fee_opt, "fee_status": tx_fee_status,
     }
     if is_whale_slot:
         return {

@@ -110,7 +110,9 @@ class AgentDatabase:
                     opened_at VARCHAR,
                     jupiter_price_impact_raw VARCHAR,
                     pair_address VARCHAR,
-                    dex_id VARCHAR
+                    dex_id VARCHAR,
+                    tx_fee_sol DOUBLE,
+                    fee_status VARCHAR
                 )
                 """
             )
@@ -331,6 +333,8 @@ class AgentDatabase:
             ("jupiter_price_impact_raw", "VARCHAR"),
             ("pair_address", "VARCHAR"),
             ("dex_id", "VARCHAR"),
+            ("tx_fee_sol", "DOUBLE"),
+            ("fee_status", "VARCHAR"),
         ]:
             if col not in trade_cols:
                 self._conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type}")
@@ -1020,9 +1024,12 @@ class AgentDatabase:
         jupiter_price_impact_raw: Optional[str] = None,
         pair_address: Optional[str] = None,
         dex_id: Optional[str] = None,
+        tx_fee_sol: Optional[float] = None,
+        fee_status: Optional[str] = None,
     ) -> None:
         clean_pair = pair_address.strip() if isinstance(pair_address, str) and pair_address.strip() else None
         clean_dex = dex_id.strip() if isinstance(dex_id, str) and dex_id.strip() else None
+        clean_fee_status = fee_status.strip() if isinstance(fee_status, str) and fee_status.strip() else None
         with self._lock:
             self._conn.execute(
                 """
@@ -1030,8 +1037,8 @@ class AgentDatabase:
                     timestamp, mode, side, mint, symbol, in_amount, out_amount,
                     sol_value, pnl_sol, pnl_pct, reason, tx_signature, rationale,
                     strategy, triggering_wallets_json, opened_at, jupiter_price_impact_raw,
-                    pair_address, dex_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pair_address, dex_id, tx_fee_sol, fee_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     utc_now_iso(),
@@ -1053,6 +1060,8 @@ class AgentDatabase:
                     jupiter_price_impact_raw,
                     clean_pair,
                     clean_dex,
+                    tx_fee_sol,
+                    clean_fee_status,
                 ],
             )
 
@@ -1062,7 +1071,7 @@ class AgentDatabase:
                 """
                 SELECT id, timestamp, mode, side, mint, symbol, in_amount, out_amount,
                        sol_value, pnl_sol, pnl_pct, reason, tx_signature, rationale,
-                       pair_address, dex_id
+                       pair_address, dex_id, tx_fee_sol, fee_status
                 FROM trades ORDER BY id DESC LIMIT ?
                 """,
                 [limit],
@@ -1084,6 +1093,8 @@ class AgentDatabase:
             "rationale",
             "pair_address",
             "dex_id",
+            "tx_fee_sol",
+            "fee_status",
         ]
         return [dict(zip(keys, r)) for r in rows]
 

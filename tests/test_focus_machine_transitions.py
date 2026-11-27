@@ -85,6 +85,9 @@ def _base_in_position(entry_sol: float = 0.5) -> dict[str, Any]:
         current_sol_value=entry_sol,
         peak_sol_value=entry_sol,
         reference_token_amount=1_000_000,
+        entry_fee_sol=0.001,
+        accumulated_fees_sol=0.001,
+        fee_accounting_status="PAPER_ASSUMED",
     ).model_dump()
 
 
@@ -565,6 +568,9 @@ async def test_two_step_partial_tp_scale_out_and_runner_trail_and_breakeven(tmp_
         current_sol_value=0.50,
         peak_sol_value=0.50,
         reference_token_amount=1_000_000,
+        entry_fee_sol=0.0,
+        accumulated_fees_sol=0.0,
+        fee_accounting_status="PAPER_ASSUMED",
     ).model_dump()
 
     # Proportional Jupiter mock: quotes SOL value proportional to input `amount`
@@ -654,13 +660,15 @@ async def test_two_step_partial_tp_scale_out_and_runner_trail_and_breakeven(tmp_
         assert pytest.approx(ex_runner["sol_balance"]) == 0.7575  # 0.4875 + 0.270
         assert pytest.approx(ex_runner["daily_pnl_sol"]) == 0.0575  # 0.0375 partial + 0.020 runner
 
-        # Also verify +2% Breakeven Floor protection on a runner that drops to +1.6% (0.254 SOL on 0.25 basis) before peak climbs
+        # Also verify +2% net lifecycle Breakeven Floor protection when runner pulls back before trail triggers
         be_runner = dict(
             mon1["active_position"],
-            peak_sol_value=0.28,  # -9.3% pullback to 0.254 (< -10% trail), so Breakeven Shield (+2% = 0.255 SOL) catches it
-            current_sol_value=0.28,
+            realized_partial_pnl_sol=0.030,
+            peak_sol_value=0.248,
+            current_sol_value=0.248,
+            trail_armed=False,
         )
-        unit_sol_price["val"] = 0.254 / 500_000
+        unit_sol_price["val"] = 0.226 / 500_000  # -9.6% on 0.25 basis (above -10% stop), net lifecycle = +0.006 (+1.2% <= +2%)
         mon_be = await position_monitor_node(
             {
                 "focus_state": FocusState.IN_POSITION.value,

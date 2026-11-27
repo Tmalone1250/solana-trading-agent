@@ -262,6 +262,35 @@ def compute_exodus(
     return ev.triggered, ev.sell_ratio_5m, ev.liq_drop_pct, ev.detail
 
 
+def compute_net_lifecycle_pnl(
+    pos: ActivePosition,
+    current_sol_value: float,
+    config: AgentConfig,
+) -> tuple[bool, Optional[float], Optional[float], Optional[float], str]:
+    """Evaluate complete lifecycle net PnL accounting for entry, partial, and expected closing fees.
+
+    Returns (fees_known, net_lifecycle_sol, net_lifecycle_pct, net_peak_pct, breakeven_status).
+    If required fees are unknown (e.g., live mode without observed fee or historical UNKNOWN position),
+    returns (False, None, None, None, "BREAKEVEN_SUPPRESSED_UNKNOWN_FEES") and never substitutes zero.
+    """
+    if config.EXECUTION_MODE != "paper":
+        return False, None, None, None, "BREAKEVEN_SUPPRESSED_UNKNOWN_FEES"
+    if pos.fee_accounting_status != "PAPER_ASSUMED" or pos.entry_fee_sol is None:
+        return False, None, None, None, "BREAKEVEN_SUPPRESSED_UNKNOWN_FEES"
+
+    init_basis = float(pos.initial_entry_sol or pos.entry_sol or 0.0)
+    rem_basis = active_cost_basis_sol(pos)
+    if init_basis <= 0.0 or rem_basis <= 0.0:
+        return False, None, None, None, "BREAKEVEN_SUPPRESSED_UNKNOWN_FEES"
+
+    est_close_fee = float(config.PAPER_TX_FEE_SOL)
+    entry_fee = float(pos.entry_fee_sol)
+    realized_partial = float(pos.realized_partial_pnl_sol or 0.0)
+    net_now_sol = realized_partial + (current_sol_value - rem_basis - est_close_fee) - entry_fee
+    net_peak_sol = realized_partial + (max(pos.peak_sol_value, current_sol_value) - rem_basis - est_close_fee) - entry_fee
+    return True, net_now_sol, (net_now_sol / init_basis), (net_peak_sol / init_basis), "NET_FEES_KNOWN"
+
+
 def evaluate_chart_position_exit(
     pos: ActivePosition,
     *,
@@ -352,8 +381,18 @@ def evaluate_chart_position_exit(
         hs_reason = f"HARD_STOP_LOSS ({hs_pnl_100:+.2f}% <= {hs_limit_100:.0f}%)"
         return _mk_order(hs_reason), hs_reason, PRIO_HARD_STOP
 
-    if peak_pnl_pct + EPS >= config.BREAKEVEN_ARM_PCT:
+    fees_known, net_now_sol, net_now_pct, net_peak_pct, be_fee_status = compute_net_lifecycle_pnl(
+        pos, current_sol_value, config
+    )
+    if fees_known and net_peak_pct is not None and net_peak_pct + EPS >= config.BREAKEVEN_ARM_PCT:
         pos.breakeven_armed = True
+    if not fees_known:
+        pos.last_breakeven_status = be_fee_status
+    elif pos.breakeven_armed:
+        pos.last_breakeven_status = "NET_BREAKEVEN_ARMED"
+    else:
+        pos.last_breakeven_status = "BREAKEVEN_UNARMED"
+
     if peak_pnl_pct + EPS >= config.TRAIL_ARM_PCT:
         pos.trail_armed = True
 
@@ -407,11 +446,12 @@ def evaluate_chart_position_exit(
                 PRIO_TRAILING_TP,
             )
 
-    # 4. Breakeven Shield (+2% floor once +8% reached)
-    if pos.breakeven_armed and pnl_pct <= config.BREAKEVEN_FLOOR_PCT + EPS:
+    # 4. Net Breakeven Shield (+2% net lifecycle floor once +8% net lifecycle reached; suppressed if fees unknown)
+    if fees_known and pos.breakeven_armed and net_now_pct is not None and net_now_pct <= config.BREAKEVEN_FLOOR_PCT + EPS:
+        pos.last_breakeven_status = "NET_BREAKEVEN_TRIGGERED"
         reason = (
             f"BREAKEVEN_SHIELD (armed >= +{config.BREAKEVEN_ARM_PCT * 100:.0f}%, "
-            f"hit floor {pnl_pct * 100:+.2f}% <= +{config.BREAKEVEN_FLOOR_PCT * 100:.0f}%)"
+            f"hit net floor {net_now_pct * 100:+.2f}% <= +{config.BREAKEVEN_FLOOR_PCT * 100:.0f}%)"
         )
         return _mk_order(reason), reason, PRIO_BREAKEVEN
 
