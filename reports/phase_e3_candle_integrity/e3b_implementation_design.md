@@ -111,18 +111,21 @@ Validation rules (all fail closed):
 - **Mandatory age validation on `pre_attached_verified`:** `evaluate_ohlcv_provenance()` applies the **exact same `last_ok_at` age check** (`<= OHLCV_CACHE_SECONDS`) to `pre_attached_verified` as to fetched candles. A `pre_attached_verified` result with missing or expired `last_ok_at` fails closed.
 - Production `scanner_node` / `safety_gate_node` JSON payloads never construct `OhlcvFetchResult` instances, preventing any production bypass.
 
-### 3.3 Explicit 5m/1m Interval Selection & Enforcement in `alpha_node.py`
-- Call `fetch_ohlcv_batch_with_provenance()` and `fetch_ohlcv_1m_batch_with_provenance()`.
-- Resolve `res_5m` (from `cand.get("_ohlcv_5m_result")` if `cand.get("candles_5m") is not None` and `isinstance(..., OhlcvFetchResult)`, else `pre_attached_unknown` if `candles_5m` is present, else `ohlcv_5m_by_pair[p_addr]`).
-- Resolve `res_1m` identically (`cand.get("_ohlcv_1m_result")`, else `pre_attached_unknown` if `candles_1m` is present, else `ohlcv_1m_by_pair.get(p_addr)` or `unavailable`).
-- Compute `ok_5m, err_5m = evaluate_ohlcv_provenance(res_5m, ...)` and `ok_1m, err_1m = evaluate_ohlcv_provenance(res_1m, ...)`, plus `closed_5m` via `normalize_and_filter_candles(res_5m.candles, bar_minutes=5, decision_timestamp=ref_ts)`.
-- **Deterministic selection rules (never use stale 5m or 1m candles as entry evidence):**
-  1. **`ok_5m` and `len(closed_5m) >= 12`:** Use 5m (`active_prov = res_5m`). Stale or unavailable 1m data does not affect this path.
-  2. **`ok_5m` and `len(closed_5m) < 12`:** Evaluate 1m fallback **only** if permitted by the existing fallback policy (5m `last_ok=True, last_status=200`, no backoff, or trusted `pre_attached_verified` 1m); independently require `ok_1m` and `len(closed_1m) >= 15`. A fresh 5m result never authorizes stale, `unavailable`, or `pre_attached_unknown` 1m candles; if `not ok_1m`, fail closed with `err_1m`.
-  3. **`not ok_5m` (stale or unavailable 5m, regardless of whether `len(closed_5m) >= 12` or `< 12`):**
-     - Stale 5m candles are **never** used as entry evidence, even when `len(closed_5m) >= 12`.
-     - Do **not** let an ineligible 5m series's candle count suppress an independently eligible 1m fallback **if** the fallback policy permits 1m (note: in live fetching, `should_fetch_1m_fallback()` blocks 1m network requests when 5m failed with `429`/backoff/error, leaving `res_1m` as `unavailable`; however, if 1m is permitted/independently eligible—e.g., `unavailable` 5m or `pre_attached_verified` 1m—`ok_1m` with `len(closed_1m) >= 15` is evaluated on 1m).
-     - If `not ok_1m` as well, fail closed immediately (`eligible=False, setup_type="NONE"`), preserving `err_5m` if `res_5m` was `stale_*`, else `err_1m`.
+### 3.3 Explicit 5m/1m Fetch Permission vs. Evaluation Eligibility (`alpha_node.py`)
+Separate **permission to fetch 1m candles over the network** from **eligibility to evaluate already-acquired 1m candles**:
+
+- **Network 1m fetch permission (`ohlcv_client.py:should_fetch_1m_fallback()`):**
+  - Strictly preserves the existing E3A policy: a network 1m request is permitted **only** when `_ohlcv_cache[pair_address]` records `last_ok=True`, `last_status=200`, fewer than 12 unique closed 5m bars exist, and global backoff (`_global_backoff_until`) is inactive.
+  - A 5m `429`, exception, active backoff, or missing/unavailable 5m cache entry **never** authorizes a network 1m request (`fetch_ohlcv_1m_batch_with_provenance()` returns `source="unavailable"`).
+- **Already-acquired 1m evaluation eligibility:**
+  - Resolve `res_5m` and `res_1m` (`cand.get("_ohlcv_*_result")` if `OhlcvFetchResult`, else `pre_attached_unknown` if raw `candles_*` is present, else fetched result / `unavailable`).
+  - Compute `ok_5m, err_5m = evaluate_ohlcv_provenance(res_5m, ...)` and `ok_1m, err_1m = evaluate_ohlcv_provenance(res_1m, ...)`, plus `closed_5m` and `closed_1m` via `normalize_and_filter_candles()`.
+  - **Deterministic selection matrix:**
+    1. **Fresh/eligible 5m (`ok_5m`) with `>= 12` closed 5m bars:** Select 5m (`active_prov = res_5m`); ignore 1m eligibility.
+    2. **Fresh/eligible 5m (`ok_5m`) with `< 12` closed 5m bars:** Permit network 1m fetch only if `should_fetch_1m_fallback()` permits it; independently require `ok_1m` and `len(closed_1m) >= 15`. A fresh 5m result never authorizes stale, `unavailable`, or `pre_attached_unknown` 1m candles; if `not ok_1m`, fail closed with `err_1m`.
+    3. **Stale/429/backoff 5m (`not ok_5m`, regardless of `>= 12` or `< 12` closed 5m bars):** Never use stale 5m. Network 1m fetch is blocked by `should_fetch_1m_fallback()`. Apply the **trusted pre-attached 1m exception** only if `res_1m` is an independently supplied runtime `OhlcvFetchResult` with `source == "pre_attached_verified"`, passes `evaluate_ohlcv_provenance()`, and has `len(closed_1m) >= 15`; otherwise fail closed preserving `err_5m`.
+    4. **Unavailable 5m (`source == "unavailable"`):** Never authorizes a network 1m request (`should_fetch_1m_fallback()` returns `False`). Apply the exact same **trusted pre-attached 1m exception** (`source == "pre_attached_verified"`, `ok_1m`, `len(closed_1m) >= 15`); otherwise fail closed.
+    5. **`pre_attached_unknown`, candidate-supplied booleans/dicts, stale cached 1m data, and blocked network 1m requests never qualify.**
 - Call `cache_breakout_telemetry()` (`L170`) **only** when `evaluate_ohlcv_provenance(active_prov, ...)[0]` is `True`.
 
 ---
@@ -179,9 +182,9 @@ Validation rules (all fail closed):
 | `B9` | Pre-attached unknown-provenance candles (`pre_attached_unknown`, omitted `ohlcv_provenance`, or candidate-supplied dict/bool flags) | Fails closed in `evaluate_scalper_entry()` and `alpha_node()` |
 | `B10` | `whale_lane.py` with stale OHLCV (`stale_429` / `stale_backoff`) | `has_ohlcv=False`, `_breakout_telemetry_cache` not overwritten, independent whale entry not falsely blocked |
 | `B11` | Fresh 5m (`< 12` closed bars) + stale/ineligible 1m (`stale_429` / `unavailable` / `pre_attached_unknown`) | `alpha_node` fails closed on 1m provenance; fresh 5m never authorizes stale 1m |
-| `B12a` | `12+` closed stale 5m candles + independently fresh 1m data (when fallback policy permits 1m) | Stale 5m is rejected and does not suppress eligible 1m (`>= 15` closed 1m bars); when 5m `429`/backoff blocks 1m fetch, fails closed on 5m |
-| `B12b` | `12+` closed fresh 5m candles + stale 1m data | 5m is selected (`active_prov = res_5m`) and entry is eligible; stale 1m does not affect 5m |
-| `B12c` | Unavailable 5m + independently fresh 1m data (when permitted) | 1m is evaluated (`>= 15` closed 1m bars) rather than blocked by unavailable 5m |
+| `B12a` | `12+` closed stale/429/backoff 5m candles + independently supplied `pre_attached_verified` 1m (`>= 15` closed bars) vs. no trusted 1m | Stale 5m is never used and network 1m fetch remains blocked; `pre_attached_verified` 1m qualifies if valid, otherwise fails closed on 5m |
+| `B12b` | `12+` closed fresh 5m candles + stale 1m data | 5m is selected (`active_prov = res_5m`) and entry is eligible; 1m eligibility is ignored |
+| `B12c` | Unavailable 5m + independently supplied `pre_attached_verified` 1m (`>= 15` closed bars) vs. no trusted 1m | Network 1m fetch is **not** permitted (`should_fetch_1m_fallback()` returns `False`); `pre_attached_verified` 1m qualifies if valid, otherwise fails closed |
 | `B13` | Pre-attached `pre_attached_verified` with missing (`None`) or expired (`> 90s`) `last_ok_at` | `evaluate_ohlcv_provenance()` fails closed (`missing or invalid OHLCV last_ok_at` / `expired OHLCV cache`) |
 | `B14a` | Telemetry computed from older candles (`ohlcv_last_ok_at` 900s old) but inserted recently (`cached_at` 5s ago) | `data_age_seconds == 900.0`, `is_historical=True`, never labeled current |
 | `B14b` | Telemetry with missing (`None`), `NaN`, `<= 0`, or materially future (`> now_ts + 5s`) `ohlcv_last_ok_at` | `data_age_seconds is None`, `is_historical=True`, `is_trusted=False` (never clamped to `0.0`) |
