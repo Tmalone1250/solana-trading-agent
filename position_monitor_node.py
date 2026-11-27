@@ -33,6 +33,28 @@ logger = logging.getLogger(__name__)
 EPS = 1e-9
 
 
+def _resolve_exodus_observation_inputs(
+    flow: Optional[dict[str, Any]],
+    pos: ActivePosition,
+    fallback_liq: float,
+) -> tuple[bool, bool, Optional[float]]:
+    """Return (flow_available, liq_available, current_liquidity_usd) from pinned pool telemetry."""
+    status = str(pos.pool_observation_status or "")
+    flow_ok = status in ("MATCHED", "ZERO_LIQUIDITY")
+    if isinstance(flow, dict) and "flow_available" in flow:
+        flow_ok = flow_ok and bool(flow.get("flow_available"))
+
+    if status in ("MATCHED", "ZERO_LIQUIDITY"):
+        raw_liq = flow.get("liquidity_usd") if isinstance(flow, dict) else None
+        liq_val = float(raw_liq) if raw_liq is not None else float(fallback_liq)
+        return flow_ok, True, liq_val
+
+    if status == "INCOMPLETE_DATA" and isinstance(flow, dict) and flow.get("liquidity_usd") is not None:
+        return False, True, float(flow["liquidity_usd"])
+
+    return False, False, None
+
+
 async def position_monitor_node(
     state: AgentGraphState,
     *,
@@ -124,8 +146,17 @@ async def position_monitor_node(
                 db.update_lane_positions_only(lane="whale", positions=[cp_d], focus_state=FocusState.IN_POSITION.value, active_position=cp_d)
                 return {"active_position": cp_d, "pending_order": None, "monitor_event": w_ev}
 
+            flow_ok, liq_ok, obs_liq = _resolve_exodus_observation_inputs(ef, cp, c_liq)
             order, ev, prio = evaluate_chart_position_exit(
-                cp, current_sol_value=curr_val, buys_5m=b5, sells_5m=s5, current_liquidity_usd=c_liq, config=config,
+                cp,
+                current_sol_value=curr_val,
+                buys_5m=b5 if flow_ok else None,
+                sells_5m=s5 if flow_ok else None,
+                current_liquidity_usd=obs_liq,
+                config=config,
+                flow_available=flow_ok,
+                liq_available=liq_ok,
+                now_dt=now_dt,
             )
             if order is not None:
                 triggered_exits.append((prio, slot_idx, cp, order, ev))
@@ -231,11 +262,18 @@ async def position_monitor_node(
         pos, current_sol_value=current_sol_value, flow=flow, lane_label="watch_reentry", used_exact_quote=used_watch_q,
     )
     total_5m = buys_5m + sells_5m
+    w_flow_ok, w_liq_ok, w_obs_liq = _resolve_exodus_observation_inputs(flow, pos, current_liq)
     is_exodus, sell_ratio_5m, _, exodus_reason = compute_exodus(
-        buys_5m=buys_5m, sells_5m=sells_5m,
-        entry_liquidity_usd=pos.entry_liquidity_usd, current_liquidity_usd=current_liq, config=config,
+        buys_5m=buys_5m if w_flow_ok else None,
+        sells_5m=sells_5m if w_flow_ok else None,
+        entry_liquidity_usd=pos.entry_liquidity_usd,
+        current_liquidity_usd=w_obs_liq,
+        config=config,
+        flow_available=w_flow_ok,
+        liq_available=w_liq_ok,
     )
-    pos.last_5m_sell_ratio = sell_ratio_5m
+    if w_flow_ok:
+        pos.last_5m_sell_ratio = sell_ratio_5m
 
     # =========================================================================
     # STATE 3: WATCHING_REENTRY

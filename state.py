@@ -172,6 +172,9 @@ class ActivePosition(BaseModel):
     last_5m_sell_ratio: Optional[float] = None
     last_liquidity_usd: Optional[float] = None
     last_price_source: Optional[str] = None
+    exodus_confirm_count: int = 0
+    exodus_last_confirmed_at: Optional[str] = None
+    last_exodus_status: Optional[str] = None
     position_mfe_pct: Optional[float] = None
     position_mae_pct: Optional[float] = None
 

@@ -216,15 +216,22 @@ async def test_exodus_bleed_and_timeout_abandonment(tmp_path):
     cfg = AgentConfig(_env_file=None)
     dec = StubDecisionClient({})
 
-    # 1. Exodus in IN_POSITION (5m sells >= 65%)
+    # 1. Exodus in IN_POSITION (5m sells >= 65% after warm-up & 2 confirmation ticks)
+    t_ex = datetime(2026, 11, 26, 12, 0, 0, tzinfo=timezone.utc)
+    pos_ex = _base_in_position(0.5)
+    pos_ex["opened_at"] = (t_ex - timedelta(minutes=10)).isoformat()
     state_pos = {
         "focus_state": FocusState.IN_POSITION.value,
         "sol_balance": 0.2,
         "daily_pnl_sol": 0.0,
-        "active_position": _base_in_position(0.5),
+        "active_position": pos_ex,
     }
     async with _make_monitor_client(sol_quote=0.52, buys_5m=30, sells_5m=70) as client:
-        mon = await position_monitor_node(state_pos, config=cfg, db=db, decision_client=dec, http_client=client)  # type: ignore[arg-type]
+        mon1 = await position_monitor_node(state_pos, config=cfg, db=db, decision_client=dec, http_client=client, now=t_ex)  # type: ignore[arg-type]
+        assert mon1["pending_order"] is None
+        state_pos["active_position"] = mon1["active_position"]
+        state_pos["chart_positions"] = mon1["chart_positions"]
+        mon = await position_monitor_node(state_pos, config=cfg, db=db, decision_client=dec, http_client=client, now=t_ex + timedelta(seconds=6))  # type: ignore[arg-type]
         assert mon["pending_order"] is not None
         assert "EXODUS_SELL_FLOW" in mon["pending_order"]["reason"]
 

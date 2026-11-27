@@ -65,6 +65,10 @@ class AgentConfig(BaseSettings):
     MAX_REENTRIES_PER_MINT: int = Field(default=2, ge=0)
     EXODUS_SELL_RATIO: float = Field(default=0.65, gt=0.0, le=1.0)
     EXODUS_LIQ_DROP_PCT: float = Field(default=0.10, gt=0.0, le=1.0)
+    # Conservative Exodus noise-guard defaults (not historically optimized trading thresholds)
+    MIN_EXODUS_TXNS_5M: int = Field(default=10, ge=1)
+    EXODUS_CONFIRMATION_TICKS: int = Field(default=2, ge=1)
+    EXODUS_FLOW_WARMUP_SECONDS: float = Field(default=300.0, ge=0.0)
     WATCH_TIMEOUT_MINUTES: int = Field(default=20, gt=0)
     DAILY_MAX_LOSS_PCT: float = Field(default=0.20, gt=0.0, le=1.0)
 
