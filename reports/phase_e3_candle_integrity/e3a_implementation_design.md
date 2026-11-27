@@ -1,4 +1,4 @@
-# Phase E3A — Candle Eligibility Implementation Design (Revised)
+# Phase E3A — Candle Eligibility Implementation Design (Final)
 
 - **Repository:** `Tmalone1250/solana-trading-agent`
 - **Audited Source Branch / Commit:** `dev_2` @ `19104e32e0ac619a19f8586ae3e27d8707af62c0`
@@ -7,24 +7,27 @@
 
 ---
 
-## Change Summary (Review Corrective Pass)
+## Change Summary (Final Corrective Pass)
 
-1. **Fail-Closed Direct Detector Contract:** Replaced optional `decision_timestamp=None` bypass risk with a fail-closed contract on both `detect_breakout_ignition()` and `evaluate_scalper_entry()`: `None` defaults internally to `time.time()` (UTC seconds), and any non-finite, non-positive, or non-numeric `decision_timestamp` fails closed (`detected=False` / `eligible=False`).
-2. **Dependency-Safe Helper Placement:** Placed `filter_eligible_candles()` in `breakout_ignition.py` (which `scalper_entry_engine.py` already imports), preventing any circular import back from `breakout_ignition.py` into `scalper_entry_engine.py`.
-3. **GeckoTerminal Timestamp Convention Evidence:** Separated what the repository proves (internal convention/assumptions) from external CoinGecko/GeckoTerminal API v2 documentation (`ohlcv_list` timestamps denote interval start in Unix epoch seconds, and zero-swap intervals are omitted by default), and explicitly stated that `timestamp + bar_seconds <= decision_timestamp` depends on the provider's interval-start invariant.
-4. **Gap Rejection & Fallback Semantics:** Defined explicit data-integrity rejection propagation: a 5m gap rejection does **not** fall back to 1m (1m fallback is strictly for `< 12` closed 5m bars on young pools), and `ScalperEntryResult.rejection_reason` / `BreakoutTelemetry.failed_gates` preserve the gap reason without being masked by `"insufficient 5m candles"`.
-5. **Test Matrix (`T3a` / `T3b` / `T4`):** Split `T3` into separate boundary tests (`T3a`: `timestamp + bar_seconds == decision_timestamp` eligible; `T3b`: `timestamp + bar_seconds == decision_timestamp + 1` ineligible) and kept `T4` (stale-but-closed) distinct.
+1. **GeckoTerminal Documentation Traceability:**
+   - Added the exact authoritative CoinGecko/GeckoTerminal API v2 documentation URL (`https://docs.coingecko.com/reference/pool-ohlcv-contract-address`) and identified the specific documented sections (`data.attributes.ohlcv_list` response schema, `before_timestamp` pagination, and `include_empty_intervals` query parameter).
+   - Corrected the Executive Summary so it does not categorically assert that the newest returned candle is always forming; instead states that `/ohlcv/minute` *can* include a currently forming interval and that the system currently cannot distinguish forming from closed candles.
+   - Explicitly stated that `timestamp + bar_seconds <= decision_timestamp` depends on interval-start Unix-second timestamps and that this provider contract must be verified before implementation.
+2. **Diagnostic-Only Recent Candle Gap Policy:**
+   - Removed hard eligibility rejection on `> 3 * bar_seconds` gaps because the cutoff is not empirically established and GeckoTerminal omits zero-swap intervals by default.
+   - Changed recent-window gap detection to **diagnostic-only** in E3A: valid closed candles are **not** rejected on gaps, 5m/1m fallback remains governed strictly by `len(closed_5m) < 12`, and diagnostic gaps never become a generic `"insufficient 5m candles"` rejection.
+   - Updated Test Matrix `T7` to verify diagnostic gap reporting without eligibility rejection or spurious fallback.
 
 ---
 
 ## 1. Executive Summary
 
-In `19104e32e0ac619a19f8586ae3e27d8707af62c0` (`dev_2`), `BREAKOUT_IGNITION` (along with `SWEEP_RECLAIM` and `DISPLACEMENT_RETEST`) evaluates `candles[-1]` without verifying whether that bar has closed, without validating `"timestamp"` presence or OHLCV sanity, and without deduplicating or checking interval continuity. Because GeckoTerminal's `/ohlcv/minute` endpoint returns the currently forming interval as the newest entry, `parse_geckoterminal_ohlcv()` places that unclosed bar at `candles[-1]`, allowing intrabar spikes or partial-bar volume to trigger `BUY` decisions.
+In `19104e32e0ac619a19f8586ae3e27d8707af62c0` (`dev_2`), `BREAKOUT_IGNITION` (along with `SWEEP_RECLAIM` and `DISPLACEMENT_RETEST`) evaluates `candles[-1]` without verifying whether that bar has closed, without validating `"timestamp"` presence or OHLCV sanity, and without deduplicating timestamps. Because GeckoTerminal's `/ohlcv/minute` endpoint *can* include the currently forming interval alongside historical bars, `parse_geckoterminal_ohlcv()` can place an unclosed bar at `candles[-1]`, allowing intrabar spikes or partial-bar volume to drive `BUY` decisions when the latest interval has not yet elapsed.
 
 This design defines a minimal, fail-closed **E3A Candle Eligibility** contract that:
 1. Captures a single UTC `decision_timestamp` per evaluation cycle and passes it to both 5m and 1m evaluations.
 2. Enforces strict closed-candle filtering (`timestamp + 300 <= decision_timestamp` for 5m; `timestamp + 60 <= decision_timestamp` for 1m) inside **both** `evaluate_scalper_entry()` and `detect_breakout_ignition()`, defaulting to `time.time()` when omitted and failing closed on invalid timestamps.
-3. Hardens normalization against missing timestamps (removing `float(c.get("timestamp", idx))`), duplicate timestamps, out-of-order rows, invalid/non-finite OHLCV values, and severe recent-window gaps.
+3. Hardens normalization against missing timestamps (removing `float(c.get("timestamp", idx))`), duplicate timestamps, out-of-order rows, and invalid/non-finite OHLCV values, while recording recent-window interval gaps as **diagnostic-only** telemetry.
 4. Preserves existing `ohlcv_client.py` cache behavior, fetcher return types, and strategy thresholds.
 5. Explicitly separates **closed-candle validation** (implemented in E3A) from **freshness/staleness validation** (threshold left undecided pending empirical telemetry).
 
@@ -89,11 +92,16 @@ insider_scanner.py:auto_detect_breakout_ts() (L84-105)
   - `ohlcv_client.py:213-214` queries `/networks/solana/pools/{addr}/ohlcv/minute` with `aggregate="5"` or `"1"`.
   - `breakout_ignition.py:83` sets aggregated 15m timestamps to `chunk[0]["timestamp"]`, showing the codebase assumes interval-start timestamps.
   - `tests/test_scalper_entry_engine.py:194-195` and `tests/test_breakout_ignition.py:32,56,66` construct synthetic candles with 300s-aligned interval-start Unix epoch seconds.
-  - Repository code and synthetic fixtures do **not** independently prove provider semantics or that the newest returned bar is always forming.
-- **External authoritative documentation:**
-  - CoinGecko / GeckoTerminal API v2 documentation for `/networks/{network}/pools/{pool_address}/ohlcv/{timeframe}` specifies that each `ohlcv_list` element `[timestamp, open, high, low, close, volume]` uses `timestamp` as the **start time of the interval in Unix epoch seconds**, `close` as the closing price (or latest price if the interval is current/forming), and omits zero-swap intervals by default (unless `include_empty_intervals=true` is passed, which `ohlcv_client.py:214` does not pass).
-- **Contractual dependency:**
-  - The rule `timestamp + bar_seconds <= decision_timestamp` is valid **if and only if** the upstream OHLCV provider timestamps candles at interval start. Any future provider change (e.g., interval-end timestamps) is an implementation prerequisite requiring explicit unit/convention conversion before entering `filter_eligible_candles()`.
+  - Repository code and synthetic fixtures do **not** independently prove provider semantics or whether the newest returned bar is always forming.
+- **Authoritative external documentation:**
+  - **URL:** `https://docs.coingecko.com/reference/pool-ohlcv-contract-address` (CoinGecko On-Chain API / GeckoTerminal `GET /onchain/networks/{network}/pools/{pool_address}/ohlcv/{timeframe}` reference).
+  - **Documented fields & sections:**
+    - **Response schema (`data.attributes.ohlcv_list`):** Documents each element as `[timestamp, open, high, low, close, volume]`, where `timestamp` is the **interval start time in Unix epoch seconds** and `close` is the closing price (or latest price for the current interval).
+    - **Query Parameter `before_timestamp`:** Documents integer Unix epoch seconds pagination using `oldest_timestamp - 1` to avoid repeating a candle, corroborating interval-start semantics.
+    - **Query Parameter `include_empty_intervals`:** Documents that zero-swap intervals are omitted by default unless `include_empty_intervals=true` is passed (`ohlcv_client.py:214` does not pass this parameter).
+  - *Note:* No live market-data API calls were executed during this audit.
+- **Implementation prerequisite:**
+  - The closed-candle formula `timestamp + bar_seconds <= decision_timestamp` is valid **only if** the upstream provider timestamps candles at interval start in Unix seconds. Before implementing E3A, this provider contract must be verified against the live/sandboxed GeckoTerminal endpoint response shape (and any future provider change must normalize to interval-start Unix seconds).
 
 ### Q3. Where `decision_timestamp` Must Be Passed
 - `alpha_node.py:115` captures `now_dt = now or utc_now()` once per cycle and already passes `now_dt.timestamp()` to `fetch_ohlcv_batch()` (`L134`) and `fetch_ohlcv_1m_batch()` (`L137`). It must pass `decision_timestamp=now_dt.timestamp()` to `evaluate_scalper_entry()` (`L161`).
@@ -125,7 +133,10 @@ insider_scanner.py:auto_detect_breakout_ts() (L84-105)
 - **Duplicate timestamps:** Deduplicate by normalized `timestamp` (keeping the latest occurrence in input order) before sorting.
 - **Out-of-order candles:** Sort ascending (oldest-first) by `timestamp` after validation and deduplication.
 - **Invalid OHLCV values:** Drop any bar where `open`, `high`, `low`, or `close` is non-finite or `<= 0`, where `high < low`, `high < max(open, close)`, `low > min(open, close)`, or where `volume` is non-finite or `< 0`.
-- **Gaps in candle intervals:** Because GeckoTerminal omits zero-swap intervals by default, historical gaps outside the active window are tolerated; however, any consecutive closed-bar delta `> 3 * bar_seconds` inside the active coil/volume window (`closed[-6:]`) is rejected as a data-integrity gap.
+- **Gaps in candle intervals (Diagnostic-Only Policy in E3A):**
+  - Because GeckoTerminal omits zero-swap intervals by default (`include_empty_intervals` is not enabled in `ohlcv_client.py:214`), gaps can represent legitimate market inactivity on low-cap Solana pools rather than malformed data, and no empirical threshold is established in the codebase.
+  - Therefore, E3A records recent-window interval gaps (`closed[-6:]`, e.g., `max_gap_seconds` and `gap_count` where `delta > bar_seconds`) as **diagnostic-only** metadata (e.g., debug/warning log or non-gating telemetry) and **does NOT reject** otherwise valid closed candles due to gaps.
+  - Diagnostic gaps never alter `eligible`, `detected`, or `len(closed_5m) < 12` fallback routing, and never turn into a generic `"insufficient 5m candles"` rejection.
 
 ### Q7. Impact on RSI, Breakout Detection, 12-Bar 5m Minimum, and 15-Bar 1m Fallback
 - **RSI (`compute_rsi`):** Computed strictly on closed-candle closes.
@@ -152,34 +163,33 @@ Covered in Section 6 (Test Matrix).
 ### 4.1 Dependency-Safe Module & Import Direction
 - **`scalper_entry_engine.py` already imports from `breakout_ignition.py` (`L9`).**
 - To preserve a strict acyclic DAG, **do not** import anything from `scalper_entry_engine.py` into `breakout_ignition.py`.
-- Place `normalize_and_filter_candles()` (shared normalization + closed-bar + gap validation helper) in **`breakout_ignition.py`** using only stdlib (`math`, `time`, `typing`) and `pydantic`.
+- Place `validate_decision_timestamp()` and `normalize_and_filter_candles()` in **`breakout_ignition.py`** using only stdlib (`math`, `time`, `typing`) and `pydantic`.
 - **Exact dependency direction:**
-  - `breakout_ignition.py` defines `normalize_and_filter_candles(...)` and `detect_breakout_ignition(...)` (no imports from `scalper_entry_engine.py`, `alpha_node.py`, or `whale_lane.py`).
-  - `scalper_entry_engine.py` imports `detect_breakout_ignition, normalize_and_filter_candles` from `breakout_ignition` (`L9`).
-  - `alpha_node.py` and `whale_lane.py` import `evaluate_scalper_entry` from `scalper_entry_engine` (and `normalize_and_filter_candles` from `breakout_ignition` if checking closed 5m count before `should_fetch_1m_fallback()`).
+  - `breakout_ignition.py` defines `validate_decision_timestamp(...)`, `normalize_and_filter_candles(...)`, and `detect_breakout_ignition(...)` (no imports from `scalper_entry_engine.py`, `alpha_node.py`, or `whale_lane.py`).
+  - `scalper_entry_engine.py` imports `detect_breakout_ignition, normalize_and_filter_candles, validate_decision_timestamp` from `breakout_ignition` (`L9`).
+  - `alpha_node.py` and `whale_lane.py` import `evaluate_scalper_entry` from `scalper_entry_engine` (and `normalize_and_filter_candles` from `breakout_ignition` when checking closed 5m count before `should_fetch_1m_fallback()`).
 
 ### 4.2 Function Contracts
 1. **`validate_decision_timestamp(decision_timestamp: Optional[float]) -> tuple[Optional[float], Optional[str]]`** (in `breakout_ignition.py`):
    - If `decision_timestamp is None`: returns `(time.time(), None)`.
    - If `isinstance(decision_timestamp, bool)` or not `isinstance(decision_timestamp, (int, float))` or not `math.isfinite(float(decision_timestamp))` or `float(decision_timestamp) <= 0.0`: returns `(None, "invalid decision_timestamp")`.
    - Otherwise returns `(float(decision_timestamp), None)`.
-2. **`normalize_and_filter_candles(raw_candles: Sequence[Any], *, bar_minutes: int, decision_timestamp: Optional[float] = None) -> tuple[list[dict[str, float]], Optional[str]]`** (in `breakout_ignition.py`):
-   - Validates `decision_timestamp` via `validate_decision_timestamp()`. If invalid, returns `([], "invalid decision_timestamp")`.
+2. **`normalize_and_filter_candles(raw_candles: Sequence[Any], *, bar_minutes: int, decision_timestamp: Optional[float] = None) -> tuple[list[dict[str, float]], Optional[str], dict[str, Any]]`** (in `breakout_ignition.py`):
+   - Validates `decision_timestamp` via `validate_decision_timestamp()`. If invalid, returns `([], "invalid decision_timestamp", {})`.
    - Parses dict/sequence rows without `idx` timestamp substitution; scales `ts >= 1e12` ms to seconds; drops non-finite/non-positive/inverted OHLCV rows; deduplicates by `timestamp` (last-wins); sorts ascending.
    - Filters to closed bars: `c["timestamp"] + (bar_minutes * 60) <= ref_ts`.
-   - Checks `closed[-6:]` for consecutive gaps `> 3 * (bar_minutes * 60)`. If found, returns `([], f"{bar_minutes}m candle interval gap (>{3 * bar_minutes * 60}s) in recent window")`.
-   - Returns `(closed, None)`.
+   - Computes diagnostic gap metrics over `closed[-6:]` (`recent_gap_count`, `max_recent_gap_seconds`) without rejecting valid closed candles.
+   - Returns `(closed, None, gap_diag)`.
 3. **`detect_breakout_ignition(..., decision_timestamp: Optional[float] = None)`** (in `breakout_ignition.py`):
    - Calls `normalize_and_filter_candles(candles, bar_minutes=bar_minutes, decision_timestamp=decision_timestamp)` at function entry.
-   - If an error reason (`invalid decision_timestamp` or gap reason) is returned, fails closed immediately with `detected=False`, `rejection_reason=err_reason`, and `failed_gates=["INVALID_DECISION_TS"]` or `["CANDLE_GAP"]`.
+   - If `err_reason` (`"invalid decision_timestamp"`) is returned, fails closed immediately with `detected=False`, `rejection_reason=err_reason`, and `failed_gates=["INVALID_DECISION_TS"]`.
    - Otherwise evaluates `closed_candles` against `min_bars` (`12` for 5m, `15` for 1m) and proceeds unchanged.
 4. **`evaluate_scalper_entry(..., decision_timestamp: Optional[float] = None)`** (in `scalper_entry_engine.py`):
    - Validates `decision_timestamp` once at entry via `validate_decision_timestamp()`; on error, returns `ScalperEntryResult(eligible=False, setup_type="NONE", rejection_reason=err_reason)`.
    - Calls `normalize_and_filter_candles(candles_5m, bar_minutes=5, decision_timestamp=ref_ts)`.
-   - **Gap rejection & fallback semantics:**
-     - If `candles_5m` fails with a **5m gap rejection**, `evaluate_scalper_entry()` **does NOT fall back to 1m** (1m fallback is strictly for young pools with `< 12` closed 5m bars, not gapped/corrupted older 5m series). It immediately returns `ScalperEntryResult(eligible=False, setup_type="NONE", rsi_5m=50.0, dist_from_1h_high_pct=0.0, rejection_reason=gap_5m_reason)` (prepending soak failure if `time_in_slot_min < min_soak`), preserving the explicit data-integrity rejection rather than `"insufficient 5m candles"`.
-     - Only when `gap_5m_reason is None` and `len(closed_5m) < 12` does it evaluate `candles_1m` via `normalize_and_filter_candles(candles_1m, bar_minutes=1, decision_timestamp=ref_ts)`. If `candles_1m` fails with a **1m gap rejection**, it immediately returns `ScalperEntryResult(eligible=False, setup_type="NONE", rejection_reason=gap_1m_reason)` rather than `"insufficient 5m candles"`.
+   - If `len(closed_5m) < 12`, calls `normalize_and_filter_candles(candles_1m, bar_minutes=1, decision_timestamp=ref_ts)` and runs 1m fallback if `len(closed_1m) >= 15`; otherwise returns `insufficient 5m candles`.
    - Passes `decision_timestamp=ref_ts` to all `detect_breakout_ignition()` calls.
+   - Diagnostic gap metrics from `gap_diag` are logged/surfaced diagnostically without rejecting valid closed candles or altering 5m/1m fallback routing.
 
 ---
 
@@ -195,7 +205,7 @@ Covered in Section 6 (Test Matrix).
 | One second before close (`ts + bar_seconds == decision_ts + 1`) | **Ineligible** (forming) | Excluded from `closed` |
 | Missing `"timestamp"` or invalid OHLCV (`<=0`, `NaN`, `high < low`, `vol < 0`) | Row dropped (no `idx` fallback) | Excluded before `min_bars` check |
 | Duplicate `timestamp` / out-of-order rows | Last-wins dedup, sorted ascending | Deterministic oldest-first series |
-| Severe gap (`> 3 * bar_seconds`) in `closed[-6:]` | **Data-integrity rejection** (no 1m fallback on 5m gap) | `eligible=False`, `setup_type="NONE"`, `rejection_reason` preserves gap reason, `failed_gates=["CANDLE_GAP"]` |
+| Interval gap in `closed[-6:]` | **Diagnostic-only** (not rejected) | Valid closed candles evaluated normally; `recent_gap_count` / `max_recent_gap_seconds` recorded diagnostically |
 | Millisecond timestamp (`ts >= 1e12`) | Scaled to `ts / 1000.0` | Evaluated in UTC seconds |
 
 ---
@@ -211,23 +221,23 @@ Covered in Section 6 (Test Matrix).
 | `T4` | Stale-but-closed candles (e.g., `timestamp + 300 <= decision_timestamp - 600`) | `scalper_entry_engine`, `breakout_ignition` | Retained by closed-candle filter (distinct from `T3a`/`T3b`; freshness threshold out of scope) |
 | `T5` | Missing `"timestamp"`, duplicate timestamps, out-of-order, `NaN`/zero OHLC, ms timestamps, invalid `decision_timestamp` | `scalper_entry_engine`, `breakout_ignition` | Missing/invalid rows dropped (no `idx` fallback); deduped; sorted; ms scaled; invalid `decision_timestamp` fails closed |
 | `T6` | 12 raw 5m bars (11 closed + 1 forming) + 15 closed 1m bars | `alpha_node`, `scalper_entry_engine` | Closed 5m count is 11 (`< 12`), triggers 1m fallback, evaluates closed 1m bars |
-| `T7` | Severe gap (`> 3 * 300s`) in 5m `closed[-6:]` even with 15 valid 1m bars present | `scalper_entry_engine`, `breakout_ignition` | Does **not** fall back to 1m; `eligible=False` with explicit 5m gap `rejection_reason` and `CANDLE_GAP` |
+| `T7` | Interval gap in 5m `closed[-6:]` with `>= 12` valid closed 5m bars | `scalper_entry_engine`, `breakout_ignition` | Diagnostic gap reported (`recent_gap_count > 0`); valid closed 5m candles **are not rejected**, do **not** fall back to 1m, and do **not** emit `"insufficient 5m candles"` |
 | `T8` | Existing callers & fixtures (`alpha_node`, `whale_lane`, `test_breakout_ignition.py`, `test_scalper_entry_engine.py`, `test_breakout_isolation.py`) | All callers & test suites | Callers pass `decision_timestamp`; existing suites pass with explicit `decision_timestamp` aligned to fixtures |
 
 ---
 
 ## 7. Risks & Unresolved Questions
 
-1. **External GeckoTerminal invariant prerequisite:** `timestamp + bar_seconds <= decision_timestamp` assumes interval-start Unix-second timestamps as documented by CoinGecko/GeckoTerminal API v2. Any alternate provider or schema change must preserve or normalize to this invariant.
+1. **External GeckoTerminal contract verification prerequisite:** `timestamp + bar_seconds <= decision_timestamp` depends on interval-start Unix-second timestamps as documented at `https://docs.coingecko.com/reference/pool-ohlcv-contract-address`. This provider contract must be verified before implementation (and any future provider change must normalize to interval-start Unix seconds).
 2. **Existing unit test compatibility:** Existing fixture tests ([test_breakout_ignition.py](file:///home/tmalone1250/ToshibaDrive/Dev/Web3_Dev/solana-trading-agent/tests/test_breakout_ignition.py#L32), [test_scalper_entry_engine.py](file:///home/tmalone1250/ToshibaDrive/Dev/Web3_Dev/solana-trading-agent/tests/test_scalper_entry_engine.py#L57), [test_breakout_isolation.py](file:///home/tmalone1250/ToshibaDrive/Dev/Web3_Dev/solana-trading-agent/tests/test_breakout_isolation.py)) use historical timestamps (`1_700_000_000`, `1_760_000_000`) and omit `decision_timestamp`; because `time.time()` is newer, closed-candle checks will pass them, though passing explicit `decision_timestamp` in tests is recommended for determinism.
-3. **Unresolved freshness threshold:** Optimal `max_close_age` cannot be determined without live telemetry on GeckoTerminal indexing lag, low-cap zero-swap bar omission rates, and `alpha_node` batch pacing duration.
+3. **Unresolved freshness & gap thresholds:** Optimal `max_close_age` and whether any gap threshold should ever become gating cannot be determined without live telemetry on GeckoTerminal indexing lag, low-cap zero-swap bar omission rates, and `alpha_node` batch pacing duration.
 
 ---
 
 ## 8. Explicit Out-of-Scope Items
 
 - Implementing any code, configuration, or test changes.
-- Defining or enforcing a numeric candle-freshness / staleness threshold.
+- Defining or enforcing a numeric candle-freshness / staleness threshold or a gating candle-gap threshold.
 - Modifying `ohlcv_client.py` cache TTLs, 429 backoff behavior, fetcher return types, or OHLCV providers.
 - Tuning `BREAKOUT_IGNITION`, `SWEEP_RECLAIM`, `DISPLACEMENT_RETEST`, RSI, or order-flow thresholds.
 - Making live market-data network requests or modifying DuckDB schemas/data.
