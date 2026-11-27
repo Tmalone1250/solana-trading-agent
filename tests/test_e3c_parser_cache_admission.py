@@ -1,0 +1,344 @@
+"""Unit and integration tests for Phase E3C — OHLCV Parser Integrity & Cache Admission."""
+
+from __future__ import annotations
+
+import math
+
+import httpx
+import pytest
+
+from config import AgentConfig
+from insider_scanner import auto_detect_breakout_ts
+from ohlcv_client import (
+    clear_ohlcv_cache,
+    evaluate_ohlcv_provenance,
+    fetch_ohlcv_batch_with_provenance,
+    get_cached_ohlcv_for_pool,
+    get_global_backoff_until,
+    parse_geckoterminal_ohlcv,
+    parse_geckoterminal_ohlcv_strict,
+)
+
+
+@pytest.mark.asyncio
+async def test_c1_malformed_json_shapes_preserve_previous_cache_without_crashing():
+    clear_ohlcv_cache()
+    cfg = AgentConfig(_env_file=None, OHLCV_CACHE_SECONDS=90.0, OHLCV_PACING_DELAY_SECONDS=0.0)
+    pool = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
+    t0 = 1_760_000_700.0
+    valid_payload = {"data": {"attributes": {"ohlcv_list": [[1_760_000_400, 1.0, 1.1, 0.95, 1.05, 500.0]]}}}
+
+    bad_payloads = [
+        [],
+        None,
+        {"data": []},
+        {"data": {"attributes": "bad"}},
+        {"data": {"attributes": {"ohlcv_list": "not_a_list"}}},
+    ]
+    for bad in bad_payloads:
+        candles, struct_ok, had_rows = parse_geckoterminal_ohlcv_strict(bad)
+        assert candles == []
+        assert struct_ok is False
+        assert had_rows is False
+
+    mode = {"payload": valid_payload}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=mode["payload"])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        r_ok = (await fetch_ohlcv_batch_with_provenance([pool], cfg, client, now_ts=t0))[pool]
+        assert r_ok.source == "network_200" and len(r_ok.candles) == 1
+
+        mode["payload"] = {"data": {"attributes": {"ohlcv_list": "not_a_list"}}}
+        r_bad = (await fetch_ohlcv_batch_with_provenance([pool], cfg, client, now_ts=t0 + 100.0))[pool]
+        assert r_bad.source == "stale_error"
+        assert r_bad.last_status == 0
+        assert r_bad.last_ok_at == pytest.approx(t0)
+        assert len(r_bad.candles) == 1
+        assert evaluate_ohlcv_provenance(r_bad, decision_timestamp=t0 + 100.0)[0] is False
+    clear_ohlcv_cache()
+
+
+@pytest.mark.asyncio
+async def test_c2_partially_valid_200_skips_malformed_row_and_admits_valid_bars():
+    clear_ohlcv_cache()
+    cfg = AgentConfig(_env_file=None, OHLCV_CACHE_SECONDS=90.0, OHLCV_PACING_DELAY_SECONDS=0.0)
+    pool = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
+    t0 = 1_760_001_000.0
+    partial_payload = {
+        "data": {
+            "attributes": {
+                "ohlcv_list": [
+                    [1_760_000_700, 1.05, 1.12, 1.02, 1.10, 600.0],
+                    [1_760_000_400, None, 1.08, 0.99, 1.05, 400.0],  # malformed row
+                    [1_760_000_100, 1.00, 1.06, 0.98, 1.04, 300.0],
+                ]
+            }
+        }
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=partial_payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        res = (await fetch_ohlcv_batch_with_provenance([pool], cfg, client, now_ts=t0))[pool]
+        assert res.source == "network_200"
+        assert len(res.candles) == 2
+        assert [c["timestamp"] for c in res.candles] == [1_760_000_100.0, 1_760_000_700.0]
+    clear_ohlcv_cache()
+
+
+@pytest.mark.asyncio
+async def test_c3_all_invalid_nonempty_ohlcv_list_preserves_previous_cache_as_stale_error():
+    clear_ohlcv_cache()
+    cfg = AgentConfig(_env_file=None, OHLCV_CACHE_SECONDS=90.0, OHLCV_PACING_DELAY_SECONDS=0.0)
+    pool = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
+    t0 = 1_760_001_000.0
+    good_payload = {"data": {"attributes": {"ohlcv_list": [[1_760_000_400, 1.0, 1.1, 0.95, 1.05, 500.0]]}}}
+    all_bad_payload = {
+        "data": {
+            "attributes": {
+                "ohlcv_list": [
+                    [True, 1.0, 1.1, 0.95, 1.05, 100.0],
+                    [1_760_000_700, 0.0, 1.1, 0.95, 1.05, 100.0],
+                    [1_760_001_000, 1.0, 0.9, 1.1, 1.05, 100.0],  # high < low
+                    [1_760_001_300, 1.0, 1.1, 0.95, 1.05, -5.0],  # negative volume
+                ]
+            }
+        }
+    }
+    mode = {"payload": good_payload}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=mode["payload"])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await fetch_ohlcv_batch_with_provenance([pool], cfg, client, now_ts=t0)
+        mode["payload"] = all_bad_payload
+        r_bad = (await fetch_ohlcv_batch_with_provenance([pool], cfg, client, now_ts=t0 + 100.0))[pool]
+        assert r_bad.source == "stale_error"
+        assert r_bad.last_ok_at == pytest.approx(t0)
+        assert len(r_bad.candles) == 1
+        assert evaluate_ohlcv_provenance(r_bad, decision_timestamp=t0 + 100.0)[0] is False
+    clear_ohlcv_cache()
+
+
+def test_c4_duplicate_and_millisecond_timestamps_sanitized_before_cache_admission():
+    payload = {
+        "data": {
+            "attributes": {
+                "ohlcv_list": [
+                    [1_760_000_700_000, 1.05, 1.12, 1.02, 1.10, 600.0],  # ms
+                    [1_760_000_400, 1.00, 1.08, 0.99, 1.05, 400.0],
+                    [1_760_000_400_000, 1.01, 1.09, 1.00, 1.07, 450.0],  # duplicate of 1_760_000_400 in ms (last wins)
+                ]
+            }
+        }
+    }
+    parsed = parse_geckoterminal_ohlcv(payload)
+    assert len(parsed) == 2
+    assert [c["timestamp"] for c in parsed] == [1_760_000_400.0, 1_760_000_700.0]
+    assert parsed[0]["close"] == pytest.approx(1.07)
+    assert parsed[0]["volume"] == pytest.approx(450.0)
+
+
+@pytest.mark.asyncio
+async def test_c5_empty_200_not_pinned_as_fresh_for_90s_and_triggers_no_backoff():
+    clear_ohlcv_cache()
+    cfg = AgentConfig(_env_file=None, OHLCV_CACHE_SECONDS=90.0, OHLCV_PACING_DELAY_SECONDS=0.0)
+    pool = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
+    t0 = 1_760_001_000.0
+    calls = {"count": 0}
+    mode = {"empty": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        if mode["empty"]:
+            return httpx.Response(200, json={"data": {"attributes": {"ohlcv_list": []}}})
+        return httpx.Response(
+            200,
+            json={"data": {"attributes": {"ohlcv_list": [[1_760_000_700, 1.05, 1.12, 1.02, 1.10, 600.0]]}}},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        r1 = (await fetch_ohlcv_batch_with_provenance([pool], cfg, client, now_ts=t0))[pool]
+        assert r1.source == "unavailable"
+        assert r1.candles == []
+        assert get_global_backoff_until() == 0.0
+        assert evaluate_ohlcv_provenance(r1, decision_timestamp=t0)[0] is False
+
+        # Only 10s later (< 90s): pool is NOT pinned to [] and re-fetches cleanly once indexed!
+        mode["empty"] = False
+        r2 = (await fetch_ohlcv_batch_with_provenance([pool], cfg, client, now_ts=t0 + 10.0))[pool]
+        assert calls["count"] == 2
+        assert r2.source == "network_200"
+        assert len(r2.candles) == 1
+        assert get_cached_ohlcv_for_pool(pool)[0] == r2.candles
+    clear_ohlcv_cache()
+
+
+@pytest.mark.asyncio
+async def test_c6_insider_scanner_receives_sanitized_candles():
+    cfg = AgentConfig(_env_file=None)
+    payload = {
+        "data": {
+            "attributes": {
+                "ohlcv_list": [
+                    [1_760_000_700, 1.0, 1.1, 0.9, 1.05, -5.0],     # invalid negative vol
+                    [1_760_000_400, 1.0, 1.1, 0.95, 1.08, 900.0],   # valid green bar
+                ]
+            }
+        }
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        ts = await auto_detect_breakout_ts("PoolXYZ", cfg, client)
+    assert ts == 1_760_000_400
+
+
+def test_c7_extra_fields_short_rows_wrong_row_types_and_zero_volume():
+    payload = {
+        "data": {
+            "attributes": {
+                "ohlcv_list": [
+                    [1_760_000_700, 1.0, 1.1, 0.95, 1.05, 0.0, "extra_field", 999],  # zero volume + extra fields -> valid
+                    [1_760_000_400, 1.0, 1.1, 0.95, 1.05],  # short row (< 6) -> skipped
+                    {"timestamp": 1_760_000_100, "open": 1.0},  # dict row -> skipped
+                    "bad_row",
+                    12345,
+                    [1_760_001_000, 1.05, 1.15, 1.02, 1.12, "bad_vol"],  # non-numeric vol -> skipped
+                ]
+            }
+        }
+    }
+    parsed = parse_geckoterminal_ohlcv(payload)
+    assert len(parsed) == 1
+    assert parsed[0] == {
+        "timestamp": 1_760_000_700.0,
+        "open": 1.0,
+        "high": 1.1,
+        "low": 0.95,
+        "close": 1.05,
+        "volume": 0.0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_c8_empty_200_with_existing_cache_preserves_prev_candles_and_last_ok_at():
+    clear_ohlcv_cache()
+    cfg = AgentConfig(_env_file=None, OHLCV_CACHE_SECONDS=90.0, OHLCV_PACING_DELAY_SECONDS=0.0)
+    pool = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
+    t0 = 1_760_001_000.0
+    good_payload = {"data": {"attributes": {"ohlcv_list": [[1_760_000_400, 1.0, 1.1, 0.95, 1.05, 500.0]]}}}
+    mode = {"payload": good_payload}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=mode["payload"])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        r_good = (await fetch_ohlcv_batch_with_provenance([pool], cfg, client, now_ts=t0))[pool]
+        assert r_good.source == "network_200" and r_good.last_ok_at == pytest.approx(t0)
+
+        # Empty 200 OK after expiry must preserve prev_candles & original last_ok_at, and remain ineligible!
+        mode["payload"] = {"data": {"attributes": {"ohlcv_list": []}}}
+        r_empty = (await fetch_ohlcv_batch_with_provenance([pool], cfg, client, now_ts=t0 + 100.0))[pool]
+        assert r_empty.source == "stale_error"
+        assert r_empty.last_ok_at == pytest.approx(t0)
+        assert r_empty.candles == r_good.candles
+        assert evaluate_ohlcv_provenance(r_empty, decision_timestamp=t0 + 100.0)[0] is False
+    clear_ohlcv_cache()
+
+
+@pytest.mark.asyncio
+async def test_c9_alpha_and_whale_reject_empty_invalid_200_and_accept_partial_valid_batch(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    from alpha_node import alpha_node
+    from db import AgentDatabase
+    from state import FocusState
+    from tests.test_breakout_ignition import _make_breakout_candles, _strong_flow_pair
+    from tests.test_e3b_cache_provenance import _StubBuyClient
+    from whale_lane import run_whale_lane_tick
+
+    clear_ohlcv_cache()
+    cfg = AgentConfig(
+        _env_file=None,
+        EXECUTION_MODE="paper",
+        WHALE_STRATEGY_ENABLED=True,
+        WHALE_MIN_LIQUIDITY_USD=20_000.0,
+        WHALE_MIN_MCAP_USD=50_000.0,
+        WHALE_MAX_MCAP_USD=10_000_000.0,
+        WHALE_MIN_BREAKOUT_SCORE=75,
+        WHALE_BLOCK_EXTENDED=True,
+        ENABLE_JUPITER_DISCOVERY=False,
+        OHLCV_PACING_DELAY_SECONDS=0.0,
+    )
+    bo = _make_breakout_candles(count=18, bar_seconds=300)
+    t0 = bo[-1]["timestamp"] + 300.0
+    now_dt = datetime.fromtimestamp(t0, tz=timezone.utc)
+    pool = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
+    mint = "MintE3CInt11111111111111111111111111111111"
+
+    # 1. Partial valid 200 (18 good bars + 1 malformed row) -> alpha_node approves BUY!
+    partial_rows = [[int(c["timestamp"]), c["open"], c["high"], c["low"], c["close"], c["volume"]] for c in bo]
+    partial_rows.append([int(t0 - 6000), "bad", 1.0, 0.9, 1.0, 100.0])
+
+    def partial_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {"attributes": {"ohlcv_list": partial_rows}}})
+
+    db_a = AgentDatabase(db_path=str(tmp_path / "e3c_alpha.duckdb"), starting_sol=1.0)
+    cand = {
+        "mint": mint,
+        "symbol": "E3C",
+        "pair_address": pool,
+        "added_at": (now_dt - timedelta(minutes=5)).isoformat(),
+        **_strong_flow_pair(1.12),
+    }
+    async with httpx.AsyncClient(transport=httpx.MockTransport(partial_handler)) as client:
+        out_a = await alpha_node(
+            {"focus_state": FocusState.SCANNING.value, "sol_balance": 1.0, "safe_candidates": [cand]},
+            config=cfg, db=db_a, decision_client=_StubBuyClient(), http_client=client, now=now_dt,
+        )
+    assert out_a["alpha_decisions"][0]["approved"] is True
+    db_a.close()
+
+    # 2. Empty 200 -> whale_lane still enters independent whale confluence without breaking
+    clear_ohlcv_cache()
+    db_w = AgentDatabase(db_path=str(tmp_path / "e3c_whale.duckdb"), starting_sol=2.0)
+    db_w.record_whale_event(
+        signature="e3c-w1", wallet="W1", mint=mint, side="BUY", sol_amount=2.0, token_amount=100.0,
+        timestamp_utc=(now_dt - timedelta(seconds=20)).isoformat(),
+    )
+    db_w.record_whale_event(
+        signature="e3c-w2", wallet="W2", mint=mint, side="BUY", sol_amount=2.0, token_amount=100.0,
+        timestamp_utc=(now_dt - timedelta(seconds=10)).isoformat(),
+    )
+    db_w.recompute_whale_signal(mint, ttl_minutes=30, now=now_dt)
+
+    def empty_whale_handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/tokens/v1/solana/" in url:
+            return httpx.Response(200, json=[{
+                "chainId": "solana", "pairAddress": pool,
+                "baseToken": {"address": mint, "symbol": "E3CW"},
+                "marketCap": 250_000, "liquidity": {"usd": 80_000},
+                "txns": {"m5": {"buys": 32, "sells": 14}, "h1": {"buys": 180, "sells": 120}},
+            }])
+        if "ohlcv" in url:
+            return httpx.Response(200, json={"data": {"attributes": {"ohlcv_list": []}}})
+        if "rugcheck.xyz" in url:
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/ultra/v1/shield" in url:
+            return httpx.Response(200, json={"warnings": {mint: []}})
+        if "/swap/v2/order" in url:
+            return httpx.Response(200, json={"outAmount": "1500000", "transaction": None})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(empty_whale_handler)) as client:
+        res_w = await run_whale_lane_tick(config=cfg, db=db_w, http_client=client, now=now_dt)
+    assert res_w["event"] == "WHALE_SCALP_CONFLUENCE_ENTERED"
+    clear_ohlcv_cache()
+    db_w.close()

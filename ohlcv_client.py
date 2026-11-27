@@ -11,7 +11,7 @@ from typing import Any, Literal, Optional
 
 import httpx
 
-from breakout_ignition import normalize_and_filter_candles
+from breakout_ignition import _parse_valid_candle, normalize_and_filter_candles
 from config import AgentConfig
 from memory_guard import prune_timestamped_cache
 
@@ -312,27 +312,47 @@ def _prune_ohlcv_cache(now_ts: float, config: AgentConfig) -> None:
     )
 
 
-def parse_geckoterminal_ohlcv(payload: dict[str, Any]) -> list[dict[str, float]]:
-    """Parse GeckoTerminal OHLCV JSON:API payload into oldest-first candle dicts."""
-    raw_list = (
-        ((payload.get("data") or {}).get("attributes") or {}).get("ohlcv_list")
-        or []
-    )
-    candles: list[dict[str, float]] = []
+def parse_geckoterminal_ohlcv_strict(payload: Any) -> tuple[list[dict[str, float]], bool, bool]:
+    """Parse GeckoTerminal OHLCV payload with strict structural & per-row validation.
+
+    Returns (deduplicated_oldest_first_candles, is_structurally_valid, had_raw_rows).
+    """
+    if not isinstance(payload, dict):
+        return [], False, False
+    data = payload.get("data")
+    if data is None:
+        return [], False, False
+    if not isinstance(data, dict):
+        return [], False, False
+    attrs = data.get("attributes")
+    if attrs is None:
+        return [], False, False
+    if not isinstance(attrs, dict):
+        return [], False, False
+
+    if "ohlcv_list" not in attrs or attrs.get("ohlcv_list") is None:
+        return [], True, False
+    raw_list = attrs.get("ohlcv_list")
+    if not isinstance(raw_list, list):
+        return [], False, False
+    if not raw_list:
+        return [], True, False
+
+    dedup: dict[float, dict[str, float]] = {}
     for row in raw_list:
         if not isinstance(row, (list, tuple)) or len(row) < 6:
             continue
-        candles.append(
-            {
-                "timestamp": float(row[0]),
-                "open": float(row[1]),
-                "high": float(row[2]),
-                "low": float(row[3]),
-                "close": float(row[4]),
-                "volume": float(row[5]),
-            }
-        )
-    candles.sort(key=lambda c: c["timestamp"])
+        parsed = _parse_valid_candle(row)
+        if parsed is not None:
+            dedup[parsed["timestamp"]] = parsed
+
+    candles = sorted(dedup.values(), key=lambda c: c["timestamp"])
+    return candles, True, True
+
+
+def parse_geckoterminal_ohlcv(payload: Any) -> list[dict[str, float]]:
+    """Parse GeckoTerminal OHLCV JSON:API payload into sanitized, deduplicated oldest-first candle dicts."""
+    candles, _, _ = parse_geckoterminal_ohlcv_strict(payload)
     return candles
 
 
@@ -456,7 +476,35 @@ async def _fetch_ohlcv_interval_with_provenance(
                 )
 
             resp.raise_for_status()
-            candles = parse_geckoterminal_ohlcv(resp.json())
+            candles, struct_ok, had_rows = parse_geckoterminal_ohlcv_strict(resp.json())
+            if not struct_ok or not candles:
+                entry_fetched_at = (entry or {}).get("fetched_at") or check_ts
+                rej_status = 200 if (struct_ok and not had_rows) else 0
+                rej_source: OhlcvSource = "unavailable" if (struct_ok and not had_rows and not prev_candles) else "stale_error"
+                _ohlcv_cache[cache_key] = {
+                    "fetched_at": entry_fetched_at,
+                    "last_ok_at": prev_ok_at,
+                    "candles": prev_candles,
+                    "last_ok": False,
+                    "last_status": rej_status,
+                }
+                _prune_ohlcv_cache(check_ts, config)
+                logger.warning(
+                    "[OHLCV] Rejected 200 payload (%sm) for pool %s.. (struct_ok=%s had_rows=%s); preserving %d cached candles",
+                    aggregate,
+                    addr[:8],
+                    struct_ok,
+                    had_rows,
+                    len(prev_candles),
+                )
+                return OhlcvFetchResult(
+                    candles=prev_candles,
+                    source=rej_source,
+                    fetched_at=entry_fetched_at,
+                    last_ok_at=prev_ok_at,
+                    last_status=rej_status,
+                )
+
             _global_429_errors = 0
             _global_backoff_until = 0.0
             _ohlcv_cache[cache_key] = {
