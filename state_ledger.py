@@ -414,100 +414,112 @@ def apply_trade_settlement(
 ) -> dict[str, Any]:
     """Atomically apply SOL/PnL deltas and upsert/remove the target position by (mint, opened_at) under db._lock."""
     with db._lock:
+        db._conn.execute("BEGIN TRANSACTION")
+        try:
+            sol_bal, _, daily_pnl, _ = rollover_daily_if_needed_locked(db._conn)
+            row = db._conn.execute(
+                "SELECT focus_state, active_position_json, whale_position_json, chart_positions_json, whale_positions_json FROM agent_state WHERE id = 1"
+            ).fetchone()
+            curr_focus = str(row[0])
+            act_p = json.loads(row[1]) if row[1] else None
+            wh_p = json.loads(row[2]) if row[2] else None
+            chart_list: list[dict[str, Any]] = json.loads(row[3]) if row[3] else []
+            whale_list: list[dict[str, Any]] = json.loads(row[4]) if row[4] else []
+
+            # Pristine-DB unit test compatibility when test jumps straight to SELL/PARTIAL_SELL without a prior BUY or save_state
+            if (
+                side.upper() != "BUY"
+                and fallback_base_sol is not None
+                and abs(sol_bal - float(db.starting_sol)) < 1e-9
+                and abs(daily_pnl) < 1e-9
+            ):
+                trade_cnt = int(db._conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] or 0)
+                if trade_cnt == 0:
+                    sol_bal = float(fallback_base_sol)
+                    daily_pnl = float(fallback_base_pnl or 0.0)
+
+            new_sol = round(max(0.0, sol_bal + float(sol_delta)), 6)
+            new_pnl = round(daily_pnl + float(pnl_delta), 6)
+
+            target_ref = {"mint": mint, "opened_at": opened_at or ""}
+            side_up = side.upper()
+            is_keep = side_up in ("BUY", "PARTIAL_SELL") and new_pos_dict is not None and int(new_pos_dict.get("token_amount") or 0) > 0
+
+            if lane == "whale":
+                kept = [p for p in whale_list if isinstance(p, dict) and not _pos_identity_match(p, target_ref)]
+                if is_keep and new_pos_dict is not None:
+                    kept.append(new_pos_dict)
+                kept = _merge_monotonic_shadow_flags(kept, whale_list)
+                legacy_wh = new_pos_dict if is_keep else (kept[0] if kept else None)
+                any_shadow = any(bool(p.get("whale_shadow_exit_flag", False)) for p in kept)
+                sets = [
+                    "whale_positions_json = ?", "whale_position_json = ?",
+                    "sol_balance = ?", "daily_pnl_sol = ?",
+                    "whale_shadow_exit_requested = ?", "updated_at = ?",
+                ]
+                params: list[Any] = [
+                    json.dumps(kept), json.dumps(legacy_wh) if legacy_wh is not None else None,
+                    new_sol, new_pnl, any_shadow, _utc_now_iso(),
+                ]
+                if last_decision_rationale is not None:
+                    sets.append("last_decision_rationale = ?")
+                    params.append(last_decision_rationale)
+                db._conn.execute(f"UPDATE agent_state SET {', '.join(sets)} WHERE id = 1", params)
+                result_payload = {
+                    "focus_state": curr_focus, "sol_balance": new_sol, "daily_pnl_sol": new_pnl,
+                    "active_position": act_p, "chart_positions": chart_list,
+                    "whale_position": legacy_wh, "whale_positions": kept,
+                }
+            else:
+                kept_c = [p for p in chart_list if isinstance(p, dict) and not _pos_identity_match(p, target_ref)]
+                if is_keep and new_pos_dict is not None:
+                    kept_c.append(new_pos_dict)
+                kept_c = _merge_monotonic_shadow_flags(kept_c, chart_list)
+
+                next_focus = focus_state or curr_focus
+                if new_pos_dict is not None and next_focus == FocusState.WATCHING_REENTRY.value:
+                    legacy_act = new_pos_dict
+                elif is_keep and new_pos_dict is not None:
+                    legacy_act = new_pos_dict
+                    next_focus = FocusState.IN_POSITION.value
+                elif kept_c:
+                    legacy_act = kept_c[0]
+                    next_focus = FocusState.IN_POSITION.value
+                else:
+                    legacy_act = new_pos_dict
+                    if legacy_act is None and next_focus != FocusState.WATCHING_REENTRY.value:
+                        next_focus = FocusState.SCANNING.value
+
+                sets_c = [
+                    "chart_positions_json = ?", "active_position_json = ?",
+                    "focus_state = ?", "sol_balance = ?", "daily_pnl_sol = ?", "updated_at = ?",
+                ]
+                params_c: list[Any] = [
+                    json.dumps(kept_c), json.dumps(legacy_act) if legacy_act is not None else None,
+                    next_focus, new_sol, new_pnl, _utc_now_iso(),
+                ]
+                if last_decision_rationale is not None:
+                    sets_c.append("last_decision_rationale = ?")
+                    params_c.append(last_decision_rationale)
+                db._conn.execute(f"UPDATE agent_state SET {', '.join(sets_c)} WHERE id = 1", params_c)
+                result_payload = {
+                    "focus_state": next_focus, "sol_balance": new_sol, "daily_pnl_sol": new_pnl,
+                    "active_position": legacy_act, "chart_positions": kept_c,
+                    "whale_position": wh_p, "whale_positions": whale_list,
+                }
+
+            db._conn.execute("COMMIT")
+        except BaseException:
+            try:
+                db._conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
+        # Release BUY reservation ONLY after DuckDB transaction commits, while still holding db._lock
         if reservation_id:
             release_buy_reservation(db, reservation_id)
-
-        sol_bal, _, daily_pnl, _ = rollover_daily_if_needed_locked(db._conn)
-        row = db._conn.execute(
-            "SELECT focus_state, active_position_json, whale_position_json, chart_positions_json, whale_positions_json FROM agent_state WHERE id = 1"
-        ).fetchone()
-        curr_focus = str(row[0])
-        act_p = json.loads(row[1]) if row[1] else None
-        wh_p = json.loads(row[2]) if row[2] else None
-        chart_list: list[dict[str, Any]] = json.loads(row[3]) if row[3] else []
-        whale_list: list[dict[str, Any]] = json.loads(row[4]) if row[4] else []
-
-        # Pristine-DB unit test compatibility when test jumps straight to SELL/PARTIAL_SELL without a prior BUY or save_state
-        if (
-            side.upper() != "BUY"
-            and fallback_base_sol is not None
-            and abs(sol_bal - float(db.starting_sol)) < 1e-9
-            and abs(daily_pnl) < 1e-9
-        ):
-            trade_cnt = int(db._conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] or 0)
-            if trade_cnt == 0:
-                sol_bal = float(fallback_base_sol)
-                daily_pnl = float(fallback_base_pnl or 0.0)
-
-        new_sol = round(max(0.0, sol_bal + float(sol_delta)), 6)
-        new_pnl = round(daily_pnl + float(pnl_delta), 6)
-
-        target_ref = {"mint": mint, "opened_at": opened_at or ""}
-        side_up = side.upper()
-        is_keep = side_up in ("BUY", "PARTIAL_SELL") and new_pos_dict is not None and int(new_pos_dict.get("token_amount") or 0) > 0
-
-        if lane == "whale":
-            kept = [p for p in whale_list if isinstance(p, dict) and not _pos_identity_match(p, target_ref)]
-            if is_keep and new_pos_dict is not None:
-                kept.append(new_pos_dict)
-            kept = _merge_monotonic_shadow_flags(kept, whale_list)
-            legacy_wh = new_pos_dict if is_keep else (kept[0] if kept else None)
-            any_shadow = any(bool(p.get("whale_shadow_exit_flag", False)) for p in kept)
-            sets = [
-                "whale_positions_json = ?", "whale_position_json = ?",
-                "sol_balance = ?", "daily_pnl_sol = ?",
-                "whale_shadow_exit_requested = ?", "updated_at = ?",
-            ]
-            params: list[Any] = [
-                json.dumps(kept), json.dumps(legacy_wh) if legacy_wh is not None else None,
-                new_sol, new_pnl, any_shadow, _utc_now_iso(),
-            ]
-            if last_decision_rationale is not None:
-                sets.append("last_decision_rationale = ?")
-                params.append(last_decision_rationale)
-            db._conn.execute(f"UPDATE agent_state SET {', '.join(sets)} WHERE id = 1", params)
-            return {
-                "focus_state": curr_focus, "sol_balance": new_sol, "daily_pnl_sol": new_pnl,
-                "active_position": act_p, "chart_positions": chart_list,
-                "whale_position": legacy_wh, "whale_positions": kept,
-            }
-
-        kept_c = [p for p in chart_list if isinstance(p, dict) and not _pos_identity_match(p, target_ref)]
-        if is_keep and new_pos_dict is not None:
-            kept_c.append(new_pos_dict)
-        kept_c = _merge_monotonic_shadow_flags(kept_c, chart_list)
-
-        next_focus = focus_state or curr_focus
-        if new_pos_dict is not None and next_focus == FocusState.WATCHING_REENTRY.value:
-            legacy_act = new_pos_dict
-        elif is_keep and new_pos_dict is not None:
-            legacy_act = new_pos_dict
-            next_focus = FocusState.IN_POSITION.value
-        elif kept_c:
-            legacy_act = kept_c[0]
-            next_focus = FocusState.IN_POSITION.value
-        else:
-            legacy_act = new_pos_dict
-            if legacy_act is None and next_focus != FocusState.WATCHING_REENTRY.value:
-                next_focus = FocusState.SCANNING.value
-
-        sets_c = [
-            "chart_positions_json = ?", "active_position_json = ?",
-            "focus_state = ?", "sol_balance = ?", "daily_pnl_sol = ?", "updated_at = ?",
-        ]
-        params_c: list[Any] = [
-            json.dumps(kept_c), json.dumps(legacy_act) if legacy_act is not None else None,
-            next_focus, new_sol, new_pnl, _utc_now_iso(),
-        ]
-        if last_decision_rationale is not None:
-            sets_c.append("last_decision_rationale = ?")
-            params_c.append(last_decision_rationale)
-        db._conn.execute(f"UPDATE agent_state SET {', '.join(sets_c)} WHERE id = 1", params_c)
-        return {
-            "focus_state": next_focus, "sol_balance": new_sol, "daily_pnl_sol": new_pnl,
-            "active_position": legacy_act, "chart_positions": kept_c,
-            "whale_position": wh_p, "whale_positions": whale_list,
-        }
+        return result_payload
 
 
 def update_lane_positions_only(

@@ -449,3 +449,86 @@ async def test_e4c_concurrent_buys_rpc_outside_lock_and_release_on_prebroadcast_
         assert get_inflight_buy_reservations(str(db.db_path)) == []
         assert (r1 == {"pending_order": None}) ^ (r2 == {"pending_order": None})
     db.close()
+
+
+@pytest.mark.asyncio
+async def test_e4c_post_broadcast_settlement_failure_retains_reservation_and_rolls_back_db(tmp_path, monkeypatch):
+    """Post-broadcast DuckDB settlement failure rolls back DB, keeps reservation, marks BROADCAST_UNRESOLVED, and blocks duplicate BUY."""
+    clear_buy_reservations()
+    clear_sell_idempotency_guard()
+    kp = Keypair()
+    unsigned_tx = _mk_unsigned_tx(kp)
+    db = AgentDatabase(db_path=str(tmp_path / "e4c_settle_fail.duckdb"), starting_sol=2.0)
+    cfg = AgentConfig(
+        _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
+        SOLANA_RPC_URL=RPC_URL, MAX_CHART_POSITIONS=3,
+    )
+
+    # 1. Direct apply_trade_settlement failure: reservation stays present and DB rolls back cleanly
+    res_id, rej = db.reserve_buy_slot(
+        lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.01,
+        max_lane_positions=3, max_open_positions=6,
+    )
+    assert res_id is not None and rej is None
+
+    import state_ledger
+    orig_merge = state_ledger._merge_monotonic_shadow_flags
+
+    def _boom_merge(*args, **kwargs):
+        raise RuntimeError("simulated DuckDB settlement failure")
+
+    monkeypatch.setattr(state_ledger, "_merge_monotonic_shadow_flags", _boom_merge)
+    with pytest.raises(RuntimeError, match="simulated DuckDB settlement failure"):
+        state_ledger.apply_trade_settlement(
+            db, lane="chart", side="BUY", mint=MINT_A, opened_at="2026-11-27T16:00:00+00:00",
+            new_pos_dict={"mint": MINT_A, "symbol": "E4C", "token_amount": 1_000_000},
+            sol_delta=-0.50, pnl_delta=0.0, focus_state=FocusState.IN_POSITION.value,
+            reservation_id=res_id,
+        )
+    # Reservation MUST still be present after failed settlement; DB MUST be rolled back
+    assert len(get_inflight_buy_reservations(str(db.db_path))) == 1
+    assert db.get_state()["sol_balance"] == pytest.approx(2.0)
+    assert db.get_state()["chart_positions"] == []
+    db.release_buy_reservation(res_id)
+
+    # 2. End-to-end live executor_node post-broadcast settlement failure -> transitions to BROADCAST_UNRESOLVED
+    def _ok_handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith(RPC_URL):
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
+        if "/swap/v2/order" in str(request.url):
+            return httpx.Response(200, json={"outAmount": "1000000", "transaction": unsigned_tx, "requestId": "req-sf"})
+        return httpx.Response(200, json={"signature": "SigSettleFail111", "outputAmountResult": "1000000"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_ok_handler)) as client:
+        with pytest.raises(RuntimeError, match="simulated DuckDB settlement failure"):
+            await executor_node(
+                {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order(mint=MINT_A)},
+                config=cfg, db=db, http_client=client,
+            )
+
+    inflight = get_inflight_buy_reservations(str(db.db_path))
+    assert len(inflight) == 1
+    assert inflight[0]["state"] == RESERVATION_STATE_BROADCAST_UNRESOLVED
+    assert db.get_state()["sol_balance"] == pytest.approx(2.0)
+    assert db.get_state()["chart_positions"] == []
+
+    # Subsequent duplicate BUY on MINT_A must remain blocked
+    res_dup, rej_dup = db.reserve_buy_slot(
+        lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.01,
+        max_lane_positions=3, max_open_positions=6,
+    )
+    assert res_dup is None and rej_dup is not None and "DUPLICATE_MINT" in rej_dup
+
+    # 3. Restore settlement & verify a successful BUY on MINT_B releases its reservation cleanly
+    monkeypatch.setattr(state_ledger, "_merge_monotonic_shadow_flags", orig_merge)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_ok_handler)) as client:
+        out_ok = await executor_node(
+            {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order(mint=MINT_B, symbol="B", pair_address=POOL_B)},
+            config=cfg, db=db, http_client=client,
+        )
+    assert len(out_ok["chart_positions"]) == 1
+    assert out_ok["chart_positions"][0]["mint"] == MINT_B
+    # Only MINT_A's BROADCAST_UNRESOLVED reservation remains; MINT_B's reservation was released on success
+    remaining = get_inflight_buy_reservations(str(db.db_path))
+    assert len(remaining) == 1 and remaining[0]["mint"] == MINT_A
+    db.close()
