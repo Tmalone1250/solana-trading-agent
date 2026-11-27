@@ -227,7 +227,8 @@ async def test_disabled_watching_reentry_abandons_early_without_http_and_preserv
                     "txns": {"m5": {"buys": 5, "sells": 15}},
                 },
                 {
-                    "chainId": "solana", "baseToken": {"address": "MintOpenHold", "symbol": "OPHD"},
+                    "chainId": "solana", "pairAddress": "QWmroo4YnnMqYW3cnxWkFdaTxGD3P7vMSzwMHGbUzwF", "dexId": "pumpswap",
+                    "baseToken": {"address": "MintOpenHold", "symbol": "OPHD"},
                     "priceNative": "0.52", "priceUsd": "0.104", "liquidity": {"usd": 85_000.0},
                     "txns": {"m5": {"buys": 16, "sells": 10}},
                 },
@@ -259,6 +260,7 @@ async def test_disabled_watching_reentry_abandons_early_without_http_and_preserv
     open_exit_2 = {**open_pos, "opened_at": (now_dt - timedelta(minutes=1)).isoformat()}
     open_hold = ActivePosition(
         mint="MintOpenHold", symbol="OPHD", entry_sol=0.50, token_amount=1_000_000,
+        pair_address="QWmroo4YnnMqYW3cnxWkFdaTxGD3P7vMSzwMHGbUzwF", dex_id="pumpswap",
         entry_liquidity_usd=85_000.0, current_sol_value=0.52, peak_sol_value=0.52,
         opened_at=(now_dt - timedelta(minutes=3)).isoformat(), strategy="BREAKOUT_IGNITION",
     ).model_dump()

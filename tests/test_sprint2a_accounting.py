@@ -122,11 +122,12 @@ async def test_paper_partial_sell_jupiter_fallback_scales_by_frac_and_monitor_tr
         if "/price/v3" in url:
             return httpx.Response(200, json={SOL_MINT: {"usdPrice": 200.0, "decimals": 9}})  # omits mint -> dexscreener_native
         if "/tokens/v1/solana/" in url:
-            return httpx.Response(200, json=[{"chainId": "solana", "baseToken": {"address": mint, "symbol": "MFE"}, "priceNative": f"{price_native['val']:.6f}", "liquidity": {"usd": 90_000.0}, "txns": {"m5": {"buys": 30, "sells": 10}}}])
+            return httpx.Response(200, json=[{"chainId": "solana", "pairAddress": "LbUiWL3xVV8hTFYBVdbTNrpDo41NKS6o3LHHuDzjfcY", "dexId": "pumpswap", "baseToken": {"address": mint, "symbol": "MFE"}, "priceNative": f"{price_native['val']:.6f}", "liquidity": {"usd": 90_000.0}, "txns": {"m5": {"buys": 30, "sells": 10}}}])
         return httpx.Response(404)
 
     pos = ActivePosition(
         mint=mint, symbol="MFE", entry_sol=0.50, token_amount=1_000_000,
+        pair_address="LbUiWL3xVV8hTFYBVdbTNrpDo41NKS6o3LHHuDzjfcY", dex_id="pumpswap",
         strategy="SCALPER", current_sol_value=0.50, peak_sol_value=0.50, reference_token_amount=1_000_000,
     ).model_dump()
     st = {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 0.50, "daily_pnl_sol": 0.0, "active_position": pos, "chart_positions": [pos]}

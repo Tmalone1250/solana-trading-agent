@@ -206,6 +206,8 @@ async def test_jupiter_raw_price_impact_persisted_without_altering_fills(tmp_pat
         side="BUY",
         mint="MintImpact11111111111111111111111111111111",
         symbol="IMP",
+        pair_address="4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi",
+        dex_id="pumpswap",
         amount_atomic=500_000_000,
         reason="DECISION_1_ENTRY",
         target_state_after_fill=FocusState.IN_POSITION,
@@ -394,14 +396,15 @@ async def test_graph_multi_slot_chart_routing_scans_below_cap_and_stops_at_cap(t
 
     pos1 = ActivePosition(
         mint=mint_open, symbol="OPEN1", entry_sol=0.50, token_amount=1_000_000,
+        pair_address="4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi", dex_id="pumpswap",
         strategy="BREAKOUT_IGNITION", opened_at=now_dt.isoformat(),
         current_sol_value=0.50, peak_sol_value=0.50, reference_token_amount=1_000_000,
         entry_liquidity_usd=80_000.0,
     ).model_dump()
     db.save_lane_positions(lane="chart", positions=[pos1], sol_balance=1.50, daily_pnl_sol=0.0, focus_state=FocusState.IN_POSITION.value, active_position=pos1)
     # Seed 1 stale watchlist entry (>15m) and 1 soaked candidate ready for Chart slot 2
-    db.upsert_watchlist_entry(mint=mint_stale, symbol="STALE", pair_address="PoolStale", candidate={"mint": mint_stale, "symbol": "STALE"}, added_at=(now_dt - timedelta(minutes=25)).isoformat())
-    db.upsert_watchlist_entry(mint=mint_new, symbol="NEW2", pair_address="PoolNew2", candidate={"mint": mint_new, "symbol": "NEW2"}, added_at=(now_dt - timedelta(minutes=5)).isoformat())
+    db.upsert_watchlist_entry(mint=mint_stale, symbol="STALE", pair_address="8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR", candidate={"mint": mint_stale, "symbol": "STALE"}, added_at=(now_dt - timedelta(minutes=25)).isoformat())
+    db.upsert_watchlist_entry(mint=mint_new, symbol="NEW2", pair_address="CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8", candidate={"mint": mint_new, "symbol": "NEW2"}, added_at=(now_dt - timedelta(minutes=5)).isoformat())
 
     sweep_ohlcv = [[c["timestamp"], c["open"], c["high"], c["low"], c["close"], c["volume"]] for c in make_sweep_reclaim_candles()]
     stub_dec = CountingStubDecisionClient({
@@ -426,9 +429,9 @@ async def test_graph_multi_slot_chart_routing_scans_below_cap_and_stops_at_cap(t
             return httpx.Response(200, json={"data": {"attributes": {"ohlcv_list": sweep_ohlcv}}})
         if "/tokens/v1/solana/" in url:
             return httpx.Response(200, json=[
-                {"chainId": "solana", "pairAddress": "PoolOpen1", "baseToken": {"address": mint_open, "symbol": "OPEN1"}, "priceNative": "0.51", "marketCap": 100_000, "liquidity": {"usd": 80_000}, "volume": {"h1": 80_000, "m5": 12_000}, "txns": {"m5": {"buys": 35, "sells": 10}}},
-                {"chainId": "solana", "pairAddress": "PoolNew2", "baseToken": {"address": mint_new, "symbol": "NEW2"}, "priceNative": "0.50", "marketCap": 100_000, "liquidity": {"usd": 60_000}, "volume": {"h1": 90_000, "m5": 15_000}, "txns": {"m5": {"buys": 40, "sells": 10}}},
-                {"chainId": "solana", "pairAddress": "PoolOpen3", "baseToken": {"address": "MintOpenSlot3333333333333333333333333333333", "symbol": "OPEN3"}, "priceNative": "0.51", "marketCap": 100_000, "liquidity": {"usd": 80_000}, "volume": {"h1": 80_000, "m5": 12_000}, "txns": {"m5": {"buys": 35, "sells": 10}}},
+                {"chainId": "solana", "pairAddress": "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi", "baseToken": {"address": mint_open, "symbol": "OPEN1"}, "priceNative": "0.51", "marketCap": 100_000, "liquidity": {"usd": 80_000}, "volume": {"h1": 80_000, "m5": 12_000}, "txns": {"m5": {"buys": 35, "sells": 10}}},
+                {"chainId": "solana", "pairAddress": "CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8", "baseToken": {"address": mint_new, "symbol": "NEW2"}, "priceNative": "0.50", "marketCap": 100_000, "liquidity": {"usd": 60_000}, "volume": {"h1": 90_000, "m5": 15_000}, "txns": {"m5": {"buys": 40, "sells": 10}}},
+                {"chainId": "solana", "pairAddress": "GgBaCs3NCBuZN12kCJgAW63ydqohFkHEdfdEXBPzLHq", "baseToken": {"address": "MintOpenSlot3333333333333333333333333333333", "symbol": "OPEN3"}, "priceNative": "0.51", "marketCap": 100_000, "liquidity": {"usd": 80_000}, "volume": {"h1": 80_000, "m5": 12_000}, "txns": {"m5": {"buys": 35, "sells": 10}}},
             ])
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})

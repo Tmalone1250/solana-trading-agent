@@ -48,9 +48,9 @@ def _make_monitor_client(
         if "/tokens/v1/solana/" in str(request.url):
             req_mint = str(request.url).rsplit("/", 1)[-1].split(",")[0]
             pair_addr = (
-                "PoolWatchEx1111111111111111111111111111111"
+                "cGfHiC6Kgg3FpFZvgwGcswsCRtp4aBP2fzuXRQPizuN"
                 if req_mint == "MintWatchEx11111111111111111111111111111111"
-                else "PoolFocus111111111111111111111111111111111"
+                else "gBxS1f6uyyGPuW5MzGBukidSb71jdsCb5fZaoSzULE5"
             )
             return httpx.Response(
                 200,
@@ -77,7 +77,7 @@ def _base_in_position(entry_sol: float = 0.5) -> dict[str, Any]:
     return ActivePosition(
         mint="MintFocus1111111111111111111111111111111111",
         symbol="FOCUS",
-        pair_address="PoolFocus111111111111111111111111111111111",
+        pair_address="gBxS1f6uyyGPuW5MzGBukidSb71jdsCb5fZaoSzULE5",
         dex_id="pumpswap",
         entry_sol=entry_sol,
         token_amount=1_000_000,
@@ -232,7 +232,7 @@ async def test_exodus_bleed_and_timeout_abandonment(tmp_path):
     watch_pos = ActivePosition(
         mint="MintWatchEx11111111111111111111111111111111",
         symbol="WEX",
-        pair_address="PoolWatchEx1111111111111111111111111111111",
+        pair_address="cGfHiC6Kgg3FpFZvgwGcswsCRtp4aBP2fzuXRQPizuN",
         dex_id="pumpswap",
         entry_sol=0.5,
         token_amount=0,
@@ -426,7 +426,7 @@ async def test_reentry_anti_chase_aborts_if_price_rips_during_decision_1(tmp_pat
     watch_pos = ActivePosition(
         mint="MintJensen111111111111111111111111111111111",
         symbol="JENSEN",
-        pair_address="PoolJensen11111111111111111111111111111111",
+        pair_address="k7FaK87WHGVXzkaoHb7CdVPgkKDQhZ29VLDeBVbDfYn",
         dex_id="pumpswap",
         entry_sol=0.5,
         token_amount=0,
@@ -452,7 +452,7 @@ async def test_reentry_anti_chase_aborts_if_price_rips_during_decision_1(tmp_pat
             json=[
                 {
                     "chainId": "solana",
-                    "pairAddress": "PoolJensen11111111111111111111111111111111",
+                    "pairAddress": "k7FaK87WHGVXzkaoHb7CdVPgkKDQhZ29VLDeBVbDfYn",
                     "dexId": "pumpswap",
                     "baseToken": {"address": "MintJensen111111111111111111111111111111111"},
                     "liquidity": {"usd": 100_000.0},

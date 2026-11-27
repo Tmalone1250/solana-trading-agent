@@ -42,12 +42,17 @@ async def test_3x3_dual_lane_caps_and_duplicate_mint_rejection(tmp_path):
         return httpx.Response(200, json={"outAmount": "1000000", "transaction": None})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(jup_handler)) as client:
+        chart_pools = [
+            "LbUiWL3xVV8hTFYBVdbTNrpDo41NKS6o3LHHuDzjfcY",
+            "QWmroo4YnnMqYW3cnxWkFdaTxGD3P7vMSzwMHGbUzwF",
+            "US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELFx",
+        ]
         # Open 3 Chart positions -> all 3 succeed
         for i in range(3):
             st = db.get_state()
             order = PendingOrder(
                 side="BUY", mint=f"MintChart{i}", symbol=f"CH{i}",
-                pair_address=f"PoolChart{i}", dex_id="pumpswap",
+                pair_address=chart_pools[i], dex_id="pumpswap",
                 amount_atomic=int(0.5 * LAMPORTS_PER_SOL), reason="DECISION_1_ENTRY",
                 target_state_after_fill=FocusState.IN_POSITION, strategy="BREAKOUT_IGNITION",
             )
@@ -273,7 +278,7 @@ async def test_jupiter_v3_flat_schema_dexscreener_pricenative_fallback_and_telem
                     },
                     {
                         "chainId": "solana",
-                        "pairAddress": "PoolShit1111111111111111111111111111111111",
+                        "pairAddress": "YMN9Qj5jPNp7j14VPcML1B6xGgcPWVZUGLFU3Mnyfaf",
                         "dexId": "pumpswap",
                         "baseToken": {"address": mint_meme, "symbol": "SHIT"},
                         "priceNative": "0.0000535",  # 10,000 tokens * 0.0000535 = 0.535 SOL (+7.0% vs 0.50 entry)
@@ -302,7 +307,7 @@ async def test_jupiter_v3_flat_schema_dexscreener_pricenative_fallback_and_telem
             side="BUY",
             mint=mint_meme,
             symbol="SHIT",
-            pair_address="PoolShit1111111111111111111111111111111111",
+            pair_address="YMN9Qj5jPNp7j14VPcML1B6xGgcPWVZUGLFU3Mnyfaf",
             dex_id="pumpswap",
             amount_atomic=int(0.50 * LAMPORTS_PER_SOL),
             reason="DECISION_1_ENTRY",

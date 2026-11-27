@@ -53,6 +53,38 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
+def _resolve_pool_identity(
+    cand: dict[str, Any],
+    wl_entry: dict[str, Any],
+    *,
+    mint: str,
+    symbol: str,
+) -> tuple[Optional[str], Optional[str], bool]:
+    """Resolve (pair_address, dex_id) as a single atomic pool identity tuple.
+
+    When a valid pinned watchlist identity exists, preserve its (pair_address, dex_id)
+    and never mix its pair_address with an unrelated candidate pool's dex_id.
+    Returns (pair_address, dex_id, identity_disagreement).
+    """
+    wl_pair = str(wl_entry.get("pair_address") or "").strip()
+    wl_dex = str(wl_entry.get("dex_id") or "").strip() or None
+    cand_pair = str(cand.get("pair_address") or "").strip()
+    cand_dex = str(cand.get("dex_id") or "").strip() or None
+
+    if is_valid_pool_address(wl_pair, mint=mint):
+        disagreement = bool(cand_pair and cand_pair != wl_pair)
+        if disagreement:
+            logger.warning(
+                "[Alpha] $%s pool identity disagreement: preserving pinned watchlist pool %s (%s) over candidate pool %s (%s)",
+                symbol, wl_pair[:8], wl_dex or "unknown", cand_pair[:8], cand_dex or "unknown",
+            )
+            return wl_pair, wl_dex, True
+        resolved_dex = wl_dex if wl_dex is not None else (cand_dex if cand_pair == wl_pair else None)
+        return wl_pair, resolved_dex, False
+
+    return (cand_pair or None), cand_dex, False
+
+
 async def alpha_node(
     state: AgentGraphState,
     *,
@@ -198,7 +230,9 @@ async def alpha_node(
     enabled_strats = config.chart_enabled_strategies()
     leg2_enabled = "LEG2_ENTRY" in enabled_strats
     decisions: list[AlphaDecision] = []
-    approved_pairs: list[tuple[AlphaDecision, dict[str, Any], bool, float, str, Optional[dict[str, Any]]]] = []
+    approved_pairs: list[
+        tuple[AlphaDecision, dict[str, Any], bool, float, str, Optional[dict[str, Any]], Optional[str], Optional[str]]
+    ] = []
 
     for idx, (cand, leg2, scalper) in enumerate(zip(safe_candidates, leg2_results, scalper_results)):
         prefix = f"t{idx}"
@@ -228,12 +262,9 @@ async def alpha_node(
             )
         )
         wl_entry = watchlist_by_mint.get(cand["mint"]) or {}
-        cand_pair_address = str(
-            cand.get("pair_address") or wl_entry.get("pair_address") or ""
-        ).strip()
-        cand_dex_id = str(
-            cand.get("dex_id") or wl_entry.get("dex_id") or ""
-        ).strip() or None
+        cand_pair_address, cand_dex_id, pool_identity_disagreement = _resolve_pool_identity(
+            cand, wl_entry, mint=cand["mint"], symbol=cand.get("symbol", "UNKNOWN")
+        )
 
         setup_enabled = scalper.setup_type in enabled_strats
         decision1_wants_buy = standard_approved or leg2_fast_track
@@ -278,6 +309,7 @@ async def alpha_node(
             "pair_address": cand_pair_address or None,
             "dex_id": cand_dex_id,
             "pool_identity_rejected": pool_identity_rejected,
+            "pool_identity_disagreement": pool_identity_disagreement,
             "narrative_cache_hit": c_hit,
             "narrative_cached_at": c_at,
             "momentum_source": "live_metrics" if c_hit else "gemini_decision_1",
@@ -367,7 +399,11 @@ async def alpha_node(
                 rsi_5m=scalper.rsi_5m, setup_type=scalper.setup_type, scalper_eligible=scalper.eligible,
                 dist_from_1h_high_pct=scalper.dist_from_1h_high_pct,
             )
-            approved_pairs.append((dec, cand, leg2_fast_track and not standard_approved, leg2_score, scalper.setup_type, scalper.breakout_telemetry))
+            approved_pairs.append((
+                dec, cand, leg2_fast_track and not standard_approved, leg2_score,
+                scalper.setup_type, scalper.breakout_telemetry,
+                cand_pair_address, cand_dex_id,
+            ))
             continue
 
         if decision1_wants_buy and not scalper.eligible:
@@ -474,11 +510,8 @@ async def alpha_node(
         ),
         reverse=True,
     )
-    winner, winner_cand, is_leg2_only, _, winner_setup, winner_bt = approved_pairs[0]
+    winner, winner_cand, is_leg2_only, _, winner_setup, winner_bt, winner_pair, winner_dex = approved_pairs[0]
     winner_mc = round(float(winner_cand.get("market_cap_usd") or 0.0), 2) or None
-    winner_wl = watchlist_by_mint.get(winner.mint) or {}
-    winner_pair = str(winner_cand.get("pair_address") or winner_wl.get("pair_address") or "").strip() or None
-    winner_dex = str(winner_cand.get("dex_id") or winner_wl.get("dex_id") or "").strip() or None
 
     order = PendingOrder(
         side="BUY",

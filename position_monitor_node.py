@@ -82,6 +82,9 @@ async def position_monitor_node(
 
     # Only fetch market data for active positions (+ watcher ONLY if LEG2_ENTRY is enabled)
     all_mints = list(dict.fromkeys([cp.mint for cp in open_chart_positions] + ([primary_pos.mint] if (primary_is_watch and leg2_enabled) else [])))
+    pinned_pools: dict[str, Optional[str]] = {cp.mint: cp.pair_address for cp in open_chart_positions}
+    if primary_is_watch and leg2_enabled and primary_pos.mint not in pinned_pools:
+        pinned_pools[primary_pos.mint] = primary_pos.pair_address
     now_dt = now or utc_now()
     owns_client = http_client is None
     client = http_client or httpx.AsyncClient()
@@ -90,7 +93,9 @@ async def position_monitor_node(
     daily_pnl_sol = float(state.get("daily_pnl_sol") if "daily_pnl_sol" in state else st_latest.get("daily_pnl_sol") or 0.0)
 
     try:
-        sol_prices, dex_flow = await fetch_batched_sol_prices(all_mints, config, client, now_ts=now_dt.timestamp())
+        sol_prices, dex_flow = await fetch_batched_sol_prices(
+            all_mints, config, client, now_ts=now_dt.timestamp(), pinned_pools=pinned_pools
+        )
 
         # Evaluate EVERY open Chart slot (Slots 1, 2, and 3) independently with full 5-layer exit protection
         triggered_exits: list[tuple[int, int, ActivePosition, PendingOrder, str]] = []

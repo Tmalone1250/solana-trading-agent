@@ -195,7 +195,7 @@ async def test_coiling_base_retention_and_breakout_ignition_csv_logging(tmp_path
     bo_mint = "MintBreakout1111111111111111111111111111111"
     bo_cand = {
         "mint": bo_mint, "symbol": "IGNITE",
-        "pair_address": "PoolIgnite11111111111111111111111111111111",
+        "pair_address": "8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR",
         "dex_id": "pumpswap",
         "added_at": (now_dt - timedelta(minutes=5)).isoformat(),
         "candles_5m": _make_breakout_candles(count=18),

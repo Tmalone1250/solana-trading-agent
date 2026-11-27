@@ -6,10 +6,12 @@ from enum import Enum
 from typing import Any, Optional, TypedDict
 
 from pydantic import BaseModel, Field, model_validator
+from solders.pubkey import Pubkey
 
 _INVALID_POOL_PLACEHOLDERS: frozenset[str] = frozenset(
     {"", "none", "null", "unknown", "n/a", "na", "undefined"}
 )
+_SYSTEM_PROGRAM_ID: str = str(Pubkey.default())
 
 
 def is_valid_pool_address(
@@ -17,17 +19,23 @@ def is_valid_pool_address(
     *,
     mint: Optional[str] = None,
 ) -> bool:
-    """Return True iff `pair_address` is a non-empty, non-placeholder pool identifier distinct from `mint`."""
+    """Return True iff `pair_address` is a valid 32-byte Base58 Solana public key distinct from `mint`."""
     if not isinstance(pair_address, str):
         return False
-    cleaned = pair_address.strip()
-    if len(cleaned) < 4 or cleaned.lower() in _INVALID_POOL_PLACEHOLDERS:
+    if any(ch.isspace() for ch in pair_address):
         return False
-    if any(ch.isspace() for ch in cleaned):
+    cleaned = pair_address.strip()
+    if not cleaned or cleaned.lower() in _INVALID_POOL_PLACEHOLDERS:
+        return False
+    if cleaned == _SYSTEM_PROGRAM_ID:
         return False
     if mint and cleaned == str(mint).strip():
         return False
-    return True
+    try:
+        parsed = Pubkey.from_string(cleaned)
+    except Exception:
+        return False
+    return len(bytes(parsed)) == 32 and str(parsed) == cleaned
 
 
 class FocusState(str, Enum):

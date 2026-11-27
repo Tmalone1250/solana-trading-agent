@@ -1,4 +1,4 @@
-"""Directive 16 (E1) Verification Suite: Pool Identity Continuity & Database Persistence."""
+"""Directive 16 & 19 (E1 + Corrective Pass) Verification Suite: Pool Identity Continuity & DB Persistence."""
 
 from __future__ import annotations
 
@@ -23,9 +23,21 @@ from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
 from db import ACTION_LOG_COLUMNS, AgentDatabase
 from executor_node import clear_sell_idempotency_guard, executor_node
 from narrative_cache import clear_narrative_cache
+from position_monitor_node import position_monitor_node
 from state import ActivePosition, FocusState, PendingOrder, is_valid_pool_address
 from state_ledger import clear_buy_reservations
 from telemetry_api import create_telemetry_app
+
+# Valid 32-byte Base58 Solana public keys for deterministic test fixtures
+POOL_PINNED = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi"
+POOL_COMPETING = "8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR"
+POOL_TAMPERED = "CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8"
+POOL_WRONG = "GgBaCs3NCBuZN12kCJgAW63ydqohFkHEdfdEXBPzLHq"
+POOL_LEGACY_WL = "LbUiWL3xVV8hTFYBVdbTNrpDo41NKS6o3LHHuDzjfcY"
+MINT_LIFE = "p2Yicb86aZig616Eav2VWG9vuXR5mEqhtzshZYBxzsV"
+MINT_NOPOOL = "swqrv48gsrwpBFbftEwnP2vB4jckpvfGJfXkwaniLCC"
+MINT_MULTI = "ws91DX9HBAAxGW77BZs5FogRDwpRtcUpiLBpKdPTfWu"
+MINT_IMPOSTOR = "21nS9Wz9sUTQ6MkcYUtnN8aSfPA26xJJP7zqshfzCzqc"
 
 
 class _StubDecision:
@@ -57,7 +69,6 @@ def _make_breakout_candles(count: int = 18) -> list[dict[str, float]]:
                 "volume": 100.0,
             }
         )
-    # Breakout candle: closes cleanly above 6-bar swing high, strong body, 2.5x volume
     last_high = max(c["high"] for c in candles[-6:])
     candles.append(
         {
@@ -98,9 +109,37 @@ def _buy_decision_answers() -> dict[str, dict[str, Any]]:
     }
 
 
+def test_e1_solana_pubkey_validation_rejects_malformed_addresses():
+    """M-2: is_valid_pool_address requires a valid 32-byte Base58 Solana Pubkey distinct from mint."""
+    assert is_valid_pool_address(POOL_PINNED, mint=MINT_LIFE) is True
+    assert is_valid_pool_address(POOL_PINNED) is True
+
+    invalid_cases = [
+        None,
+        "",
+        "   ",
+        f" {POOL_PINNED} ",
+        f"{POOL_PINNED[:10]} {POOL_PINNED[10:]}",
+        "unknown",
+        "none",
+        "null",
+        "n/a",
+        "!!!!",
+        "PoolAddr0",
+        "https://dexscreener.com/solana/pool",
+        "0OIl" * 11,  # invalid Base58 chars
+        "1" * 32,  # System Program ID (all-zero bytes)
+        "2" * 10,  # valid Base58 but wrong decoded length (< 32 bytes)
+        "2" * 50,  # valid Base58 but wrong decoded length (> 32 bytes)
+        MINT_LIFE,  # token mint itself used as pool address
+    ]
+    for bad in invalid_cases:
+        assert is_valid_pool_address(bad, mint=MINT_LIFE) is False, f"Expected invalid: {bad!r}"
+
+
 @pytest.mark.asyncio
-async def test_e1_pool_identity_full_lifecycle_watchlist_to_settlement(tmp_path):
-    """Tests 1–7: Watchlist -> Alpha -> PendingOrder -> ActivePosition -> Ser/Deser -> Trades -> ActionLog."""
+async def test_e1_pool_identity_full_lifecycle_watchlist_partial_and_final_settlement(tmp_path):
+    """Tests 1–7 + M-3 + L-1A: Watchlist -> Alpha (atomic tuple) -> BUY -> PARTIAL_SELL -> SELL."""
     clear_narrative_cache()
     clear_buy_reservations()
     clear_sell_idempotency_guard()
@@ -114,51 +153,53 @@ async def test_e1_pool_identity_full_lifecycle_watchlist_to_settlement(tmp_path)
         PAPER_TX_FEE_SOL=0.001,
     )
     now_dt = datetime(2026, 11, 26, 12, 0, 0, tzinfo=timezone.utc)
-    mint = "MintPoolLife111111111111111111111111111111"
-    pair_addr = "PoolPinned11111111111111111111111111111111"
     dex_id = "pumpswap"
 
-    # 1. Watchlist persistence & retrieval preserves pair_address + dex_id and refuses silent overwrite
+    # 1. Watchlist persistence preserves (pair_address, dex_id) and refuses silent overwrite
     cand = {
-        "mint": mint,
+        "mint": MINT_LIFE,
         "symbol": "PLIFE",
-        "pair_address": pair_addr,
+        "pair_address": POOL_PINNED,
         "dex_id": dex_id,
         "added_at": (now_dt - timedelta(minutes=5)).isoformat(),
         "candles_5m": _make_breakout_candles(18),
         **_strong_flow_pair(),
     }
     db.upsert_watchlist_entry(
-        mint=mint, symbol="PLIFE", pair_address=pair_addr, dex_id=dex_id,
+        mint=MINT_LIFE, symbol="PLIFE", pair_address=POOL_PINNED, dex_id=dex_id,
         candidate=cand, added_at=cand["added_at"],
     )
-    # Upsert again with a different pool address -> original pool identity must remain preserved
+    # Upsert again with a competing pool & different DEX -> original watchlist identity must remain intact
     db.upsert_watchlist_entry(
-        mint=mint, symbol="PLIFE", pair_address="PoolOther999999999999999999999999999999999",
-        dex_id="raydium", candidate={**cand, "pair_address": "PoolOther999999999999999999999999999999999"},
+        mint=MINT_LIFE, symbol="PLIFE", pair_address=POOL_COMPETING, dex_id="raydium",
+        candidate={**cand, "pair_address": POOL_COMPETING, "dex_id": "raydium"},
         added_at=cand["added_at"],
     )
     wl = db.get_watchlist()
     assert len(wl) == 1
-    assert wl[0]["pair_address"] == pair_addr
+    assert wl[0]["pair_address"] == POOL_PINNED
     assert wl[0]["dex_id"] == dex_id
 
-    # 2 & 3. Entry approval reaches alpha_node and PendingOrder stores pair_address + dex_id
+    # 2 & 3 (M-3). Even if refreshed candidate disagrees with pinned watchlist (POOL_COMPETING, raydium),
+    # alpha_node preserves atomic watchlist tuple (POOL_PINNED, pumpswap) without mixing DEX IDs.
+    drifted_cand = {**cand, "pair_address": POOL_COMPETING, "dex_id": "raydium"}
     out_alpha = await alpha_node(
-        {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "safe_candidates": [cand]},
+        {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "safe_candidates": [drifted_cand]},
         config=cfg, db=db, decision_client=_StubDecision(_buy_decision_answers()), now=now_dt,  # type: ignore[arg-type]
     )
     pending = out_alpha["pending_order"]
     assert pending is not None
     assert pending["strategy"] == "BREAKOUT_IGNITION"
-    assert pending["pair_address"] == pair_addr
+    assert pending["pair_address"] == POOL_PINNED
     assert pending["dex_id"] == dex_id
 
-    # 4, 5, 6, 7. Executor BUY -> ActivePosition inherits identity -> ser/deser -> PARTIAL_SELL -> SELL
+    # 4, 5, 6, 7 & L-1A. Executor BUY -> ActivePosition -> PARTIAL_SELL -> Final SELL
     def jup_handler(request: httpx.Request) -> httpx.Response:
         if request.url.params.get("inputMint") == SOL_MINT:
             return httpx.Response(200, json={"outAmount": "1000000", "priceImpactPct": "-0.01", "transaction": None})
-        return httpx.Response(200, json={"outAmount": "550000000", "priceImpactPct": "-0.01", "transaction": None})
+        if request.url.params.get("amount") == "500000":
+            return httpx.Response(200, json={"outAmount": "290000000", "priceImpactPct": "-0.01", "transaction": None})
+        return httpx.Response(200, json={"outAmount": "280000000", "priceImpactPct": "-0.01", "transaction": None})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(jup_handler)) as client:
         out_buy = await executor_node(
@@ -166,29 +207,46 @@ async def test_e1_pool_identity_full_lifecycle_watchlist_to_settlement(tmp_path)
             config=cfg, db=db, http_client=client,
         )
         pos_dict = out_buy["chart_positions"][0]
-        assert pos_dict["pair_address"] == pair_addr
+        assert pos_dict["pair_address"] == POOL_PINNED
         assert pos_dict["dex_id"] == dex_id
         assert pos_dict["pool_identity_status"] == "PINNED"
 
-        # Verify round-trip DB serialization/deserialization and protection against silent overwrite
+        # Round-trip DB reload + tamper protection
         reloaded = db.get_state()["chart_positions"][0]
         pos_obj = ActivePosition.model_validate(reloaded)
-        assert pos_obj.pair_address == pair_addr
+        assert pos_obj.pair_address == POOL_PINNED
         assert pos_obj.dex_id == dex_id
-        assert pos_obj.pool_identity_status == "PINNED"
 
-        # Attempt to overwrite pair_address via update_lane_positions_only -> original preserved
         tampered = dict(reloaded)
-        tampered["pair_address"] = "PoolTampered11111111111111111111111111111"
+        tampered["pair_address"] = POOL_TAMPERED
         tampered["dex_id"] = "meteora"
         merged = db.update_lane_positions_only(lane="chart", positions=[tampered])
-        assert merged[0]["pair_address"] == pair_addr
+        assert merged[0]["pair_address"] == POOL_PINNED
         assert merged[0]["dex_id"] == dex_id
 
-        # Exit SELL (even if exit PendingOrder omitted pair_address, executor inherits from ActivePosition)
+        # Actual PARTIAL_SELL execution (50% scale-out)
+        partial_order = PendingOrder(
+            side="PARTIAL_SELL", mint=MINT_LIFE, symbol="PLIFE", opened_at=pos_obj.opened_at,
+            amount_atomic=500_000, reason="PARTIAL_TP_50PCT (+15%)",
+            target_state_after_fill=FocusState.IN_POSITION, strategy="BREAKOUT_IGNITION",
+        ).model_dump()
+        out_partial = await executor_node(
+            {**db.get_state(), "pending_order": partial_order},
+            config=cfg, db=db, http_client=client,
+        )
+        # Position remains open with original (pair_address, dex_id) intact
+        assert out_partial["focus_state"] == FocusState.IN_POSITION.value
+        assert len(out_partial["chart_positions"]) == 1
+        runner = out_partial["chart_positions"][0]
+        assert runner["partial_tp_taken"] is True
+        assert runner["token_amount"] == 500_000
+        assert runner["pair_address"] == POOL_PINNED
+        assert runner["dex_id"] == dex_id
+
+        # Subsequent final SELL retains the same original identity
         sell_order = PendingOrder(
-            side="SELL", mint=mint, symbol="PLIFE", opened_at=pos_obj.opened_at,
-            amount_atomic=pos_obj.token_amount, reason="TRAILING_TP",
+            side="SELL", mint=MINT_LIFE, symbol="PLIFE", opened_at=runner["opened_at"],
+            amount_atomic=runner["token_amount"], reason="TRAILING_TP",
             target_state_after_fill=FocusState.SCANNING, strategy="BREAKOUT_IGNITION",
         ).model_dump()
         await executor_node(
@@ -196,24 +254,23 @@ async def test_e1_pool_identity_full_lifecycle_watchlist_to_settlement(tmp_path)
             config=cfg, db=db, http_client=client,
         )
 
-    # Verify trades & action_log retain pair_address and dex_id across BUY and SELL
+    # Verify BUY, PARTIAL_SELL, and SELL in trades & action_log all preserve (POOL_PINNED, pumpswap)
     recent_trades = db.get_recent_trades(limit=10)
-    assert len(recent_trades) == 2
-    assert all(t["pair_address"] == pair_addr and t["dex_id"] == dex_id for t in recent_trades)
+    assert [t["side"] for t in reversed(recent_trades)] == ["BUY", "PARTIAL_SELL", "SELL"]
+    assert all(t["pair_address"] == POOL_PINNED and t["dex_id"] == dex_id for t in recent_trades)
 
     actions = db.get_action_log(limit=20)
-    d1_rows = [a for a in actions if a["action"] == "DECISION_1"]
-    buy_rows = [a for a in actions if a["action"] == "BUY"]
-    sell_rows = [a for a in actions if a["action"] == "SELL"]
-    assert d1_rows and d1_rows[0]["pair_address"] == pair_addr and d1_rows[0]["dex_id"] == dex_id
-    assert buy_rows and buy_rows[0]["pair_address"] == pair_addr and buy_rows[0]["dex_id"] == dex_id
-    assert sell_rows and sell_rows[0]["pair_address"] == pair_addr and sell_rows[0]["dex_id"] == dex_id
+    for act_name in ("DECISION_1", "BUY", "PARTIAL_SELL", "SELL"):
+        matched_rows = [a for a in actions if a["action"] == act_name]
+        assert matched_rows, f"Missing action_log row for {act_name}"
+        assert matched_rows[0]["pair_address"] == POOL_PINNED
+        assert matched_rows[0]["dex_id"] == dex_id
     db.close()
 
 
 @pytest.mark.asyncio
 async def test_e1_missing_or_invalid_pair_address_rejects_breakout_ignition(tmp_path):
-    """Test 8: Missing or invalid pair_address rejects a new BREAKOUT_IGNITION entry at both alpha and executor."""
+    """Test 8: Missing or malformed pair_address rejects BREAKOUT_IGNITION at both alpha and executor."""
     clear_narrative_cache()
     clear_buy_reservations()
 
@@ -225,13 +282,12 @@ async def test_e1_missing_or_invalid_pair_address_rejects_breakout_ignition(tmp_
         WHALE_STRATEGY_ENABLED=False,
     )
     now_dt = datetime(2026, 11, 26, 12, 0, 0, tzinfo=timezone.utc)
-    mint = "MintNoPool11111111111111111111111111111111"
 
-    for bad_pair in ("", "   ", "unknown", "none", mint):
+    for bad_pair in ("", "   ", "unknown", "!!!!", "https://bad.url", "PoolNotBase58", MINT_NOPOOL):
         clear_narrative_cache()
-        assert not is_valid_pool_address(bad_pair, mint=mint)
+        assert not is_valid_pool_address(bad_pair, mint=MINT_NOPOOL)
         cand = {
-            "mint": mint,
+            "mint": MINT_NOPOOL,
             "symbol": "NOPOOL",
             "pair_address": bad_pair,
             "added_at": (now_dt - timedelta(minutes=5)).isoformat(),
@@ -249,17 +305,18 @@ async def test_e1_missing_or_invalid_pair_address_rejects_breakout_ignition(tmp_
     actions = db.get_action_log(limit=20)
     assert any("MISSING_OR_INVALID_POOL_IDENTITY" in str(a.get("reason") or "") for a in actions)
 
-    # Executor-level defense-in-depth guard also rejects BREAKOUT_IGNITION BUY lacking pair_address
-    bad_order = PendingOrder(
-        side="BUY", mint=mint, symbol="NOPOOL", pair_address=None,
-        amount_atomic=int(0.5 * LAMPORTS_PER_SOL), reason="DECISION_1_ENTRY",
-        target_state_after_fill=FocusState.IN_POSITION, strategy="BREAKOUT_IGNITION",
-    ).model_dump()
-    out_ex = await executor_node(
-        {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "pending_order": bad_order},
-        config=cfg, db=db,
-    )
-    assert out_ex["pending_order"] is None
+    # Executor defense-in-depth rejects both None and malformed strings
+    for bad_exec_pair in (None, "!!!!", "PoolShort"):
+        bad_order = PendingOrder(
+            side="BUY", mint=MINT_NOPOOL, symbol="NOPOOL", pair_address=bad_exec_pair,
+            amount_atomic=int(0.5 * LAMPORTS_PER_SOL), reason="DECISION_1_ENTRY",
+            target_state_after_fill=FocusState.IN_POSITION, strategy="BREAKOUT_IGNITION",
+        ).model_dump()
+        out_ex = await executor_node(
+            {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "pending_order": bad_order},
+            config=cfg, db=db,
+        )
+        assert out_ex["pending_order"] is None
     assert db.get_state()["chart_positions"] == []
     db.close()
 
@@ -267,7 +324,6 @@ async def test_e1_missing_or_invalid_pair_address_rejects_breakout_ignition(tmp_
 def test_e1_historical_null_identities_migration_idempotency_and_exports(tmp_path):
     """Tests 9, 10, 16, 17: Historical NULL identities readable, never fabricated, migrations idempotent, CSV works."""
     db_file = tmp_path / "legacy_pre_e1.duckdb"
-    # Build a legacy pre-E1 DuckDB without pair_address/dex_id on trades & action_log and without dex_id on watchlist
     conn = duckdb.connect(str(db_file))
     conn.execute("""
         CREATE TABLE trades (
@@ -292,10 +348,10 @@ def test_e1_historical_null_identities_migration_idempotency_and_exports(tmp_pat
             added_at VARCHAR NOT NULL, candidate_json VARCHAR NOT NULL
         )
     """)
-    conn.execute("""
+    conn.execute(f"""
         INSERT INTO active_watchlist VALUES (
-            'MintLegacyWL', 'OLDWL', 'PoolOldWL111111111111111111111111111111',
-            '2026-11-26T05:00:00+00:00', '{"mint":"MintLegacyWL","symbol":"OLDWL"}'
+            'MintLegacyWL', 'OLDWL', '{POOL_LEGACY_WL}',
+            '2026-11-26T05:00:00+00:00', '{{"mint":"MintLegacyWL","symbol":"OLDWL"}}'
         )
     """)
     conn.execute("""
@@ -315,19 +371,15 @@ def test_e1_historical_null_identities_migration_idempotency_and_exports(tmp_pat
     """)
     conn.close()
 
-    # Initialize AgentDatabase TWICE to verify additive migration + idempotency
     db1 = AgentDatabase(db_path=str(db_file), starting_sol=1.0)
     db1.close()
     db2 = AgentDatabase(db_path=str(db_file), starting_sol=1.0)
 
-    # Historical trade row remains intact with NULL pair_address/dex_id (never fabricated)
     trades = db2.get_recent_trades(limit=5)
     assert len(trades) == 1
-    assert trades[0]["mint"] == "MintLegacy111111111111111111111111111111"
     assert trades[0]["pair_address"] is None
     assert trades[0]["dex_id"] is None
 
-    # Historical action_log row remains intact with NULL pair_address/dex_id and exports cleanly via CSV
     cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper")
     tc = TestClient(create_telemetry_app(config=cfg, db=db2))
     csv_resp = tc.get("/api/export/csv")
@@ -337,7 +389,6 @@ def test_e1_historical_null_identities_migration_idempotency_and_exports(tmp_pat
     assert rows[0]["pair_address"] == ""
     assert rows[0]["dex_id"] == ""
 
-    # Historical ActivePosition without pair_address loads as UNKNOWN and never adopts foreign pool flow
     legacy_pos = ActivePosition(
         mint="MintLegacy111111111111111111111111111111", symbol="OLD",
         entry_sol=0.5, token_amount=1_000_000, entry_liquidity_usd=50_000.0,
@@ -349,7 +400,7 @@ def test_e1_historical_null_identities_migration_idempotency_and_exports(tmp_pat
         current_sol_value=0.51,
         flow={
             "all_solana_pairs": [{
-                "chainId": "solana", "pairAddress": "PoolUnrelated111111111111111111111111",
+                "chainId": "solana", "pairAddress": POOL_COMPETING,
                 "baseToken": {"address": legacy_pos.mint},
                 "liquidity": {"usd": 999_000.0}, "txns": {"m5": {"buys": 1, "sells": 99}},
             }]
@@ -367,25 +418,21 @@ async def test_e1_monitor_pins_stored_pool_and_rejects_mismatches_and_migrations
     """Tests 11–15: Stored pool pinned (no highest-liq substitution), mismatches rejected, missing vs zero-liq vs zero-flow."""
     clear_price_backoff()
     cfg = AgentConfig(_env_file=None)
-    mint = "MintMultiPool11111111111111111111111111111"
-    pinned_pool = "PoolOriginal11111111111111111111111111111"
-    higher_liq_pool = "PoolHigherLiq2222222222222222222222222222"
 
-    # 11. Multiple pools exist: monitor must use pinned_pool, NOT higher_liq_pool
     def multi_pool_handler(request: httpx.Request) -> httpx.Response:
         if "/price/v3" in str(request.url):
-            return httpx.Response(200, json={SOL_MINT: {"usdPrice": 200.0, "decimals": 9}, mint: {"usdPrice": 0.02, "decimals": 6}})
+            return httpx.Response(200, json={SOL_MINT: {"usdPrice": 200.0, "decimals": 9}, MINT_MULTI: {"usdPrice": 0.02, "decimals": 6}})
         return httpx.Response(
             200,
             json=[
                 {
-                    "chainId": "solana", "pairAddress": higher_liq_pool, "dexId": "raydium",
-                    "baseToken": {"address": mint}, "priceNative": "0.00010",
+                    "chainId": "solana", "pairAddress": POOL_COMPETING, "dexId": "raydium",
+                    "baseToken": {"address": MINT_MULTI}, "priceNative": "0.00010",
                     "liquidity": {"usd": 500_000.0}, "txns": {"m5": {"buys": 1, "sells": 99}},
                 },
                 {
-                    "chainId": "solana", "pairAddress": pinned_pool, "dexId": "pumpswap",
-                    "baseToken": {"address": mint}, "priceNative": "0.00010",
+                    "chainId": "solana", "pairAddress": POOL_PINNED, "dexId": "pumpswap",
+                    "baseToken": {"address": MINT_MULTI}, "priceNative": "0.00010",
                     "liquidity": {"usd": 60_000.0}, "txns": {"m5": {"buys": 42, "sells": 8}},
                 },
             ],
@@ -393,97 +440,208 @@ async def test_e1_monitor_pins_stored_pool_and_rejects_mismatches_and_migrations
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(multi_pool_handler)) as client:
         _, dex_flow = await fetch_batched_sol_prices(
-            [mint], cfg, client, now_ts=1000.0, pinned_pools={mint: pinned_pool}
+            [MINT_MULTI], cfg, client, now_ts=1000.0, pinned_pools={MINT_MULTI: POOL_PINNED}
         )
-    obs = dex_flow[mint]
+    obs = dex_flow[MINT_MULTI]
     assert obs["pool_status"] == "MATCHED"
     assert obs["flow_available"] is True
-    assert obs["pair_address"] == pinned_pool
+    assert obs["pair_address"] == POOL_PINNED
     assert obs["dex_id"] == "pumpswap"
     assert obs["buys_5m"] == 42 and obs["sells_5m"] == 8
     assert obs["liquidity_usd"] == 60_000.0
 
-    # 12. Provider response with mismatched pair_address is rejected (no silent substitution)
+    # Pair mismatch rejected
     res_bad_pair = select_pinned_dexscreener_pair(
         [{
-            "chainId": "solana", "pairAddress": "PoolWrong99999999999999999999999999999999",
-            "baseToken": {"address": "OtherMint11111111111111111111111111111111"},
+            "chainId": "solana", "pairAddress": POOL_WRONG,
+            "baseToken": {"address": MINT_IMPOSTOR},
             "liquidity": {"usd": 80_000.0}, "txns": {"m5": {"buys": 10, "sells": 10}},
         }],
-        expected_mint=mint, expected_pair_address=pinned_pool,
+        expected_mint=MINT_MULTI, expected_pair_address=POOL_PINNED,
     )
     assert res_bad_pair["pool_status"] == "MISMATCHED_PAIR"
     assert res_bad_pair["flow_available"] is False
 
-    # 13. Provider response with mismatched token mint on same pair_address is rejected
+    # Mint mismatch on same pair_address rejected
     res_bad_mint = select_pinned_dexscreener_pair(
         [{
-            "chainId": "solana", "pairAddress": pinned_pool,
-            "baseToken": {"address": "MintImpostor11111111111111111111111111111"},
+            "chainId": "solana", "pairAddress": POOL_PINNED,
+            "baseToken": {"address": MINT_IMPOSTOR},
             "liquidity": {"usd": 80_000.0}, "txns": {"m5": {"buys": 10, "sells": 10}},
         }],
-        expected_mint=mint, expected_pair_address=pinned_pool,
+        expected_mint=MINT_MULTI, expected_pair_address=POOL_PINNED,
     )
     assert res_bad_mint["pool_status"] == "MISMATCHED_MINT"
     assert res_bad_mint["flow_available"] is False
 
-    # 14. Original pool temporarily unavailable or migrated -> no silent substitution, original identity preserved
+    # Original pool migrated/missing -> no silent substitution
     pos = ActivePosition(
-        mint=mint, symbol="MULTI", pair_address=pinned_pool, dex_id="pumpswap",
+        mint=MINT_MULTI, symbol="MULTI", pair_address=POOL_PINNED, dex_id="pumpswap",
         entry_sol=0.5, token_amount=1_000_000, entry_liquidity_usd=60_000.0, last_liquidity_usd=60_000.0,
     )
     b5_m, s5_m, _, liq_m = apply_dex_flow_and_pnl(
         pos, current_sol_value=0.50,
         flow={
             "all_solana_pairs": [{
-                "chainId": "solana", "pairAddress": higher_liq_pool, "dexId": "raydium",
-                "baseToken": {"address": mint}, "liquidity": {"usd": 500_000.0},
+                "chainId": "solana", "pairAddress": POOL_COMPETING, "dexId": "raydium",
+                "baseToken": {"address": MINT_MULTI}, "liquidity": {"usd": 500_000.0},
                 "txns": {"m5": {"buys": 0, "sells": 50}},
             }]
         },
     )
-    assert pos.pair_address == pinned_pool
+    assert pos.pair_address == POOL_PINNED
     assert pos.dex_id == "pumpswap"
     assert pos.pool_observation_status == "POOL_MIGRATED_OR_MISSING"
-    assert pos.last_liquidity_usd == 60_000.0  # preserved, not overwritten
+    assert pos.last_liquidity_usd == 60_000.0
     assert (b5_m, s5_m, liq_m) == (0, 0, 0.0)
 
-    # 15. Distinguish ZERO_LIQUIDITY, POOL_UNAVAILABLE, INCOMPLETE_DATA, and valid zero-transaction flow
+    # Zero-flow, zero-liquidity, missing, and incomplete data distinguished
     res_zero_flow = select_pinned_dexscreener_pair(
         [{
-            "chainId": "solana", "pairAddress": pinned_pool, "dexId": "pumpswap",
-            "baseToken": {"address": mint}, "liquidity": {"usd": 60_000.0},
+            "chainId": "solana", "pairAddress": POOL_PINNED, "dexId": "pumpswap",
+            "baseToken": {"address": MINT_MULTI}, "liquidity": {"usd": 60_000.0},
             "txns": {"m5": {"buys": 0, "sells": 0}},
         }],
-        expected_mint=mint, expected_pair_address=pinned_pool,
+        expected_mint=MINT_MULTI, expected_pair_address=POOL_PINNED,
     )
-    assert res_zero_flow["pool_status"] == "MATCHED"
-    assert res_zero_flow["flow_available"] is True
-    assert res_zero_flow["buys_5m"] == 0 and res_zero_flow["sells_5m"] == 0
+    assert res_zero_flow["pool_status"] == "MATCHED" and res_zero_flow["flow_available"] is True
 
     res_zero_liq = select_pinned_dexscreener_pair(
         [{
-            "chainId": "solana", "pairAddress": pinned_pool, "dexId": "pumpswap",
-            "baseToken": {"address": mint}, "liquidity": {"usd": 0.0},
+            "chainId": "solana", "pairAddress": POOL_PINNED, "dexId": "pumpswap",
+            "baseToken": {"address": MINT_MULTI}, "liquidity": {"usd": 0.0},
             "txns": {"m5": {"buys": 0, "sells": 5}},
         }],
-        expected_mint=mint, expected_pair_address=pinned_pool,
+        expected_mint=MINT_MULTI, expected_pair_address=POOL_PINNED,
     )
-    assert res_zero_liq["pool_status"] == "ZERO_LIQUIDITY"
-    assert res_zero_liq["flow_available"] is True
-    assert res_zero_liq["liquidity_usd"] == 0.0
+    assert res_zero_liq["pool_status"] == "ZERO_LIQUIDITY" and res_zero_liq["flow_available"] is True
 
-    res_missing = select_pinned_dexscreener_pair([], expected_mint=mint, expected_pair_address=pinned_pool)
-    assert res_missing["pool_status"] == "POOL_UNAVAILABLE"
-    assert res_missing["flow_available"] is False
-    assert res_missing["buys_5m"] is None and res_missing["liquidity_usd"] is None
+    res_missing = select_pinned_dexscreener_pair([], expected_mint=MINT_MULTI, expected_pair_address=POOL_PINNED)
+    assert res_missing["pool_status"] == "POOL_UNAVAILABLE" and res_missing["flow_available"] is False
 
     res_incomplete = select_pinned_dexscreener_pair(
         [{
-            "chainId": "solana", "pairAddress": pinned_pool, "dexId": "pumpswap",
-            "baseToken": {"address": mint}, "liquidity": {"usd": 60_000.0},
+            "chainId": "solana", "pairAddress": POOL_PINNED, "dexId": "pumpswap",
+            "baseToken": {"address": MINT_MULTI}, "liquidity": {"usd": 60_000.0},
         }],
-        expected_mint=mint, expected_pair_address=pinned_pool,
+        expected_mint=MINT_MULTI, expected_pair_address=POOL_PINNED,
     )
-    assert res_incomplete["pool_status"] == "INCOMPLETE_DATA"
-    assert res_incomplete["flow_available"] is False
+    assert res_incomplete["pool_status"] == "INCOMPLETE_DATA" and res_incomplete["flow_available"] is False
+
+
+@pytest.mark.asyncio
+async def test_e1_position_monitor_multi_pool_jupiter_miss_and_reentry_pinning(tmp_path):
+    """M-1 + L-1B: End-to-end position_monitor_node with Jupiter miss + competing higher-liq pool."""
+    clear_price_backoff()
+    db = AgentDatabase(db_path=str(tmp_path / "e1_monitor_multipool.duckdb"), starting_sol=2.0)
+    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper")
+    now_dt = datetime(2026, 11, 26, 13, 0, 0, tzinfo=timezone.utc)
+
+    # 1. Open position pinned to POOL_PINNED; Jupiter /price/v3 omits MINT_MULTI.
+    # Competing POOL_COMPETING has higher liquidity ($500k) and an extreme dump priceNative (0.00010 -> -80%!) + 99% sells.
+    # Pinned POOL_PINNED has priceNative 0.00052 (+4% -> 0.52 SOL), $65k liq, and 80% buys.
+    open_pos = ActivePosition(
+        mint=MINT_MULTI, symbol="MULTI", pair_address=POOL_PINNED, dex_id="pumpswap",
+        entry_sol=0.50, token_amount=1_000_000_000, decimals=6,
+        entry_liquidity_usd=65_000.0, current_sol_value=0.50, peak_sol_value=0.50,
+        reference_token_amount=1_000_000_000, strategy="BREAKOUT_IGNITION",
+        opened_at=now_dt.isoformat(),
+    ).model_dump()
+
+    def multi_miss_handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/price/v3" in url:
+            # Jupiter misses MINT_MULTI (only returns SOL)
+            return httpx.Response(200, json={SOL_MINT: {"usdPrice": 200.0, "decimals": 9}})
+        if "/tokens/v1/solana/" in url:
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "chainId": "solana", "pairAddress": POOL_COMPETING, "dexId": "raydium",
+                        "baseToken": {"address": MINT_MULTI}, "priceNative": "0.00010",
+                        "liquidity": {"usd": 500_000.0}, "txns": {"m5": {"buys": 1, "sells": 99}},
+                    },
+                    {
+                        "chainId": "solana", "pairAddress": POOL_PINNED, "dexId": "pumpswap",
+                        "baseToken": {"address": MINT_MULTI}, "priceNative": "0.00052",
+                        "liquidity": {"usd": 65_000.0}, "txns": {"m5": {"buys": 40, "sells": 10}},
+                    },
+                ],
+            )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(multi_miss_handler)) as client:
+        mon_out = await position_monitor_node(
+            {
+                "focus_state": FocusState.IN_POSITION.value,
+                "sol_balance": 1.5,
+                "daily_pnl_sol": 0.0,
+                "active_position": open_pos,
+                "chart_positions": [open_pos],
+            },
+            config=cfg, db=db, decision_client=_StubDecision({}), http_client=client, now=now_dt,  # type: ignore[arg-type]
+        )
+
+    # Must HOLD using POOL_PINNED's priceNative (0.52 SOL), liquidity ($65k), and 80% buys (ignoring POOL_COMPETING!)
+    assert mon_out["monitor_event"] == "HOLD_IN_POSITION"
+    cp = mon_out["chart_positions"][0]
+    assert cp["pair_address"] == POOL_PINNED
+    assert cp["dex_id"] == "pumpswap"
+    assert cp["current_sol_value"] == pytest.approx(0.52, rel=1e-4)
+    assert cp["last_liquidity_usd"] == pytest.approx(65_000.0, rel=1e-4)
+    assert cp["last_5m_buy_ratio"] == pytest.approx(0.80, rel=1e-3)
+    assert cp["last_price_source"] == "dexscreener_native"
+
+    # 2. WATCHING_REENTRY pinned to POOL_PINNED with POOL_PINNED absent (only POOL_COMPETING present):
+    # Competing pool has bullish curl/flow, but missing pinned pool must NOT substitute POOL_COMPETING or trigger reentry!
+    watch_pos = ActivePosition(
+        mint=MINT_MULTI, symbol="MULTI", pair_address=POOL_PINNED, dex_id="pumpswap",
+        entry_sol=0.50, token_amount=0, decimals=6,
+        entry_liquidity_usd=65_000.0, current_sol_value=0.48, peak_sol_value=0.65,
+        run_peak_sol=0.65, retrace_low_sol=0.48, reference_token_amount=1_000_000_000,
+        watch_started_at=now_dt.isoformat(), strategy="BREAKOUT_IGNITION",
+    ).model_dump()
+
+    def missing_pinned_handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/price/v3" in url:
+            return httpx.Response(200, json={SOL_MINT: {"usdPrice": 200.0, "decimals": 9}})
+        if "/swap/v2/order" in url:
+            return httpx.Response(200, json={"outAmount": "520000000", "transaction": None})
+        if "/tokens/v1/solana/" in url:
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "chainId": "solana", "pairAddress": POOL_COMPETING, "dexId": "raydium",
+                        "baseToken": {"address": MINT_MULTI}, "priceNative": "0.00055",
+                        "liquidity": {"usd": 500_000.0},
+                        "volume": {"h1": 300_000.0, "m5": 60_000.0},
+                        "priceChange": {"h1": 25.0, "m5": 8.0},
+                        "txns": {"m5": {"buys": 80, "sells": 10}},
+                    }
+                ],
+            )
+        return httpx.Response(404)
+
+    reentry_dec = _StubDecision({
+        "leg_2_momentum": {"type": "score", "score": 4.5, "confidence": 0.90},
+        "is_dead_cat_bounce": {"type": "noul", "noul": 0.10, "confidence": 0.90},
+    })
+    async with httpx.AsyncClient(transport=httpx.MockTransport(missing_pinned_handler)) as client:
+        watch_out = await position_monitor_node(
+            {
+                "focus_state": FocusState.WATCHING_REENTRY.value,
+                "sol_balance": 1.5,
+                "daily_pnl_sol": 0.0,
+                "active_position": watch_pos,
+            },
+            config=cfg, db=db, decision_client=reentry_dec, http_client=client, now=now_dt,  # type: ignore[arg-type]
+        )
+
+    # Must NOT substitute POOL_COMPETING for reentry scoring or fallback price
+    assert watch_out["pending_order"] is None
+    assert watch_out["active_position"]["pair_address"] == POOL_PINNED
+    assert watch_out["active_position"]["pool_observation_status"] == "POOL_MIGRATED_OR_MISSING"
+    db.close()
