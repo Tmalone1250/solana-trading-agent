@@ -5,12 +5,17 @@
 **Design Branch:** `design/e4-entry-execution`  
 **Exact Application-Source Baseline:** `ca01c640ac60477e63a33a86217298573680c5f0` (`impl/e3c-parser-cache-integrity`)  
 **Audit Reference:** `reports/phase_e4_entry_execution/e4_breakout_ignition_entry_audit.md` (report-only commit `1780d0836af205103887c2e5818a3ed817922c86`)  
-**Revision:** Rev 3 (Final Narrowly Scoped Corrective Pass)  
+**Revision:** Rev 4 (Final `jsonParsed` Account-Key Resolution Corrective Pass)  
 **Date:** 2026-11-27
 
 ---
 
 ## 0. Independent-Review Corrective Log
+
+### Rev 4 Resolutions
+| # | Finding | Resolution in Rev 4 |
+|---|---|---|
+| 1 | E4D mixed `encoding="jsonParsed"` with `meta.loadedAddresses` concatenation (`message.accountKeys + meta.loadedAddresses...`). | Standardized E4D strictly on `encoding="jsonParsed"` with `maxSupportedTransactionVersion=0`: `transaction.message.accountKeys` already contains the complete resolved key list (including ALT-loaded accounts) and `meta.loadedAddresses` is omitted. Extract `pubkey` directly from each parsed `message.accountKeys` entry; never append `meta.loadedAddresses`. Added explicit `accountIndex` bounds/type validation and E4D v0/ALT regression tests. |
 
 ### Rev 3 Resolutions
 | # | Finding | Resolution in Rev 3 |
@@ -237,7 +242,12 @@ Wallet token balance (`getTokenAccountsByOwner` / `getBalance`) is **supporting 
 3. **Committed Success & Deterministic Token-Delta Attribution (`status.err is None` and `confirmationStatus in ("confirmed", "finalized")`):**
    - Call `getTransaction(tx_signature, encoding="jsonParsed", maxSupportedTransactionVersion=0, commitment=...)`.
    - If `getTransaction` returns `None`, lacks `meta`, or has `meta.err != None`: retain `UNRESOLVED` (or `FAILED` only under the committed-failure rule above) — never guess.
-   - **Complete account-key resolution:** Build the full ordered account list `all_keys = message.accountKeys + meta.loadedAddresses.writable + meta.loadedAddresses.readonly` (so ALT-loaded accounts are resolved accurately).
+   - **Complete account-key resolution (`jsonParsed` encoding contract):** Because `getTransaction` is requested with `encoding="jsonParsed"` and `maxSupportedTransactionVersion=0`, `transaction.message.accountKeys` **already contains the complete resolved account-key list**, including address-lookup-table-loaded accounts for v0 transactions (`meta.loadedAddresses` is omitted in `jsonParsed`). Extract each entry's `pubkey` string directly from `transaction.message.accountKeys` (handling parsed key objects `{"pubkey": ..., "source": "transaction" | "lookupTable"}`), and **never** append `meta.loadedAddresses`. Do not mix `jsonParsed` and raw-`json` key composition.
+   - **Strict `accountIndex` validation:**
+     - Resolve every `preTokenBalances` and `postTokenBalances` `accountIndex` against the exact `all_keys` array extracted from `transaction.message.accountKeys`.
+     - Reject any negative, boolean/non-integer, out-of-range (`idx < 0 or idx >= len(all_keys)`), or malformed `accountIndex`, and reject any `accountKeys` entry missing a valid `pubkey`.
+     - Verify that resolved pre- and post-token-balance entries map to the expected account addresses and `order.mint`.
+     - Never silently repair an index or fall back to a different key ordering; if the RPC response does not provide enough information to prove the mapping, retain `UNRESOLVED`.
    - **Deterministic output token-delta attribution (`order.mint`):**
      - Match `meta.preTokenBalances` and `meta.postTokenBalances` by `accountIndex` (resolved against `all_keys`), `mint == order.mint`, and validated token program (`SPL Token` / `Token-2022`) + `uiTokenAmount.decimals` consistency.
      - **Missing `owner` / `programId`:** Treat omitted `owner` or `programId` in token balance entries as a requirement to resolve account ownership from reliable transaction/account evidence (parsed token-account owner / ATA derivation from `(taker_pubkey, token_program, order.mint)` / decoded instruction accounts) — **never** assume ownership without proof.
@@ -356,7 +366,7 @@ Every E4 commit must pass:
 - **E2A**: `tests/test_e2a_exit_integrity.py`, `tests/test_e2a_watching_reentry.py`
 - **E2B**: `tests/test_e2b_fee_accounting.py` (when integrated with `dev_2`; preserve `tx_fee_sol=None`/`UNKNOWN` in live mode and never fabricate fees from `LIVE_FEE_RESERVATION_BUFFER_SOL`)
 - **E3A–E3C**: `tests/test_breakout_ignition.py`, `tests/test_scalper_entry_engine.py`, `tests/test_breakout_isolation.py`, and E3A/E3B/E3C OHLCV provenance tests
-- **E4-specific**: Separate tests for `out_amount <= 0` vs. empty `tx_signature`; `getTransaction` token-delta attribution with pre-existing holdings; `gasless`/`signatureFeePayer != taker` rejection; single null RPC response remaining `UNRESOLVED`; router-specific `metis`/`jupiterz`/`dflow`/`okx` route policies; RPC-outside-lock balance divergence.
+- **E4-specific**: Separate tests for `out_amount <= 0` vs. empty `tx_signature`; `getTransaction` token-delta attribution with pre-existing holdings; v0 transaction with lookup-table-loaded accounts returned via `jsonParsed` where a token-balance `accountIndex` refers to a lookup-table-loaded account and verifying loaded addresses are not appended a second time; malformed or out-of-range `accountIndex` remaining `UNRESOLVED`; `gasless`/`signatureFeePayer != taker` rejection; single null RPC response remaining `UNRESOLVED`; router-specific `metis`/`jupiterz`/`dflow`/`okx` route policies; RPC-outside-lock balance divergence.
 
 ---
 
