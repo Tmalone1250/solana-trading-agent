@@ -1,0 +1,590 @@
+{
+  "deterministic_gate_replay": {
+    "config_profile_name": "supplied_phase1_pi_snapshot",
+    "config_profile_provenance": "SUPPLIED_PI_ENV_SNAPSHOT_NOT_VERIFIED_AS_PID_8315_EFFECTIVE_RUNTIME",
+    "consistency_explanation": "CONSISTENT: Recorded REJECT aligns with 6 failed hard gate(s) (G04_BREAKOUT_VOL_RATIO_THRESHOLD, G05_BREAKOUT_MIN_SCORE_THRESHOLD, G08_WATCHLIST_SOAK_GATE, G11_ALPHA_ACTION_CHOICE, G14_ALPHA_MIN_NARRATIVE_SCORE, G15_ALPHA_MIN_MOMENTUM_SCORE) under 'supplied_phase1_pi_snapshot'.",
+    "consistent_with_recorded_outcome": true,
+    "decision_timestamp": "2026-11-26T15:05:03.504192+00:00",
+    "episode_id": "32rBxcFj-ep005",
+    "eviction_gates": [
+      {
+        "availability": "EXACT_HISTORICAL",
+        "description": "Immediate vamp >= VAMP_EVICT_THRESHOLD or consecutive >= VAMP_WARN_THRESHOLD",
+        "explanation": "vamp_score=0.501 below eviction thresholds.",
+        "gate_id": "E01_VAMP_EVICTION_RULE",
+        "is_hard_entry_gate": false,
+        "observed_value": 0.501,
+        "stage": "alpha_node.alpha_node (L363-380)",
+        "status": "EVICT_NOT_TRIGGERED",
+        "threshold_provenance": "SUPPLIED_PI_ENV_SNAPSHOT_NOT_VERIFIED_AS_PID_8315_EFFECTIVE_RUNTIME",
+        "threshold_value": 0.85
+      },
+      {
+        "availability": "EXACT_HISTORICAL",
+        "description": "Weak narrative & momentum (< LOW_SCORE_EVICT_THRESHOLD)",
+        "explanation": "LOW_SCORE eviction triggered: narr=1.95 < 2.0 AND mom=1.26 < 2.0 (coiling_base_eligible=False or strikes=1 >= 2).",
+        "gate_id": "E02_LOW_SCORE_EVICTION_RULE",
+        "is_hard_entry_gate": false,
+        "observed_value": {
+          "momentum_score": 1.26,
+          "narrative_score": 1.95
+        },
+        "stage": "alpha_node.alpha_node (L382-406)",
+        "status": "EVICT_TRIGGERED",
+        "threshold_provenance": "EXPECTED_FROM_CODE_DEFAULT_OMITTED_IN_SUPPLIED_SNAPSHOT",
+        "threshold_value": 2.0
+      },
+      {
+        "availability": "EXACT_HISTORICAL",
+        "description": "Watchlist elapsed time > STALE_WATCH_TIMEOUT_MINUTES (or 25m if coiling base)",
+        "explanation": "soak_minutes=0.05m <= 15m.",
+        "gate_id": "E03_STALE_WATCH_EVICTION_RULE",
+        "is_hard_entry_gate": false,
+        "observed_value": 0.05,
+        "stage": "alpha_node.alpha_node (L410-424)",
+        "status": "EVICT_NOT_TRIGGERED",
+        "threshold_provenance": "SUPPLIED_PI_ENV_SNAPSHOT_NOT_VERIFIED_AS_PID_8315_EFFECTIVE_RUNTIME",
+        "threshold_value": 15
+      }
+    ],
+    "eviction_replay_verdict": "DETERMINISTIC_EVICT (E02_LOW_SCORE_EVICTION_RULE)",
+    "failed_hard_gate_ids": [
+      "G04_BREAKOUT_VOL_RATIO_THRESHOLD",
+      "G05_BREAKOUT_MIN_SCORE_THRESHOLD",
+      "G08_WATCHLIST_SOAK_GATE",
+      "G11_ALPHA_ACTION_CHOICE",
+      "G14_ALPHA_MIN_NARRATIVE_SCORE",
+      "G15_ALPHA_MIN_MOMENTUM_SCORE"
+    ],
+    "gates": [
+      {
+        "availability": "MISSING",
+        "description": "Full candle-level BREAKOUT_IGNITION detection from live-forming 5m/1m OHLCV & pair_data",
+        "explanation": "Raw live-forming 5m/1m OHLCV candles and raw DexScreener pair_data were not persisted in DuckDB; independent detector recreation is NOT_REPLAYABLE.",
+        "gate_id": "G01_RAW_BREAKOUT_DETECTOR",
+        "is_hard_entry_gate": true,
+        "observed_value": null,
+        "stage": "breakout_ignition.detect_breakout_ignition",
+        "status": "NOT_REPLAYABLE",
+        "threshold_provenance": "HARDCODED_CODE_INVARIANT",
+        "threshold_value": ">=12 5m or >=15 1m live candles + raw pair_data"
+      },
+      {
+        "availability": "MISSING",
+        "description": "Close > 15m-30m swing high, green candle, and body_pos_pct >= 65% (res_passed)",
+        "explanation": "Prior candle highs and breakout candle open/high/low/close are MISSING; cannot independently recompute res_passed without trusting recorded diagnostic strings.",
+        "gate_id": "G02_BREAKOUT_RESISTANCE_AND_BODY",
+        "is_hard_entry_gate": true,
+        "observed_value": null,
+        "stage": "breakout_ignition.detect_breakout_ignition (L188-195, L356)",
+        "status": "NOT_REPLAYABLE",
+        "threshold_provenance": "HARDCODED_CODE_INVARIANT",
+        "threshold_value": "close > swing_high AND body_pos_pct >= 0.65"
+      },
+      {
+        "availability": "MISSING",
+        "description": "5m buy ratio >= 62% (8 pts) & 5m buy acceleration >= 1.5x (7 pts) [score-only pillars]",
+        "explanation": "Raw 5m/1h buy and sell transaction counts are MISSING. Absence of BUY_RATIO or BUY_ACCEL in breakout_failed_gates is never treated as proof of passing.",
+        "gate_id": "G03_BREAKOUT_FLOW_AND_ACCEL_SCORE_PILLARS",
+        "is_hard_entry_gate": false,
+        "observed_value": null,
+        "stage": "breakout_ignition.detect_breakout_ignition (L252-266)",
+        "status": "NOT_REPLAYABLE",
+        "threshold_provenance": "HARDCODED_CODE_INVARIANT",
+        "threshold_value": "buy_ratio_5m >= 0.62; buys_accel >= 1.5x (score deductions only)"
+      },
+      {
+        "availability": "EXACT_HISTORICAL",
+        "description": "Recorded breakout volume spike ratio >= BREAKOUT_MIN_VOL_RATIO",
+        "explanation": "Recorded breakout_vol_ratio=0.47x < 0.70x (note: uses recorded detector scalar; raw candle volumes MISSING).",
+        "gate_id": "G04_BREAKOUT_VOL_RATIO_THRESHOLD",
+        "is_hard_entry_gate": true,
+        "observed_value": 0.47,
+        "stage": "breakout_ignition.detect_breakout_ignition (L201, L357)",
+        "status": "FAIL",
+        "threshold_provenance": "SUPPLIED_PI_ENV_SNAPSHOT_NOT_VERIFIED_AS_PID_8315_EFFECTIVE_RUNTIME",
+        "threshold_value": 0.7
+      },
+      {
+        "availability": "EXACT_HISTORICAL",
+        "description": "Recorded breakout score >= BREAKOUT_MIN_SCORE",
+        "explanation": "Recorded breakout_score=18 < 55 (uses recorded detector score; raw candles MISSING).",
+        "gate_id": "G05_BREAKOUT_MIN_SCORE_THRESHOLD",
+        "is_hard_entry_gate": true,
+        "observed_value": 18,
+        "stage": "breakout_ignition.detect_breakout_ignition (L355)",
+        "status": "FAIL",
+        "threshold_provenance": "SUPPLIED_PI_ENV_SNAPSHOT_NOT_VERIFIED_AS_PID_8315_EFFECTIVE_RUNTIME",
+        "threshold_value": 55
+      },
+      {
+        "availability": "MISSING",
+        "description": "Anti-chase extension <= +12.0% above both EMA9 and VWAP",
+        "explanation": "ema_ext_pct=-17.01 <= +12.0%, but ext_above_vwap_pct is MISSING (decisions_log pruned); refusing to assume VWAP extension passed.",
+        "gate_id": "G06_BREAKOUT_ANTI_CHASE_EXTENSION",
+        "is_hard_entry_gate": true,
+        "observed_value": {
+          "ema_ext_pct": -17.01,
+          "vwap_ext_pct": null
+        },
+        "stage": "breakout_ignition.detect_breakout_ignition (L218-220, L358)",
+        "status": "NOT_REPLAYABLE",
+        "threshold_provenance": "HARDCODED_CODE_INVARIANT",
+        "threshold_value": 12.0
+      },
+      {
+        "availability": "EXACT_HISTORICAL",
+        "description": "Breakout RSI ceiling <= 78.0",
+        "explanation": "Recorded RSI=57.95 <= 78.0.",
+        "gate_id": "G07_BREAKOUT_RSI_CEILING",
+        "is_hard_entry_gate": true,
+        "observed_value": 57.95,
+        "stage": "breakout_ignition (L213, L359) & scalper_entry_engine (L286)",
+        "status": "PASS",
+        "threshold_provenance": "HARDCODED_CODE_INVARIANT",
+        "threshold_value": 78.0
+      },
+      {
+        "availability": "EXACT_HISTORICAL",
+        "description": "Watchlist soak duration >= MIN_WATCHLIST_SOAK_MINUTES",
+        "explanation": "Recorded soak_minutes=0.05m < 1.00m.",
+        "gate_id": "G08_WATCHLIST_SOAK_GATE",
+        "is_hard_entry_gate": true,
+        "observed_value": 0.05,
+        "stage": "scalper_entry_engine.evaluate_scalper_entry (L220, L280)",
+        "status": "FAIL",
+        "threshold_provenance": "SUPPLIED_PI_ENV_SNAPSHOT_NOT_VERIFIED_AS_PID_8315_EFFECTIVE_RUNTIME",
+        "threshold_value": 1.0
+      },
+      {
+        "availability": "MISSING",
+        "description": "5m total transactions >= SCALPER_MIN_TXNS_5M (note: SCALPER_MIN_BUY_RATIO_5M bypassed for BREAKOUT_IGNITION)",
+        "explanation": "Historical 5m transaction counts (txns.m5.buys + sells) were not persisted in DuckDB; SCALPER_MIN_TXNS_5M cannot be independently evaluated.",
+        "gate_id": "G09_SCALPER_MIN_TXNS_5M",
+        "is_hard_entry_gate": true,
+        "observed_value": null,
+        "stage": "scalper_entry_engine.evaluate_scalper_entry (L222, L305)",
+        "status": "NOT_REPLAYABLE",
+        "threshold_provenance": "EXPECTED_FROM_CODE_DEFAULT_OMITTED_IN_SUPPLIED_SNAPSHOT",
+        "threshold_value": 15
+      },
+      {
+        "availability": "EXACT_HISTORICAL",
+        "description": "BREAKOUT_IGNITION permitted by CHART_ENABLED_STRATEGIES",
+        "explanation": "BREAKOUT_IGNITION is enabled in profile 'supplied_phase1_pi_snapshot'.",
+        "gate_id": "G10_CHART_STRATEGY_ALLOWLIST",
+        "is_hard_entry_gate": true,
+        "observed_value": [
+          "BREAKOUT_IGNITION"
+        ],
+        "stage": "scalper_entry_engine (L274), alpha_node (L229, L439), executor_node (L134)",
+        "status": "PASS",
+        "threshold_provenance": "SUPPLIED_PI_ENV_SNAPSHOT_NOT_VERIFIED_AS_PID_8315_EFFECTIVE_RUNTIME",
+        "threshold_value": "BREAKOUT_IGNITION"
+      },
+      {
+        "availability": "EXACT_HISTORICAL",
+        "description": "Alpha action choice == 'BUY' (standard BREAKOUT_IGNITION path)",
+        "explanation": "Recorded Alpha action='REJECT' != 'BUY'.",
+        "gate_id": "G11_ALPHA_ACTION_CHOICE",
+        "is_hard_entry_gate": true,
+        "observed_value": "REJECT",
+        "stage": "alpha_node.alpha_node (L213)",
+        "status": "FAIL",
+        "threshold_provenance": "HARDCODED_CODE_INVARIANT",
+        "threshold_value": "BUY"
+      },
+      {
+        "availability": "EXACT_HISTORICAL",
+        "description": "BUY action confidence >= MIN_BUY_CONFIDENCE",
+        "explanation": "action_log.buy_confidence=0.800 records confidence in 'REJECT', not BUY confidence (Alpha chose non-BUY action).",
+        "gate_id": "G12_ALPHA_MIN_BUY_CONFIDENCE",
+        "is_hard_entry_gate": true,
+        "observed_value": 0.8,
+        "stage": "alpha_node.alpha_node (L214)",
+        "status": "NOT_REPLAYABLE",
+        "threshold_provenance": "SUPPLIED_PI_ENV_SNAPSHOT_NOT_VERIFIED_AS_PID_8315_EFFECTIVE_RUNTIME",
+        "threshold_value": 0.55
+      },
+      {
+        "availability": "EXACT_HISTORICAL",
+        "description": "Copycat/vamp probability <= MAX_VAMP_ENTRY",
+        "explanation": "Recorded vamp_score=0.501 <= 0.55.",
+        "gate_id": "G13_ALPHA_MAX_VAMP_ENTRY",
+        "is_hard_entry_gate": true,
+        "observed_value": 0.501,
+        "stage": "alpha_node.alpha_node (L215)",
+        "status": "PASS",
+        "threshold_provenance": "SUPPLIED_PI_ENV_SNAPSHOT_NOT_VERIFIED_AS_PID_8315_EFFECTIVE_RUNTIME",
+        "threshold_value": 0.55
+      },
+      {
+        "availability": "EXACT_HISTORICAL",
+        "description": "Narrative strength >= MIN_NARRATIVE_SCORE",
+        "explanation": "Recorded narrative_score=1.95 < 2.00.",
+        "gate_id": "G14_ALPHA_MIN_NARRATIVE_SCORE",
+        "is_hard_entry_gate": true,
+        "observed_value": 1.95,
+        "stage": "alpha_node.alpha_node (L216)",
+        "status": "FAIL",
+        "threshold_provenance": "SUPPLIED_PI_ENV_SNAPSHOT_NOT_VERIFIED_AS_PID_8315_EFFECTIVE_RUNTIME",
+        "threshold_value": 2.0
+      },
+      {
+        "availability": "EXACT_HISTORICAL",
+        "description": "Momentum quality >= MIN_MOMENTUM_SCORE",
+        "explanation": "Recorded momentum_score=1.26 < 2.00.",
+        "gate_id": "G15_ALPHA_MIN_MOMENTUM_SCORE",
+        "is_hard_entry_gate": true,
+        "observed_value": 1.26,
+        "stage": "alpha_node.alpha_node (L217)",
+        "status": "FAIL",
+        "threshold_provenance": "SUPPLIED_PI_ENV_SNAPSHOT_NOT_VERIFIED_AS_PID_8315_EFFECTIVE_RUNTIME",
+        "threshold_value": 2.0
+      },
+      {
+        "availability": "RECONSTRUCTABLE",
+        "description": "Mint not already open and Chart/global position slots available",
+        "explanation": "Reconstructed from trades <= decision_timestamp: open_chart=0/3, total=1/6, dup_mint=False.",
+        "gate_id": "G16_PORTFOLIO_SLOT_AND_DUPLICATE_MINT",
+        "is_hard_entry_gate": true,
+        "observed_value": {
+          "mint_already_open": false,
+          "open_chart_count": 0,
+          "open_total_count": 1
+        },
+        "stage": "alpha_node (L66-69, L432-438) & executor_node (L151-161)",
+        "status": "PASS",
+        "threshold_provenance": "SUPPLIED_PI_ENV_SNAPSHOT_NOT_VERIFIED_AS_PID_8315_EFFECTIVE_RUNTIME",
+        "threshold_value": {
+          "MAX_CHART_POSITIONS": 3,
+          "MAX_OPEN_POSITIONS": 6
+        }
+      }
+    ],
+    "mint": "32rBxcFjCFnyqZ41CEPM5AL67X1dcw8w83vZt6Kxpump",
+    "non_replayable_hard_gate_count": 5,
+    "not_replayable_gate_ids": [
+      "G01_RAW_BREAKOUT_DETECTOR",
+      "G02_BREAKOUT_RESISTANCE_AND_BODY",
+      "G03_BREAKOUT_FLOW_AND_ACCEL_SCORE_PILLARS",
+      "G06_BREAKOUT_ANTI_CHASE_EXTENSION",
+      "G09_SCALPER_MIN_TXNS_5M",
+      "G12_ALPHA_MIN_BUY_CONFIDENCE"
+    ],
+    "overall_entry_verdict": "DETERMINISTICALLY_REJECTED_OR_BLOCKED",
+    "passed_hard_gate_ids": [
+      "G07_BREAKOUT_RSI_CEILING",
+      "G10_CHART_STRATEGY_ALLOWLIST",
+      "G13_ALPHA_MAX_VAMP_ENTRY",
+      "G16_PORTFOLIO_SLOT_AND_DUPLICATE_MINT"
+    ],
+    "replay_mode": "DETERMINISTIC_GATE_REPLAY",
+    "replayable_hard_gate_count": 10,
+    "runtime_code_provenance": "HISTORICAL_CODE_VERSION_UNVERIFIED",
+    "source_action_log_id": 104876,
+    "source_table": "action_log",
+    "strategy_scope": "BREAKOUT_IGNITION",
+    "symbol": "PAIR"
+  },
+  "execution_analysis": {
+    "config_profile_name": "supplied_phase1_pi_snapshot",
+    "executable_quote_availability": "UNAVAILABLE",
+    "lifecycles": [],
+    "mint": "32rBxcFjCFnyqZ41CEPM5AL67X1dcw8w83vZt6Kxpump",
+    "note": "Candidate was NOT traded in BREAKOUT_IGNITION. Historical Jupiter order quotes, route price impact, and executable slippage are UNAVAILABLE; chart/DexScreener prices are never treated as executable fills.",
+    "runtime_code_provenance": "HISTORICAL_CODE_VERSION_UNVERIFIED",
+    "symbol": "PAIR",
+    "traded": false
+  },
+  "post_decision_outcome_analysis": {
+    "blind_gap_minutes_after_decision": 17.0,
+    "decision_timestamp": "2026-11-26T15:05:03.504192+00:00",
+    "episode_id": "32rBxcFj-ep005",
+    "executable_fill_disclaimer": "Outcome metrics are 60-second DexScreener spot polls (PRICE_ONLY), and trajectory USD prices between snapshots are INFERRED_PRICE_FROM_MARKET_CAP. Neither proves executable Jupiter fill prices or liquidity depth.",
+    "inferred_price_provenance_label": "INFERRED_PRICE_FROM_MARKET_CAP",
+    "matched_outcome_record": {
+      "decision": "REJECTED",
+      "decision_reason": "REJECT -> REJECT",
+      "discovered_at": "2026-11-26T15:05:03.504192+00:00",
+      "entry_liq_usd": 28543.96,
+      "entry_mc_usd": 148391.0,
+      "entry_price_usd": 0.0001486,
+      "evidence_classification": "PRICE_ONLY",
+      "finalized": true,
+      "mae_pct": 0.0,
+      "mfe_pct": 95.42,
+      "mint": "32rBxcFjCFnyqZ41CEPM5AL67X1dcw8w83vZt6Kxpump",
+      "outcome_id": "32rBxcFj-1795705503-0c8e52",
+      "price_15m_pct": 41.72,
+      "price_1m_pct": 5.92,
+      "price_30m_pct": 94.28,
+      "price_5m_pct": 24.09,
+      "strategy": "NONE",
+      "symbol": "PAIR"
+    },
+    "min_liq_usd_after_decision": 25659.31,
+    "mint": "32rBxcFjCFnyqZ41CEPM5AL67X1dcw8w83vZt6Kxpump",
+    "outcome_deduplicated_away": false,
+    "peak_liq_usd_after_decision": 53493.16,
+    "peak_mc_usd_after_decision": 487301.0,
+    "runtime_code_provenance": "HISTORICAL_CODE_VERSION_UNVERIFIED",
+    "sample_trajectory_30m": [
+      {
+        "elapsed_minutes": 17.0,
+        "inferred_price_usd": 0.0002419333,
+        "liq_change_pct": 29.15,
+        "liq_usd": 36864.48,
+        "mc_change_pct": 62.81,
+        "mc_usd": 241593.0,
+        "price_provenance": "INFERRED_PRICE_FROM_MARKET_CAP",
+        "timestamp_utc": "2026-11-26T15:22:03.299520+00:00"
+      },
+      {
+        "elapsed_minutes": 17.88,
+        "inferred_price_usd": 0.0002334834,
+        "liq_change_pct": 26.93,
+        "liq_usd": 36231.77,
+        "mc_change_pct": 57.12,
+        "mc_usd": 233155.0,
+        "price_provenance": "INFERRED_PRICE_FROM_MARKET_CAP",
+        "timestamp_utc": "2026-11-26T15:22:56.106893+00:00"
+      },
+      {
+        "elapsed_minutes": 18.72,
+        "inferred_price_usd": 0.000224709,
+        "liq_change_pct": 24.67,
+        "liq_usd": 35584.46,
+        "mc_change_pct": 51.22,
+        "mc_usd": 224393.0,
+        "price_provenance": "INFERRED_PRICE_FROM_MARKET_CAP",
+        "timestamp_utc": "2026-11-26T15:23:46.830344+00:00"
+      },
+      {
+        "elapsed_minutes": 19.57,
+        "inferred_price_usd": 0.0002436597,
+        "liq_change_pct": 30.18,
+        "liq_usd": 37159.78,
+        "mc_change_pct": 63.97,
+        "mc_usd": 243317.0,
+        "price_provenance": "INFERRED_PRICE_FROM_MARKET_CAP",
+        "timestamp_utc": "2026-11-26T15:24:37.920492+00:00"
+      },
+      {
+        "elapsed_minutes": 20.46,
+        "inferred_price_usd": 0.0002582552,
+        "liq_change_pct": 31.99,
+        "liq_usd": 37674.31,
+        "mc_change_pct": 73.79,
+        "mc_usd": 257892.0,
+        "price_provenance": "INFERRED_PRICE_FROM_MARKET_CAP",
+        "timestamp_utc": "2026-11-26T15:25:30.806847+00:00"
+      },
+      {
+        "elapsed_minutes": 21.3,
+        "inferred_price_usd": 0.000251698,
+        "liq_change_pct": 30.33,
+        "liq_usd": 37200.41,
+        "mc_change_pct": 69.38,
+        "mc_usd": 251344.0,
+        "price_provenance": "INFERRED_PRICE_FROM_MARKET_CAP",
+        "timestamp_utc": "2026-11-26T15:26:21.275984+00:00"
+      },
+      {
+        "elapsed_minutes": 22.14,
+        "inferred_price_usd": 0.0002654774,
+        "liq_change_pct": 34.07,
+        "liq_usd": 38270.18,
+        "mc_change_pct": 78.65,
+        "mc_usd": 265104.0,
+        "price_provenance": "INFERRED_PRICE_FROM_MARKET_CAP",
+        "timestamp_utc": "2026-11-26T15:27:11.746032+00:00"
+      },
+      {
+        "elapsed_minutes": 22.97,
+        "inferred_price_usd": 0.0002692036,
+        "liq_change_pct": 35.1,
+        "liq_usd": 38563.79,
+        "mc_change_pct": 81.16,
+        "mc_usd": 268825.0,
+        "price_provenance": "INFERRED_PRICE_FROM_MARKET_CAP",
+        "timestamp_utc": "2026-11-26T15:28:01.678341+00:00"
+      },
+      {
+        "elapsed_minutes": 23.94,
+        "inferred_price_usd": 0.0002918094,
+        "liq_change_pct": 40.98,
+        "liq_usd": 40241.66,
+        "mc_change_pct": 96.37,
+        "mc_usd": 291399.0,
+        "price_provenance": "INFERRED_PRICE_FROM_MARKET_CAP",
+        "timestamp_utc": "2026-11-26T15:29:00.110396+00:00"
+      },
+      {
+        "elapsed_minutes": 24.79,
+        "inferred_price_usd": 0.0002903664,
+        "liq_change_pct": 40.81,
+        "liq_usd": 40192.48,
+        "mc_change_pct": 95.4,
+        "mc_usd": 289958.0,
+        "price_provenance": "INFERRED_PRICE_FROM_MARKET_CAP",
+        "timestamp_utc": "2026-11-26T15:29:50.719130+00:00"
+      },
+      {
+        "elapsed_minutes": 25.66,
+        "inferred_price_usd": 0.0002889103,
+        "liq_change_pct": 41.2,
+        "liq_usd": 40304.35,
+        "mc_change_pct": 94.42,
+        "mc_usd": 288504.0,
+        "price_provenance": "INFERRED_PRICE_FROM_MARKET_CAP",
+        "timestamp_utc": "2026-11-26T15:30:43.077907+00:00"
+      },
+      {
+        "elapsed_minutes": 26.5,
+        "inferred_price_usd": 0.0002724352,
+        "liq_change_pct": 37.13,
+        "liq_usd": 39141.98,
+        "mc_change_pct": 83.33,
+        "mc_usd": 272052.0,
+        "price_provenance": "INFERRED_PRICE_FROM_MARKET_CAP",
+        "timestamp_utc": "2026-11-26T15:31:33.238031+00:00"
+      },
+      {
+        "elapsed_minutes": 27.48,
+        "inferred_price_usd": 0.0002763897,
+        "liq_change_pct": 38.29,
+        "liq_usd": 39472.62,
+        "mc_change_pct": 86.0,
+        "mc_usd": 276001.0,
+        "price_provenance": "INFERRED_PRICE_FROM_MARKET_CAP",
+        "timestamp_utc": "2026-11-26T15:32:32.193911+00:00"
+      },
+      {
+        "elapsed_minutes": 28.31,
+        "inferred_price_usd": 0.0002890095,
+        "liq_change_pct": 41.59,
+        "liq_usd": 40413.98,
+        "mc_change_pct": 94.49,
+        "mc_usd": 288603.0,
+        "price_provenance": "INFERRED_PRICE_FROM_MARKET_CAP",
+        "timestamp_utc": "2026-11-26T15:33:22.058681+00:00"
+      },
+      {
+        "elapsed_minutes": 29.22,
+        "inferred_price_usd": 0.0002885859,
+        "liq_change_pct": 41.6,
+        "liq_usd": 40417.22,
+        "mc_change_pct": 94.2,
+        "mc_usd": 288180.0,
+        "price_provenance": "INFERRED_PRICE_FROM_MARKET_CAP",
+        "timestamp_utc": "2026-11-26T15:34:16.417132+00:00"
+      },
+      {
+        "elapsed_minutes": 29.92,
+        "inferred_price_usd": 0.0002883245,
+        "liq_change_pct": 41.61,
+        "liq_usd": 40420.71,
+        "mc_change_pct": 94.03,
+        "mc_usd": 287919.0,
+        "price_provenance": "INFERRED_PRICE_FROM_MARKET_CAP",
+        "timestamp_utc": "2026-11-26T15:34:58.455261+00:00"
+      }
+    ],
+    "subsequent_observation_count_30m": 45,
+    "symbol": "PAIR"
+  },
+  "recorded_decision_audit": {
+    "config_profile_name": "supplied_phase1_pi_snapshot",
+    "config_profile_provenance": "SUPPLIED_PI_ENV_SNAPSHOT_NOT_VERIFIED_AS_PID_8315_EFFECTIVE_RUNTIME",
+    "decision_timestamp": "2026-11-26T15:05:03.504192+00:00",
+    "episode_id": "32rBxcFj-ep005",
+    "mint": "32rBxcFjCFnyqZ41CEPM5AL67X1dcw8w83vZt6Kxpump",
+    "recorded_alpha_action": "REJECT",
+    "recorded_alpha_action_provenance": "EXACT_HISTORICAL",
+    "recorded_decision_class": "REJECT",
+    "recorded_evicted_same_tick": true,
+    "recorded_eviction_reason": "LOW_SCORE (narr=1.95, mom=1.26 < 2.0)",
+    "recorded_hard_veto_diagnostics": [
+      "RES(no_break)",
+      "VOL_SPIKE(0.5x<0.7x)"
+    ],
+    "recorded_metric_provenance": {
+      "breakout_ema_ext_pct": "EXACT_HISTORICAL",
+      "breakout_failed_gates": "EXACT_HISTORICAL",
+      "breakout_score": "EXACT_HISTORICAL",
+      "breakout_state": "EXACT_HISTORICAL",
+      "breakout_timeframe": "EXACT_HISTORICAL",
+      "breakout_vol_ratio": "EXACT_HISTORICAL",
+      "buy_confidence": "EXACT_HISTORICAL",
+      "leg2_score": "EXACT_HISTORICAL",
+      "liq_usd": "EXACT_HISTORICAL",
+      "mc_usd": "EXACT_HISTORICAL",
+      "momentum_score": "EXACT_HISTORICAL",
+      "narrative_score": "EXACT_HISTORICAL",
+      "rsi": "EXACT_HISTORICAL",
+      "soak_minutes": "EXACT_HISTORICAL",
+      "vamp_score": "EXACT_HISTORICAL"
+    },
+    "recorded_metrics": {
+      "breakout_ema_ext_pct": -17.01,
+      "breakout_failed_gates": [
+        "COIL(91.6%>7.0%)",
+        "RES(no_break)",
+        "VOL_SPIKE(0.5x<0.7x)",
+        "BUY_RATIO(53%<62%)",
+        "BUY_ACCEL(0.6x<1.5x)",
+        "EMA(not_aligned)",
+        "HTF_15M(bearish)"
+      ],
+      "breakout_score": 18,
+      "breakout_state": "FORMING",
+      "breakout_timeframe": "5m",
+      "breakout_vol_ratio": 0.47,
+      "buy_confidence": 0.8,
+      "leg2_score": 39.1,
+      "liq_usd": 28543.96,
+      "mc_usd": 148391.0,
+      "momentum_score": 1.26,
+      "narrative_score": 1.95,
+      "rsi": 57.95,
+      "soak_minutes": 0.05,
+      "vamp_score": 0.501
+    },
+    "recorded_reason": "REJECT -> REJECT",
+    "recorded_score_deduction_diagnostics": [
+      "COIL(91.6%>7.0%)",
+      "BUY_RATIO(53%<62%)",
+      "BUY_ACCEL(0.6x<1.5x)",
+      "EMA(not_aligned)",
+      "HTF_15M(bearish)"
+    ],
+    "recorded_strategy": "NONE",
+    "replay_mode": "RECORDED_DECISION_AUDIT",
+    "runtime_code_provenance": "HISTORICAL_CODE_VERSION_UNVERIFIED",
+    "source_action_log_id": 104876,
+    "source_decisions_log_id": null,
+    "source_table": "action_log",
+    "source_terminal_action_log_id": 104877,
+    "strategy_scope": "BREAKOUT_IGNITION",
+    "symbol": "PAIR",
+    "unclassified_diagnostics": []
+  },
+  "runtime_code_provenance": "HISTORICAL_CODE_VERSION_UNVERIFIED",
+  "snapshot_provenance": {
+    "db_sha256": "fd5fe1ef0517eda7a23fe8d0240d8bbec058b5584f3ce4d4a505f1a3e8dc3abd",
+    "snapshot_method": "OFFLINE_LOCK_FREE_SHA256_VERIFIED_SNAPSHOT",
+    "source_db_path": "/mnt/toshiba/Dev/Web3_Dev/solana-trading-agent/reports/phase1/solana_meme_agent.duckdb",
+    "wal_included": true,
+    "wal_sha256": "771c2ce29a60edc121b42427317aeab48b665cedcab99ad98fd108eaf7e5252b"
+  },
+  "strategy_scope": "BREAKOUT_IGNITION",
+  "target": {
+    "decision_timestamp": "2026-11-26T15:05:03.504192+00:00",
+    "episode_id": "32rBxcFj-ep005",
+    "mint": "32rBxcFjCFnyqZ41CEPM5AL67X1dcw8w83vZt6Kxpump",
+    "mint_total_d1_observations_in_window": 362,
+    "mint_total_episodes_in_window": 20,
+    "symbol": "PAIR"
+  }
+}

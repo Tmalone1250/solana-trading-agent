@@ -1,0 +1,32 @@
+[Unit]
+Description=Solana Replay Simulator - Isolated One-Shot BREAKOUT_IGNITION Historical Audit
+# Intentionally has NO Requires=, Wants=, BindsTo=, PartOf=, or Conflicts= on solana-trading-agent.service
+
+[Service]
+Type=oneshot
+User=tmalone1250
+WorkingDirectory=/home/tmalone1250/solana-trading-agent
+
+# Reads ONLY a separate pre-staged database snapshot (never the active live DuckDB)
+ExecStart=/home/tmalone1250/solana-trading-agent/venv/bin/python -m simulator \
+    --db /home/tmalone1250/solana-trading-agent/reports/snapshots/solana_meme_agent.duckdb \
+    --profile supplied_phase1_pi_snapshot \
+    --mode all \
+    --out-dir /home/tmalone1250/solana-trading-agent/reports/replay_out
+
+# Separate journal identifier and bounded runtime/resource limits for Raspberry Pi 4
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solana-replay-simulator
+TimeoutStartSec=180
+Nice=10
+CPUQuota=50%
+MemoryMax=512M
+
+# Kernel-level network & filesystem sandboxing
+PrivateNetwork=true
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadOnlyPaths=/home/tmalone1250/solana-trading-agent
+ReadWritePaths=/home/tmalone1250/solana-trading-agent/reports
