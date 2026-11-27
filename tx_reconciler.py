@@ -623,15 +623,23 @@ async def reconcile_single_intent(
 
     sig_err = sig_status.get("err")
     if sig_err is not None:
-        # Require matching terminal getTransaction.meta.err; null/missing/malformed meta remains UNRESOLVED
+        # Require matching structured terminal getTransaction.meta.err; null/missing/malformed/differing err remains UNRESOLVED
         if not isinstance(tx_obj, dict) or not isinstance(tx_obj.get("meta"), dict):
             db.transition_order_intent(
                 intent_id, new_status="UNRESOLVED", error_detail="GET_TRANSACTION_MISSING_OR_MALFORMED_ON_ERR"
             )
             return "UNRESOLVED"
-        if tx_obj["meta"].get("err") is None:
+        tx_err = tx_obj["meta"].get("err")
+        if tx_err is None:
             db.transition_order_intent(
-                intent_id, new_status="UNRESOLVED", error_detail="STATUS_AND_GET_TX_ERR_DISAGREE"
+                intent_id, new_status="UNRESOLVED", error_detail="STATUS_AND_GET_TX_ERR_DISAGREE:meta_err_none"
+            )
+            return "UNRESOLVED"
+        if sig_err != tx_err:
+            db.transition_order_intent(
+                intent_id,
+                new_status="UNRESOLVED",
+                error_detail=f"STATUS_AND_GET_TX_ERR_MISMATCH: status={sig_err!r} != meta={tx_err!r}",
             )
             return "UNRESOLVED"
         db.transition_order_intent(intent_id, new_status="FAILED", error_detail=f"ONCHAIN_ERR:{sig_err}")

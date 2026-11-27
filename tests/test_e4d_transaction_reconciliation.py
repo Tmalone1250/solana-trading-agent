@@ -508,7 +508,14 @@ async def test_e4d_terminal_status_error_with_null_missing_or_malformed_get_tran
         token_decimals=6, taker_pubkey=taker, reserved_sol=0.51, status="UNRESOLVED",
     )
 
-    tx_payloads: list[Any] = [None, {}, {"meta": None}, {"meta": "bad"}, {"meta": {"err": None}}]
+    tx_payloads: list[Any] = [
+        None,
+        {},
+        {"meta": None},
+        {"meta": "bad"},
+        {"meta": {"err": None}},
+        {"meta": {"err": {"InstructionError": [1, "DifferentErr"]}}},  # different non-null error
+    ]
     idx = {"i": 0}
 
     def rpc_handler(request: httpx.Request) -> httpx.Response:
@@ -526,4 +533,11 @@ async def test_e4d_terminal_status_error_with_null_missing_or_malformed_get_tran
             res = await reconcile_unresolved_intents(db, config=cfg, client=client)
             assert res == [("int-f2", "UNRESOLVED")]
             assert len(get_inflight_buy_reservations(str(db.db_path))) == 1
+        assert "MISMATCH" in (db.get_order_intent("int-f2")["error_detail"] or "")
+
+        # Matching non-null error transitions to FAILED and releases reservation
+        tx_payloads.append({"meta": {"err": {"InstructionError": [0, "Custom"]}}})
+        res_match = await reconcile_unresolved_intents(db, config=cfg, client=client)
+        assert res_match == [("int-f2", "FAILED")]
+        assert get_inflight_buy_reservations(str(db.db_path)) == []
     db.close()

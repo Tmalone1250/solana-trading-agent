@@ -1,5 +1,5 @@
 diff --git a/db.py b/db.py
-index 3b536b0..6110832 100644
+index 3b536b0..0d50dc1 100644
 --- a/db.py
 +++ b/db.py
 @@ -212,6 +212,40 @@ class AgentDatabase:
@@ -43,7 +43,7 @@ index 3b536b0..6110832 100644
              self._conn.execute(
                  """
                  CREATE TABLE IF NOT EXISTS social_signals (
-@@ -606,6 +640,207 @@ class AgentDatabase:
+@@ -606,6 +640,211 @@ class AgentDatabase:
      def reserve_buy_slot(self, **kwargs: Any) -> tuple[Optional[str], Optional[str]]:
          return reserve_buy_slot(self, **kwargs)
  
@@ -145,14 +145,18 @@ index 3b536b0..6110832 100644
 +            self._conn.execute("BEGIN TRANSACTION")
 +            try:
 +                row = self._conn.execute(
-+                    "SELECT status, tx_signature FROM order_intents WHERE intent_id = ?",
++                    "SELECT status, tx_signature, error_detail FROM order_intents WHERE intent_id = ?",
 +                    [intent_id],
 +                ).fetchone()
 +                if not row:
 +                    self._conn.execute("ROLLBACK")
 +                    return False
-+                curr_status, curr_sig = str(row[0]), row[1]
-+                if curr_status == new_status and (tx_signature is None or tx_signature == curr_sig):
++                curr_status, curr_sig, curr_err = str(row[0]), row[1], row[2]
++                if (
++                    curr_status == new_status
++                    and (tx_signature is None or tx_signature == curr_sig)
++                    and (error_detail is None or error_detail == curr_err)
++                ):
 +                    self._conn.execute("COMMIT")
 +                    return True
 +                # Never allow a terminal intent (RECONCILED or FAILED) to transition backward
@@ -625,10 +629,10 @@ index 746888d..f278e41 100644
              try:
 diff --git a/tests/test_e4d_transaction_reconciliation.py b/tests/test_e4d_transaction_reconciliation.py
 new file mode 100644
-index 0000000..c86bac6
+index 0000000..5a3a2fa
 --- /dev/null
 +++ b/tests/test_e4d_transaction_reconciliation.py
-@@ -0,0 +1,529 @@
+@@ -0,0 +1,543 @@
 +"""Phase E4D Tests: Durable Transaction Intent & Evidence-Based RPC Reconciliation."""
 +
 +from __future__ import annotations
@@ -1139,7 +1143,14 @@ index 0000000..c86bac6
 +        token_decimals=6, taker_pubkey=taker, reserved_sol=0.51, status="UNRESOLVED",
 +    )
 +
-+    tx_payloads: list[Any] = [None, {}, {"meta": None}, {"meta": "bad"}, {"meta": {"err": None}}]
++    tx_payloads: list[Any] = [
++        None,
++        {},
++        {"meta": None},
++        {"meta": "bad"},
++        {"meta": {"err": None}},
++        {"meta": {"err": {"InstructionError": [1, "DifferentErr"]}}},  # different non-null error
++    ]
 +    idx = {"i": 0}
 +
 +    def rpc_handler(request: httpx.Request) -> httpx.Response:
@@ -1157,13 +1168,20 @@ index 0000000..c86bac6
 +            res = await reconcile_unresolved_intents(db, config=cfg, client=client)
 +            assert res == [("int-f2", "UNRESOLVED")]
 +            assert len(get_inflight_buy_reservations(str(db.db_path))) == 1
++        assert "MISMATCH" in (db.get_order_intent("int-f2")["error_detail"] or "")
++
++        # Matching non-null error transitions to FAILED and releases reservation
++        tx_payloads.append({"meta": {"err": {"InstructionError": [0, "Custom"]}}})
++        res_match = await reconcile_unresolved_intents(db, config=cfg, client=client)
++        assert res_match == [("int-f2", "FAILED")]
++        assert get_inflight_buy_reservations(str(db.db_path)) == []
 +    db.close()
 diff --git a/tx_reconciler.py b/tx_reconciler.py
 new file mode 100644
-index 0000000..0e7685b
+index 0000000..81d37a1
 --- /dev/null
 +++ b/tx_reconciler.py
-@@ -0,0 +1,697 @@
+@@ -0,0 +1,705 @@
 +"""Phase E4D: Durable Transaction Intent Attribution & Evidence-Based RPC Reconciliation."""
 +
 +from __future__ import annotations
@@ -1789,15 +1807,23 @@ index 0000000..0e7685b
 +
 +    sig_err = sig_status.get("err")
 +    if sig_err is not None:
-+        # Require matching terminal getTransaction.meta.err; null/missing/malformed meta remains UNRESOLVED
++        # Require matching structured terminal getTransaction.meta.err; null/missing/malformed/differing err remains UNRESOLVED
 +        if not isinstance(tx_obj, dict) or not isinstance(tx_obj.get("meta"), dict):
 +            db.transition_order_intent(
 +                intent_id, new_status="UNRESOLVED", error_detail="GET_TRANSACTION_MISSING_OR_MALFORMED_ON_ERR"
 +            )
 +            return "UNRESOLVED"
-+        if tx_obj["meta"].get("err") is None:
++        tx_err = tx_obj["meta"].get("err")
++        if tx_err is None:
 +            db.transition_order_intent(
-+                intent_id, new_status="UNRESOLVED", error_detail="STATUS_AND_GET_TX_ERR_DISAGREE"
++                intent_id, new_status="UNRESOLVED", error_detail="STATUS_AND_GET_TX_ERR_DISAGREE:meta_err_none"
++            )
++            return "UNRESOLVED"
++        if sig_err != tx_err:
++            db.transition_order_intent(
++                intent_id,
++                new_status="UNRESOLVED",
++                error_detail=f"STATUS_AND_GET_TX_ERR_MISMATCH: status={sig_err!r} != meta={tx_err!r}",
 +            )
 +            return "UNRESOLVED"
 +        db.transition_order_intent(intent_id, new_status="FAILED", error_detail=f"ONCHAIN_ERR:{sig_err}")

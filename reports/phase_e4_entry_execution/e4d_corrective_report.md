@@ -19,6 +19,9 @@
 3. **Finding 3 — Persist Reconciled Token Decimals (`tx_reconciler.py`)**:
    - Persisted `snap["reconciled_decimals"] = attr.get("decimals")` alongside `reconciled_out_tokens` and `reconciled_entry_sol`.
    - On `SETTLEMENT_PENDING_PERSISTENCE` retry, restored `snap.get("reconciled_decimals")` (falling back to `intent.get("token_decimals")` only if `None`), preserving non-6 decimals across settlement failures and retries.
+4. **Finding 4 — Require Structurally Matching Terminal Transaction Errors (`tx_reconciler.py`, `db.py`)**:
+   - Required `sig_err == tx_err` (both non-null and structurally equal) before transitioning to `FAILED` and releasing the reservation.
+   - Different non-null errors retain `UNRESOLVED` with diagnostic `STATUS_AND_GET_TX_ERR_MISMATCH` (`db.transition_order_intent()` updated to persist new `error_detail` even when `curr_status == new_status`).
 
 ---
 

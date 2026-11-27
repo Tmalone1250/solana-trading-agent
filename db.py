@@ -738,14 +738,18 @@ class AgentDatabase:
             self._conn.execute("BEGIN TRANSACTION")
             try:
                 row = self._conn.execute(
-                    "SELECT status, tx_signature FROM order_intents WHERE intent_id = ?",
+                    "SELECT status, tx_signature, error_detail FROM order_intents WHERE intent_id = ?",
                     [intent_id],
                 ).fetchone()
                 if not row:
                     self._conn.execute("ROLLBACK")
                     return False
-                curr_status, curr_sig = str(row[0]), row[1]
-                if curr_status == new_status and (tx_signature is None or tx_signature == curr_sig):
+                curr_status, curr_sig, curr_err = str(row[0]), row[1], row[2]
+                if (
+                    curr_status == new_status
+                    and (tx_signature is None or tx_signature == curr_sig)
+                    and (error_detail is None or error_detail == curr_err)
+                ):
                     self._conn.execute("COMMIT")
                     return True
                 # Never allow a terminal intent (RECONCILED or FAILED) to transition backward
