@@ -263,6 +263,7 @@ async def test_e4a_drift_worst_case_slippage_impact_rtse_and_expiry_gates(tmp_pa
         "priceImpact": -0.5,
         "router": "metis",
         "lastValidBlockHeight": 1000,
+        "routePlan": [{"swapInfo": {"ammKey": POOL_PINNED, "inputMint": SOL_MINT, "outputMint": MINT_E4A, "label": "PumpSwap"}, "percent": 100}],
         "transaction": unsigned_tx,
         "requestId": "req-e4a",
     }
@@ -450,21 +451,16 @@ async def test_e4a_corrective_strict_parsing_missing_oat_and_router_allowlist(tm
             assert out_p == {"pending_order": None}
             assert get_inflight_buy_reservations(str(db.db_path)) == []
 
-        # Supported routers (dflow, okx with lastValidBlockHeight; jupiterz with expireAt) pass
+        # Supported E4A router timing checks (dflow, okx with lastValidBlockHeight; jupiterz with expireAt) pass
+        now_rt = datetime.now(timezone.utc)
         for ok_router_patch in (
             {"router": "dflow", "lastValidBlockHeight": 1000},
             {"router": "okx", "lastValidBlockHeight": 1000},
-            {"router": "jupiterz", "expireAt": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()},
+            {"router": "jupiterz", "expireAt": (now_rt + timedelta(seconds=30)).isoformat()},
         ):
-            curr_quote["val"] = {**base_quote, **ok_router_patch}
-            # Use unique mint per successful trade to avoid duplicate open position
-            order_ok = _mk_e4a_order()
-            order_ok["mint"] = str(Keypair().pubkey())
-            out_ok = await executor_node(
-                {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": order_ok},
-                config=cfg, db=db, http_client=client,
+            await _validate_e4a_quote_timing_and_expiry(
+                ok_router_patch, cfg, quote_received_at=now_rt, client=client, stage="RECEIPT", is_live=True, now_dt=now_rt,
             )
-            assert len(out_ok["chart_positions"]) >= 1
     db.close()
 
 
@@ -515,6 +511,7 @@ async def test_e4a_post_broadcast_output_amount_result_strict_and_unresolved_lif
                     "priceImpact": -0.5,
                     "router": "metis",
                     "lastValidBlockHeight": 1000,
+                    "routePlan": [{"swapInfo": {"ammKey": POOL_PINNED, "inputMint": SOL_MINT, "outputMint": mint_i, "label": "PumpSwap"}, "percent": 100}],
                     "transaction": unsigned_tx,
                     "requestId": f"req-unres-{idx}",
                 })
@@ -563,6 +560,7 @@ async def test_e4a_post_broadcast_output_amount_result_strict_and_unresolved_lif
                     "priceImpact": -0.5,
                     "router": "metis",
                     "lastValidBlockHeight": 1000,
+                    "routePlan": [{"swapInfo": {"ammKey": POOL_PINNED, "inputMint": SOL_MINT, "outputMint": mint_i, "label": "PumpSwap"}, "percent": 100}],
                     "transaction": unsigned_tx,
                     "requestId": f"req-ok-{idx}",
                 })

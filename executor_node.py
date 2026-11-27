@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import math
 import re
@@ -373,6 +374,84 @@ async def _validate_e4a_quote_receipt(
             )
 
 
+def _evaluate_e4b_route_pool(
+    order: PendingOrder,
+    order_resp: dict[str, Any],
+) -> tuple[Optional[str], list[str], str, Optional[str]]:
+    """Evaluate Jupiter routePlan against pinned pair_address per E4B router-specific contract.
+
+    Returns (router_norm, route_pool_keys, pool_route_status, block_reason).
+    """
+    raw_router = order_resp.get("router")
+    router_norm = raw_router.strip().lower() if isinstance(raw_router, str) and raw_router.strip() else None
+
+    route_plan = order_resp.get("routePlan")
+    route_pool_keys: list[str] = []
+    if isinstance(route_plan, list):
+        for hop in route_plan:
+            if isinstance(hop, dict) and isinstance(hop.get("swapInfo"), dict):
+                ak = hop["swapInfo"].get("ammKey")
+                if isinstance(ak, str) and ak.strip():
+                    route_pool_keys.append(ak.strip())
+
+    if router_norm != "metis":
+        return (
+            router_norm,
+            route_pool_keys,
+            "UNVERIFIABLE_ROUTER",
+            f"BLOCKED: ROUTE_POOL_UNVERIFIABLE (router={raw_router!r})",
+        )
+
+    if not isinstance(route_plan, list) or len(route_plan) == 0:
+        return (
+            router_norm,
+            route_pool_keys,
+            "MISSING_ROUTE_PLAN",
+            "BLOCKED: ROUTE_POOL_UNVERIFIABLE (missing or empty routePlan)",
+        )
+
+    pinned_pair = str(order.pair_address or "").strip()
+    qualifying_hops = 0
+    for hop in route_plan:
+        if not isinstance(hop, dict) or not isinstance(hop.get("swapInfo"), dict):
+            return (
+                router_norm,
+                route_pool_keys,
+                "MISSING_ROUTE_PLAN",
+                "BLOCKED: ROUTE_POOL_UNVERIFIABLE (malformed routePlan hop)",
+            )
+        swap_info = hop["swapInfo"]
+        in_mint = swap_info.get("inputMint")
+        out_mint = swap_info.get("outputMint")
+        if in_mint == order.mint or out_mint == order.mint:
+            qualifying_hops += 1
+            amm_key = swap_info.get("ammKey")
+            if not isinstance(amm_key, str) or not amm_key.strip():
+                return (
+                    router_norm,
+                    route_pool_keys,
+                    "MISSING_ROUTE_PLAN",
+                    "BLOCKED: ROUTE_POOL_UNVERIFIABLE (missing swapInfo.ammKey on target-mint hop)",
+                )
+            if amm_key.strip() != pinned_pair:
+                return (
+                    router_norm,
+                    route_pool_keys,
+                    "POOL_MISMATCH",
+                    f"BLOCKED: ROUTE_POOL_MISMATCH (expected={pinned_pair}, got={amm_key.strip()})",
+                )
+
+    if qualifying_hops == 0:
+        return (
+            router_norm,
+            route_pool_keys,
+            "MISSING_ROUTE_PLAN",
+            "BLOCKED: ROUTE_POOL_UNVERIFIABLE (no target-mint hop in routePlan)",
+        )
+
+    return (router_norm, route_pool_keys, "VERIFIED_PINNED_POOL", None)
+
+
 async def fetch_live_wallet_sol_balance(
     pubkey: str,
     *,
@@ -632,6 +711,9 @@ async def executor_node(
     settled_buy = False
     intent_id: Optional[str] = None
     buy_opened_at = utc_now_iso() if is_buy else None
+    e4b_router: Optional[str] = None
+    e4b_pool_keys: list[str] = []
+    e4b_pool_status: Optional[str] = None
 
     try:
         try:
@@ -652,10 +734,19 @@ async def executor_node(
             else:
                 raise
         out_amount = _parse_strict_int(order_resp.get("outAmount"), "OUT_AMOUNT", min_value=1)
+        # Phase E4B: Evaluate execution pool route telemetry before E4A checks so telemetry is always logged
+        e4b_block: Optional[str] = None
+        if is_buy and (order.strategy or "").strip().upper() == "BREAKOUT_IGNITION":
+            e4b_router, e4b_pool_keys, e4b_pool_status, e4b_block = _evaluate_e4b_route_pool(order, order_resp)
         # Checkpoint 1: Quote receipt validation (out_amount > 0 in all modes, plus E4A drift/impact/slippage/expiry)
         await _validate_e4a_quote_receipt(
             order, order_resp, out_amount, config, quote_received_at=quote_received_at, client=client,
         )
+        # Phase E4B: Enforce execution pool integrity (live unconditionally fail-closed; paper opt-in)
+        if e4b_block is not None and (
+            config.EXECUTION_MODE == "live" or config.REQUIRE_PINNED_POOL_ROUTE_IN_PAPER
+        ):
+            raise E4AValidationError(e4b_block)
         tx_signature: Optional[str] = None
         if config.EXECUTION_MODE == "live":
             tx_b64 = order_resp.get("transaction")
@@ -765,6 +856,9 @@ async def executor_node(
             symbol=order.symbol, asset_id=order.mint,
             strategy=order.strategy or "SCALPER", reason=str(exc),
             pair_address=order.pair_address, dex_id=order.dex_id,
+            router=e4b_router,
+            route_pool_keys=json.dumps(e4b_pool_keys) if e4b_pool_status is not None else None,
+            pool_route_status=e4b_pool_status,
         )
         return {"pending_order": None}
     except BaseException as exc:
@@ -894,6 +988,9 @@ async def executor_node(
             breakout_failed_gates="; ".join(bt.get("failed_gates") or []) if bt else None,
             jupiter_price_impact_raw=raw_price_impact,
             pair_address=pos.pair_address, dex_id=pos.dex_id,
+            router=e4b_router,
+            route_pool_keys=json.dumps(e4b_pool_keys) if e4b_pool_status is not None else None,
+            pool_route_status=e4b_pool_status,
         )
         logger.info("[%s] BUY %s: %.4f SOL -> %d tokens (reason=%s)", config.EXECUTION_MODE.upper(), order.symbol, spent_sol, out_amount, order.reason)
     elif is_partial_sell:
@@ -1080,6 +1177,9 @@ async def executor_node(
         "jupiter_price_impact_raw": raw_price_impact,
         "tx_fee_sol": tx_fee_opt, "fee_status": tx_fee_status,
         "fee_accounting_incomplete": tx_fee_opt is None,
+        "router": e4b_router,
+        "route_pool_keys": e4b_pool_keys if e4b_pool_status is not None else None,
+        "pool_route_status": e4b_pool_status,
     }
     if is_whale_slot:
         return {

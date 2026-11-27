@@ -54,6 +54,10 @@ ACTION_LOG_COLUMNS: list[str] = [
     # E1 pool identity continuity columns
     "pair_address",
     "dex_id",
+    # E4B execution pool route observability columns
+    "router",
+    "route_pool_keys",
+    "pool_route_status",
 ]
 
 ACTION_LOG_MIGRATIONS: list[tuple[str, str]] = [
@@ -86,6 +90,9 @@ ACTION_LOG_MIGRATIONS: list[tuple[str, str]] = [
     ("position_mae_pct", "DOUBLE"),
     ("pair_address", "VARCHAR"),
     ("dex_id", "VARCHAR"),
+    ("router", "VARCHAR"),
+    ("route_pool_keys", "VARCHAR"),
+    ("pool_route_status", "VARCHAR"),
 ]
 
 EXPORT_TYPE_ACTIONS: dict[str, Optional[list[str]]] = {

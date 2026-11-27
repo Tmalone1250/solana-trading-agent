@@ -1695,6 +1695,9 @@ class AgentDatabase:
         position_mae_pct: Optional[float] = None,
         pair_address: Optional[str] = None,
         dex_id: Optional[str] = None,
+        router: Optional[str] = None,
+        route_pool_keys: Optional[str] = None,
+        pool_route_status: Optional[str] = None,
     ) -> None:
         """Append a structured board action row to DuckDB action_log."""
         ts = timestamp_utc or utc_now_iso()
@@ -1733,6 +1736,7 @@ class AgentDatabase:
                     jupiter_price_impact_raw, monitor_sol_value, price_source,
                     position_mfe_pct, position_mae_pct,
                     clean_pair, clean_dex,
+                    router, route_pool_keys, pool_route_status,
                 ],
             )
 

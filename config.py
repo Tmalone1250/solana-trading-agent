@@ -204,6 +204,8 @@ class AgentConfig(BaseSettings):
     MAX_ENTRY_PRICE_IMPACT_PCT: float | None = Field(default=None, ge=0.0)
     MIN_BLOCK_HEIGHT_HEADROOM: int | None = Field(default=None, ge=0)
     MIN_RFQ_EXPIRY_HEADROOM_SECONDS: float | None = Field(default=None, ge=0.0)
+    # Phase E4B: Execution pool integrity (live unconditionally fail-closed; paper opt-in)
+    REQUIRE_PINNED_POOL_ROUTE_IN_PAPER: bool = False
 
     # Loop, Persistence & Telemetry
     MONITOR_POLL_SECONDS: float = Field(default=5.0, gt=0.0)
