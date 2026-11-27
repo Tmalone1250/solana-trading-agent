@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import math
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from state import FocusState
+
+logger = logging.getLogger(__name__)
 
 RESERVATION_TTL_SEC = 60.0
 SELL_GUARD_TTL_SEC = 60.0
@@ -108,10 +114,26 @@ def _utc_now_iso() -> str:
     return _utc_now().isoformat()
 
 
+def get_inflight_buy_reservations(db_path: str) -> list[dict[str, Any]]:
+    """Return a shallow copy of current in-flight BUY reservations for inspection/tests."""
+    return [dict(r) for r in _inflight_buy_reservations.get(str(db_path), [])]
+
+
+def _resolve_owner_task_id() -> str:
+    try:
+        curr_task = asyncio.current_task()
+        if curr_task is not None:
+            return f"task-{id(curr_task)}"
+    except RuntimeError:
+        pass
+    return f"thread-{threading.get_ident()}"
+
+
 def _prune_reservations_locked(db_path: str, now_ts: float) -> list[dict[str, Any]]:
     active = [
         r for r in _inflight_buy_reservations.get(db_path, [])
-        if (now_ts - float(r.get("created_ts") or 0.0)) < RESERVATION_TTL_SEC
+        if bool(r.get("active_coroutine", False))
+        or (now_ts - float(r.get("created_ts") or 0.0)) < RESERVATION_TTL_SEC
     ]
     _inflight_buy_reservations[db_path] = active
     return active
@@ -193,13 +215,42 @@ def reserve_buy_slot(
     max_open_positions: int,
     is_reentry_same_mint: bool = False,
     fallback_state_sol: Optional[float] = None,
+    daily_max_loss_pct: Optional[float] = None,
+    live_wallet_sol: Optional[float] = None,
+    live_min_sol_reserve: float = 0.0,
+    balance_divergence_warn_sol: Optional[float] = None,
+    now_dt: Optional[datetime] = None,
+    owner_task_id: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str]]:
-    """Atomically verify duplicate-mint, lane/global slot caps, and free SOL (including in-flight buys).
+    """Atomically verify cooldown, daily-loss, duplicate-mint, lane/global caps, and fee-aware free SOL.
 
     Returns (reservation_id, rejection_reason). If rejection_reason is not None, BUY must abort.
+    Note (E4C scope): Reservations are in-process only; durable post-broadcast recovery belongs to E4D.
     """
     with db._lock:
-        sol_bal, _, daily_pnl, _ = rollover_daily_if_needed_locked(db._conn)
+        sol_bal, daily_start, daily_pnl, _ = rollover_daily_if_needed_locked(db._conn)
+
+        # Atomic cooldown check under db._lock
+        check_now = now_dt or _utc_now()
+        cd_row = db._conn.execute(
+            "SELECT expires_at FROM cooldowns WHERE mint = ?", [mint]
+        ).fetchone()
+        if cd_row and cd_row[0]:
+            try:
+                exp_dt = datetime.fromisoformat(str(cd_row[0]))
+                if exp_dt.tzinfo is None:
+                    exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                if exp_dt > check_now:
+                    return None, f"ON_COOLDOWN ({mint} until {exp_dt.isoformat()})"
+            except ValueError:
+                pass
+
+        # Atomic daily max loss circuit-breaker check under db._lock
+        if daily_max_loss_pct is not None and daily_start > 0.0:
+            max_loss_sol = daily_start * float(daily_max_loss_pct)
+            if daily_pnl <= -max_loss_sol + 1e-12:
+                return None, f"DAILY_MAX_LOSS_HIT (daily_pnl={daily_pnl:.4f} <= -{max_loss_sol:.4f})"
+
         row = db._conn.execute(
             "SELECT active_position_json, whale_position_json, chart_positions_json, whale_positions_json FROM agent_state WHERE id = 1"
         ).fetchone()
@@ -237,10 +288,32 @@ def reserve_buy_slot(
         if (live_lane_cnt + res_lane_cnt) >= max_lane_positions or total_cnt >= max_open_positions:
             return None, f"LANE_CAPACITY (lane={live_lane_cnt + res_lane_cnt}/{max_lane_positions}, total={total_cnt}/{max_open_positions})"
 
+        fee_headroom = max(0.0, float(tx_fee_sol or 0.0))
+        total_required = float(required_sol) + fee_headroom
         reserved_sol = sum(float(r["sol_amount"]) for r in active_res)
-        avail_sol = sol_bal - reserved_sol
-        if avail_sol + 1e-9 < required_sol:
-            return None, f"INSUFFICIENT_SOL (avail={avail_sol:.4f} < req={required_sol:.4f})"
+        duck_avail_sol = sol_bal - reserved_sol
+
+        if live_wallet_sol is not None:
+            if not math.isfinite(live_wallet_sol) or live_wallet_sol < 0.0:
+                return None, "INVALID_LIVE_WALLET_BALANCE"
+            if (
+                balance_divergence_warn_sol is not None
+                and abs(float(live_wallet_sol) - sol_bal) > float(balance_divergence_warn_sol)
+            ):
+                logger.warning(
+                    "[Ledger] BALANCE_DIVERGENCE mint=%s wallet_sol=%.6f duckdb_sol=%.6f diff=%.6f (threshold=%.6f; capping spend without modifying historical PnL)",
+                    mint, float(live_wallet_sol), sol_bal, float(live_wallet_sol) - sol_bal, float(balance_divergence_warn_sol),
+                )
+            wallet_avail_sol = float(live_wallet_sol) - max(0.0, float(live_min_sol_reserve)) - reserved_sol
+            effective_avail = min(duck_avail_sol, wallet_avail_sol)
+            if effective_avail + 1e-9 < total_required:
+                return None, (
+                    f"INSUFFICIENT_SOL (effective_avail={effective_avail:.4f}, "
+                    f"duck_avail={duck_avail_sol:.4f}, wallet_avail={wallet_avail_sol:.4f} "
+                    f"< req_with_fee={total_required:.4f})"
+                )
+        elif duck_avail_sol + 1e-9 < total_required:
+            return None, f"INSUFFICIENT_SOL (avail={duck_avail_sol:.4f} < req_with_fee={total_required:.4f})"
 
         res_id = uuid.uuid4().hex
         active_res.append(
@@ -248,8 +321,10 @@ def reserve_buy_slot(
                 "id": res_id,
                 "lane": lane,
                 "mint": mint,
-                "sol_amount": float(required_sol + tx_fee_sol),
+                "sol_amount": total_required,
                 "created_ts": time.monotonic(),
+                "active_coroutine": True,
+                "owner_task_id": owner_task_id or _resolve_owner_task_id(),
             }
         )
         return res_id, None

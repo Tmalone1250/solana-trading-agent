@@ -44,6 +44,36 @@ def sign_jupiter_transaction(tx_base64: str, private_key_bs58: str) -> str:
     return base64.b64encode(bytes(signed_tx)).decode("ascii")
 
 
+async def fetch_live_wallet_sol_balance(
+    pubkey: str,
+    *,
+    config: AgentConfig,
+    client: httpx.AsyncClient,
+) -> float:
+    """Query Solana JSON-RPC getBalance(confirmed) outside db._lock and return spendable wallet SOL."""
+    rpc_url = config.SOLANA_RPC_URL.strip()
+    if not rpc_url or not (rpc_url.startswith("http://") or rpc_url.startswith("https://")):
+        raise RuntimeError("SOLANA_RPC_URL is missing or malformed for live balance verification")
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getBalance",
+        "params": [pubkey, {"commitment": "confirmed"}],
+    }
+    resp = await client.post(rpc_url, json=payload, timeout=config.LIVE_RPC_TIMEOUT_SECONDS)
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict) or data.get("error") is not None:
+        raise RuntimeError(f"Solana RPC getBalance error: {data.get('error') if isinstance(data, dict) else data}")
+    result = data.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError("Solana RPC getBalance missing result object")
+    lamports = result.get("value")
+    if isinstance(lamports, bool) or not isinstance(lamports, int) or lamports < 0:
+        raise RuntimeError(f"Solana RPC getBalance invalid lamports value: {lamports!r}")
+    return lamports / LAMPORTS_PER_SOL
+
+
 async def fetch_jupiter_order(
     *,
     input_mint: str,
@@ -126,57 +156,94 @@ async def executor_node(
     if config.EXECUTION_MODE == "paper":
         tx_fee_opt: Optional[float] = float(config.PAPER_TX_FEE_SOL)
         tx_fee_status = "PAPER_ASSUMED"
+        reserve_fee_sol = float(config.PAPER_TX_FEE_SOL)
     else:
         tx_fee_opt = None
         tx_fee_status = "UNKNOWN"
+        # Reservation headroom only (base fee + priority fee + possible ATA rent); never persisted as observed fee
+        reserve_fee_sol = float(config.LIVE_FEE_RESERVATION_BUFFER_SOL)
+
+    taker: Optional[str] = None
+    if config.EXECUTION_MODE == "live":
+        keypair = Keypair.from_base58_string(config.SOLANA_PRIVATE_KEY_BS58)
+        taker = str(keypair.pubkey())
+
     lane_tag = "whale" if is_whale_slot else "chart"
     reservation_id: Optional[str] = None
+    owns_client = http_client is None
+    client = http_client or httpx.AsyncClient()
     if is_buy:
-        if is_whale_slot:
-            if not config.WHALE_STRATEGY_ENABLED:
-                logger.warning("[Executor] Strategy gate blocked whale_slot BUY of %s: WHALE_STRATEGY_ENABLED=False", order.symbol)
+        try:
+            if is_whale_slot:
+                if not config.WHALE_STRATEGY_ENABLED:
+                    logger.warning("[Executor] Strategy gate blocked whale_slot BUY of %s: WHALE_STRATEGY_ENABLED=False", order.symbol)
+                    return {"pending_order": None}
+            elif not config.is_chart_strategy_enabled(order.strategy, allow_legacy_scalper_when_all_enabled=True):
+                logger.warning(
+                    "[Executor] Strategy allowlist blocked chart_slot BUY of %s: strategy=%s not in CHART_ENABLED_STRATEGIES (%s)",
+                    order.symbol, order.strategy, ",".join(sorted(config.chart_enabled_strategies())),
+                )
                 return {"pending_order": None}
-        elif not config.is_chart_strategy_enabled(order.strategy, allow_legacy_scalper_when_all_enabled=True):
-            logger.warning(
-                "[Executor] Strategy allowlist blocked chart_slot BUY of %s: strategy=%s not in CHART_ENABLED_STRATEGIES (%s)",
-                order.symbol, order.strategy, ",".join(sorted(config.chart_enabled_strategies())),
+            elif str(order.strategy or "").upper() == "BREAKOUT_IGNITION" and not is_valid_pool_address(order.pair_address, mint=order.mint):
+                rej_msg = "BLOCKED: MISSING_OR_INVALID_POOL_IDENTITY (pair_address absent or invalid at executor)"
+                logger.warning("[Executor] Pool identity guard blocked BREAKOUT_IGNITION BUY of %s: %s", order.symbol, rej_msg)
+                db.log_action(
+                    mode=config.EXECUTION_MODE, action="DECISION_1", symbol=order.symbol, asset_id=order.mint,
+                    strategy="BREAKOUT_IGNITION", reason=rej_msg,
+                    pair_address=None, dex_id=order.dex_id,
+                )
+                return {"pending_order": None}
+            active_pos_for_reentry = state.get("active_position") or st_live.get("active_position")
+            is_reentry_same_mint = (
+                not is_whale_slot and order.reason == "LEG_2_REENTRY"
+                and isinstance(active_pos_for_reentry, dict) and active_pos_for_reentry.get("mint") == order.mint
+                and state.get("focus_state") == FocusState.WATCHING_REENTRY.value
             )
-            return {"pending_order": None}
-        elif str(order.strategy or "").upper() == "BREAKOUT_IGNITION" and not is_valid_pool_address(order.pair_address, mint=order.mint):
-            rej_msg = "BLOCKED: MISSING_OR_INVALID_POOL_IDENTITY (pair_address absent or invalid at executor)"
-            logger.warning("[Executor] Pool identity guard blocked BREAKOUT_IGNITION BUY of %s: %s", order.symbol, rej_msg)
-            db.log_action(
-                mode=config.EXECUTION_MODE, action="DECISION_1", symbol=order.symbol, asset_id=order.mint,
-                strategy="BREAKOUT_IGNITION", reason=rej_msg,
-                pair_address=None, dex_id=order.dex_id,
+            # Also block if caller passed in-memory open mints not yet persisted
+            caller_open = {
+                str(p["mint"]) for p in (state.get("chart_positions") or []) + (state.get("whale_positions") or []) + [state.get("active_position"), state.get("whale_position")]
+                if isinstance(p, dict) and p.get("mint")
+            }
+            if order.mint in caller_open and not is_reentry_same_mint:
+                logger.warning("[Executor] Duplicate mint guard blocked %s BUY of %s", f"{lane_tag}_slot", order.symbol)
+                return {"pending_order": None}
+
+            # Live mode: fetch actual wallet SOL balance via RPC strictly OUTSIDE db._lock; fail closed on any error
+            live_wallet_sol: Optional[float] = None
+            if config.EXECUTION_MODE == "live":
+                assert taker is not None
+                try:
+                    live_wallet_sol = await fetch_live_wallet_sol_balance(taker, config=config, client=client)
+                except Exception as exc:
+                    logger.warning(
+                        "[Executor] BLOCKED: LIVE_RPC_BALANCE_UNAVAILABLE for %s BUY of %s: %s",
+                        f"{lane_tag}_slot", order.symbol, exc,
+                    )
+                    return {"pending_order": None}
+
+            req_sol = order.amount_atomic / LAMPORTS_PER_SOL
+            lane_cap = config.MAX_WHALE_POSITIONS if is_whale_slot else config.MAX_CHART_POSITIONS
+            fb_sol_state = float(state["sol_balance"]) if "sol_balance" in state and state["sol_balance"] is not None else None
+            reservation_id, rej_reason = db.reserve_buy_slot(
+                lane=lane_tag, mint=order.mint, required_sol=req_sol,
+                tx_fee_sol=reserve_fee_sol,
+                max_lane_positions=lane_cap, max_open_positions=config.MAX_OPEN_POSITIONS,
+                is_reentry_same_mint=is_reentry_same_mint, fallback_state_sol=fb_sol_state,
+                daily_max_loss_pct=config.DAILY_MAX_LOSS_PCT,
+                live_wallet_sol=live_wallet_sol,
+                live_min_sol_reserve=float(config.LIVE_MIN_SOL_RESERVE) if config.EXECUTION_MODE == "live" else 0.0,
+                balance_divergence_warn_sol=float(config.BALANCE_DIVERGENCE_WARN_SOL) if config.EXECUTION_MODE == "live" else None,
             )
-            return {"pending_order": None}
-        active_pos_for_reentry = state.get("active_position") or st_live.get("active_position")
-        is_reentry_same_mint = (
-            not is_whale_slot and order.reason == "LEG_2_REENTRY"
-            and isinstance(active_pos_for_reentry, dict) and active_pos_for_reentry.get("mint") == order.mint
-            and state.get("focus_state") == FocusState.WATCHING_REENTRY.value
-        )
-        # Also block if caller passed in-memory open mints not yet persisted
-        caller_open = {
-            str(p["mint"]) for p in (state.get("chart_positions") or []) + (state.get("whale_positions") or []) + [state.get("active_position"), state.get("whale_position")]
-            if isinstance(p, dict) and p.get("mint")
-        }
-        if order.mint in caller_open and not is_reentry_same_mint:
-            logger.warning("[Executor] Duplicate mint guard blocked %s BUY of %s", f"{lane_tag}_slot", order.symbol)
-            return {"pending_order": None}
-        req_sol = order.amount_atomic / LAMPORTS_PER_SOL
-        lane_cap = config.MAX_WHALE_POSITIONS if is_whale_slot else config.MAX_CHART_POSITIONS
-        fb_sol_state = float(state["sol_balance"]) if "sol_balance" in state and state["sol_balance"] is not None else None
-        reservation_id, rej_reason = db.reserve_buy_slot(
-            lane=lane_tag, mint=order.mint, required_sol=req_sol,
-            tx_fee_sol=float(tx_fee_opt) if tx_fee_opt is not None else 0.0,
-            max_lane_positions=lane_cap, max_open_positions=config.MAX_OPEN_POSITIONS,
-            is_reentry_same_mint=is_reentry_same_mint, fallback_state_sol=fb_sol_state,
-        )
-        if rej_reason is not None:
-            logger.warning("[Executor] Pre-trade reservation blocked %s BUY of %s: %s", f"{lane_tag}_slot", order.symbol, rej_reason)
-            return {"pending_order": None}
+            if rej_reason is not None:
+                logger.warning("[Executor] Pre-trade reservation blocked %s BUY of %s: %s", f"{lane_tag}_slot", order.symbol, rej_reason)
+                return {"pending_order": None}
+        except BaseException:
+            if owns_client:
+                await client.aclose()
+            raise
+        finally:
+            if reservation_id is None and owns_client:
+                await client.aclose()
 
     is_exit = not is_buy
     live_lane_for_fb = whale_positions if is_whale_slot else chart_positions
@@ -208,6 +275,8 @@ async def executor_node(
         )
         if is_dup:
             logger.warning("[Executor] Duplicate/already-closed %s skipped for %s (%s)", side_up, order.symbol, order.reason)
+            if owns_client:
+                await client.aclose()
             return {
                 "focus_state": st_live["focus_state"], "sol_balance": float(st_live["sol_balance"]),
                 "daily_pnl_sol": float(st_live["daily_pnl_sol"]), "active_position": st_live["active_position"],
@@ -219,13 +288,6 @@ async def executor_node(
     input_mint = SOL_MINT if is_buy else order.mint
     output_mint = order.mint if is_buy else SOL_MINT
 
-    taker: Optional[str] = None
-    if config.EXECUTION_MODE == "live":
-        keypair = Keypair.from_base58_string(config.SOLANA_PRIVATE_KEY_BS58)
-        taker = str(keypair.pubkey())
-
-    owns_client = http_client is None
-    client = http_client or httpx.AsyncClient()
     try:
         try:
             order_resp = await fetch_jupiter_order(

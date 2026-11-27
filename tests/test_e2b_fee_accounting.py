@@ -217,6 +217,7 @@ async def test_e2b_live_unknown_fee_remains_null_and_historical_migration_preser
     kp = Keypair()
     cfg_live = AgentConfig(
         _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
+        SOLANA_RPC_URL="https://rpc.example.test",
     )
 
     from solders.message import MessageV0
@@ -226,6 +227,8 @@ async def test_e2b_live_unknown_fee_remains_null_and_historical_migration_preser
     unsigned_tx = base64.b64encode(bytes(VersionedTransaction(msg, [kp]))).decode("ascii")
 
     def live_handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith("https://rpc.example.test"):
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
         if "/swap/v2/order" in str(request.url):
             return httpx.Response(200, json={"outAmount": "1000000", "transaction": unsigned_tx, "requestId": "req-1"})
         return httpx.Response(200, json={"signature": "LiveSig111", "outputAmountResult": "1000000"})
@@ -521,6 +524,7 @@ async def test_e2b_c2_live_unknown_fees_no_zero_substitution(tmp_path, monkeypat
     cfg = AgentConfig(
         _env_file=None, EXECUTION_MODE="live",
         SOLANA_PRIVATE_KEY_BS58=str(kp), JUPITER_API_KEY="k", PAPER_TX_FEE_SOL=0.001,
+        SOLANA_RPC_URL="https://rpc.example.test",
     )
 
     monkeypatch.setattr("executor_node.sign_jupiter_transaction", lambda tx, k: "signed-b64")
@@ -533,6 +537,8 @@ async def test_e2b_c2_live_unknown_fees_no_zero_substitution(tmp_path, monkeypat
     sell_calls = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith("https://rpc.example.test"):
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 3_000_000_000}})
         if request.url.params.get("inputMint") == SOL_MINT:
             return httpx.Response(200, json={"outAmount": "1000000", "transaction": "tx-buy", "requestId": "rb"})
         sell_calls["n"] += 1

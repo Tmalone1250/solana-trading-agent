@@ -167,6 +167,7 @@ async def test_executor_live_mode_passes_taker_signs_and_executes(tmp_path):
         EXECUTION_MODE="live",
         JUPITER_API_KEY="jup-live-key",
         SOLANA_PRIVATE_KEY_BS58=str(kp),
+        SOLANA_RPC_URL="https://rpc.example.test",
     )
 
     # Build a valid unsigned VersionedTransaction for the mock Jupiter response
@@ -178,6 +179,8 @@ async def test_executor_live_mode_passes_taker_signs_and_executes(tmp_path):
     calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith("https://rpc.example.test"):
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 700_000_000}})
         calls.append(f"{request.method} {request.url.path}")
         if request.url.path == "/swap/v2/order":
             assert request.url.params.get("taker") == str(kp.pubkey())
