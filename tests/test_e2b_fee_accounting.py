@@ -348,3 +348,209 @@ def test_e2b_net_breakeven_accounts_for_fees_and_suppresses_when_unknown():
         config=cfg_p, now_dt=now_dt,
     )
     assert o_ex is not None and p_ex == PRIO_EXODUS
+
+
+def test_e2b_c1_lifecycle_reporting_and_summary_reconciliation(tmp_path):
+    """C-1 Tests 1, 2, 3, 4, 6, 9: Complete lifecycle PnL, partial+runner combos, separate same-mint lifecycles, summary."""
+    from fastapi.testclient import TestClient
+    from telemetry_api import create_telemetry_app
+
+    db = AgentDatabase(db_path=str(tmp_path / "c1_lifecycles.duckdb"), starting_sol=5.0)
+    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.001)
+    t1 = "2026-11-26T10:00:00+00:00"
+    t2 = "2026-11-26T11:00:00+00:00"
+    t3 = "2026-11-26T12:00:00+00:00"
+
+    # Lifecycle 1 (same mint): BUY -> SELL (+0.048 net)
+    db.log_trade(mode="paper", side="BUY", mint=MINT_E2B, symbol="E2B", in_amount=500_000_000, out_amount=1_000_000, sol_value=0.50, reason="ENTRY", opened_at=t1, tx_fee_sol=0.001, fee_status="PAPER_ASSUMED")
+    db.log_trade(mode="paper", side="SELL", mint=MINT_E2B, symbol="E2B", in_amount=1_000_000, out_amount=550_000_000, sol_value=0.55, pnl_sol=0.049, pnl_pct=0.098, reason="TRAILING_TP", opened_at=t1, tx_fee_sol=0.001, fee_status="PAPER_ASSUMED")
+
+    # Lifecycle 2 (same mint, separate opened_at): Profitable partial (+0.049) + losing runner (-0.101) - entry fee (0.001) = -0.053
+    db.log_trade(mode="paper", side="BUY", mint=MINT_E2B, symbol="E2B", in_amount=500_000_000, out_amount=1_000_000, sol_value=0.50, reason="LEG_2_REENTRY", opened_at=t2, tx_fee_sol=0.001, fee_status="PAPER_ASSUMED")
+    db.log_trade(mode="paper", side="PARTIAL_SELL", mint=MINT_E2B, symbol="E2B", in_amount=500_000, out_amount=300_000_000, sol_value=0.30, pnl_sol=0.049, pnl_pct=0.196, reason="PARTIAL_TP_50PCT", opened_at=t2, tx_fee_sol=0.001, fee_status="PAPER_ASSUMED")
+    db.log_trade(mode="paper", side="SELL", mint=MINT_E2B, symbol="E2B", in_amount=500_000, out_amount=150_000_000, sol_value=0.15, pnl_sol=-0.101, pnl_pct=-0.404, reason="HARD_STOP_LOSS", opened_at=t2, tx_fee_sol=0.001, fee_status="PAPER_ASSUMED")
+
+    # Lifecycle 3 (same mint, separate opened_at): Losing partial (-0.051) + profitable runner (+0.149) - entry fee (0.001) = +0.097
+    db.log_trade(mode="paper", side="BUY", mint=MINT_E2B, symbol="E2B", in_amount=500_000_000, out_amount=1_000_000, sol_value=0.50, reason="ENTRY", opened_at=t3, tx_fee_sol=0.001, fee_status="PAPER_ASSUMED")
+    db.log_trade(mode="paper", side="PARTIAL_SELL", mint=MINT_E2B, symbol="E2B", in_amount=500_000, out_amount=200_000_000, sol_value=0.20, pnl_sol=-0.051, pnl_pct=-0.204, reason="PARTIAL_MANUAL", opened_at=t3, tx_fee_sol=0.001, fee_status="PAPER_ASSUMED")
+    db.log_trade(mode="paper", side="SELL", mint=MINT_E2B, symbol="E2B", in_amount=500_000, out_amount=400_000_000, sol_value=0.40, pnl_sol=0.149, pnl_pct=0.596, reason="TRAILING_TP", opened_at=t3, tx_fee_sol=0.001, fee_status="PAPER_ASSUMED")
+
+    recent = db.get_recent_closed_trades(limit=10)
+    assert len(recent) == 3  # separate lifecycles in same mint
+    assert [r["opened_at"] for r in recent] == [t3, t2, t1]
+
+    # Lifecycle 3 (newest): (0.20 + 0.40) - 0.50 - 0.003 = +0.097
+    assert recent[0]["entry_sol"] == pytest.approx(0.50)
+    assert recent[0]["exit_sol"] == pytest.approx(0.60)
+    assert recent[0]["pnl_sol"] == pytest.approx(0.097)
+    assert recent[0]["realized_partial_pnl_sol"] == pytest.approx(-0.051)
+    assert recent[0]["final_sell_pnl_sol"] == pytest.approx(0.149)
+    assert recent[0]["total_fees_sol"] == pytest.approx(0.003)
+    assert recent[0]["lifecycle_complete"] is True and recent[0]["net_pnl_known"] is True
+
+    # Lifecycle 2: (0.30 + 0.15) - 0.50 - 0.003 = -0.053 (counted as loss even though partial was +0.049)
+    assert recent[1]["entry_sol"] == pytest.approx(0.50)
+    assert recent[1]["exit_sol"] == pytest.approx(0.45)
+    assert recent[1]["pnl_sol"] == pytest.approx(-0.053)
+    assert recent[1]["total_fees_sol"] == pytest.approx(0.003)
+
+    # Lifecycle 1: 0.55 - 0.50 - 0.002 = +0.048
+    assert recent[2]["pnl_sol"] == pytest.approx(0.048)
+    assert recent[2]["total_fees_sol"] == pytest.approx(0.002)
+
+    summ = db.get_closed_trades_summary()
+    assert summ == {
+        "total_trades": 3,
+        "wins": 2,
+        "losses": 1,
+        "win_rate_pct": 66.7,
+        "net_pnl_sol": pytest.approx(0.092),  # 0.048 - 0.053 + 0.097
+    }
+    tel = TestClient(create_telemetry_app(config=cfg, db=db)).get("/api/telemetry").json()
+    assert tel["closed_trades_summary"]["net_pnl_sol"] == pytest.approx(0.092)
+    assert len(tel["recent_trades"]) == 3
+    db.close()
+
+
+def test_e2b_c1_historical_incomplete_lifecycle_not_fabricated(tmp_path):
+    """C-1 Test 7: Missing BUY with PARTIAL_SELL must NOT infer entry_sol = exit_sol - final_sell_pnl."""
+    db = AgentDatabase(db_path=str(tmp_path / "c1_incomplete.duckdb"), starting_sol=1.0)
+    t_hist = "2026-11-20T09:00:00+00:00"
+    db.log_trade(mode="paper", side="PARTIAL_SELL", mint=MINT_E2B, symbol="HIST", in_amount=500, out_amount=300, sol_value=0.30, pnl_sol=0.05, pnl_pct=0.20, reason="PARTIAL_TP_50PCT", opened_at=t_hist)
+    db.log_trade(mode="paper", side="SELL", mint=MINT_E2B, symbol="HIST", in_amount=500, out_amount=320, sol_value=0.32, pnl_sol=0.07, pnl_pct=0.28, reason="TRAILING_TP", opened_at=t_hist)
+
+    recent = db.get_recent_closed_trades(limit=5)
+    assert len(recent) == 1
+    lc = recent[0]
+    assert lc["entry_sol"] is None  # never fabricated as 0.32 - 0.07 = 0.25
+    assert lc["total_fees_sol"] is None
+    assert lc["fee_accounting_status"] == "UNKNOWN"
+    assert lc["lifecycle_complete"] is False
+    assert lc["net_pnl_known"] is False
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_e2b_c2_live_unknown_fees_no_zero_substitution(tmp_path, monkeypatch):
+    """C-2 Test 8: Live mode retains None/UNKNOWN across BUY, PARTIAL_SELL, SELL without substituting 0.0."""
+    clear_buy_reservations()
+    clear_sell_idempotency_guard()
+    kp = Keypair()
+    db = AgentDatabase(db_path=str(tmp_path / "c2_live.duckdb"), starting_sol=3.0)
+    cfg = AgentConfig(
+        _env_file=None, EXECUTION_MODE="live",
+        SOLANA_PRIVATE_KEY_BS58=str(kp), JUPITER_API_KEY="k", PAPER_TX_FEE_SOL=0.001,
+    )
+
+    monkeypatch.setattr("executor_node.sign_jupiter_transaction", lambda tx, k: "signed-b64")
+
+    async def fake_exec(signed_tx_base64, request_id, config, client):
+        return {"status": "Success", "signature": "sig-live", "outputAmountResult": None}
+
+    monkeypatch.setattr("executor_node.execute_jupiter_signed_order", fake_exec)
+
+    sell_calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("inputMint") == SOL_MINT:
+            return httpx.Response(200, json={"outAmount": "1000000", "transaction": "tx-buy", "requestId": "rb"})
+        sell_calls["n"] += 1
+        out_lamports = int((0.30 if sell_calls["n"] == 1 else 0.32) * LAMPORTS_PER_SOL)
+        return httpx.Response(200, json={"outAmount": str(out_lamports), "transaction": "tx-sell", "requestId": "rs"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        out_b = await executor_node(
+            {"focus_state": FocusState.SCANNING.value, "sol_balance": 3.0, "daily_pnl_sol": 0.0, "pending_order": _mk_paper_buy_order()},
+            config=cfg, db=db, http_client=client,
+        )
+        assert out_b["last_execution"]["tx_fee_sol"] is None
+        assert out_b["last_execution"]["fee_status"] == "UNKNOWN"
+        assert out_b["last_execution"]["fee_accounting_incomplete"] is True
+        assert out_b["sol_balance"] == pytest.approx(2.5)  # gross delta, no assumed fee subtracted
+        assert out_b["daily_pnl_sol"] == pytest.approx(0.0)
+        pos = out_b["chart_positions"][0]
+        assert pos["entry_fee_sol"] is None
+        assert pos["fee_accounting_status"] == "UNKNOWN"
+
+        ps_order = PendingOrder(
+            side="PARTIAL_SELL", mint=MINT_E2B, symbol="E2B", opened_at=pos["opened_at"],
+            amount_atomic=500_000, reason="PARTIAL_TP_50PCT",
+            target_state_after_fill=FocusState.IN_POSITION, strategy="BREAKOUT_IGNITION",
+        ).model_dump()
+        out_p = await executor_node({**db.get_state(), "pending_order": ps_order}, config=cfg, db=db, http_client=client)
+        assert out_p["last_execution"]["tx_fee_sol"] is None
+        assert out_p["last_execution"]["fee_status"] == "UNKNOWN"
+        assert out_p["chart_positions"][0]["fee_accounting_status"] == "UNKNOWN"
+
+        sell_order = PendingOrder(
+            side="SELL", mint=MINT_E2B, symbol="E2B", opened_at=pos["opened_at"],
+            amount_atomic=500_000, reason="TRAILING_TP",
+            target_state_after_fill=FocusState.SCANNING, strategy="BREAKOUT_IGNITION",
+        ).model_dump()
+        out_s = await executor_node({**db.get_state(), "pending_order": sell_order}, config=cfg, db=db, http_client=client)
+        assert out_s["last_execution"]["tx_fee_sol"] is None
+        assert out_s["last_execution"]["fee_status"] == "UNKNOWN"
+        assert out_s["last_execution"]["fee_accounting_incomplete"] is True
+
+    trades = db.get_recent_trades(limit=5)
+    assert len(trades) == 3
+    assert all(t["tx_fee_sol"] is None and t["fee_status"] == "UNKNOWN" for t in trades)
+    closed = db.get_recent_closed_trades(limit=5)
+    assert len(closed) == 1
+    assert closed[0]["lifecycle_complete"] is False
+    assert closed[0]["net_pnl_known"] is False
+    assert closed[0]["fee_accounting_status"] == "UNKNOWN"
+    assert closed[0]["total_fees_sol"] is None
+    db.close()
+
+
+def test_e2b_c3_exact_quote_selection_aligned_with_net_lifecycle_breakeven():
+    """C-3 Tests 10, 11: Quote selection uses net lifecycle formula before/after partial TP and handles UNKNOWN fees."""
+    from batched_price_monitor import needs_exact_jupiter_quote
+
+    cfg_hi = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.01)
+    warmed = (datetime(2026, 11, 26, 12, 0, 0, tzinfo=timezone.utc) - timedelta(minutes=10)).isoformat()
+
+    # 1. Pre-partial: entry=0.50, entry_fee=0.01, est_close=0.01 -> round-trip fee = 4% of 0.50
+    pos_pre = ActivePosition(
+        mint=MINT_E2B, symbol="QPRE", pair_address=POOL_PINNED, dex_id="pumpswap",
+        entry_sol=0.50, initial_entry_sol=0.50, remaining_cost_basis_sol=0.50,
+        token_amount=1_000_000, current_sol_value=0.55, peak_sol_value=0.55,
+        entry_fee_sol=0.01, accumulated_fees_sol=0.01, fee_accounting_status="PAPER_ASSUMED",
+        breakeven_armed=True, opened_at=warmed,
+    )
+    # At 0.5275 (+5.5% gross, +1.5% net <= 2% floor + 2% proximity) -> needs exact quote
+    assert needs_exact_jupiter_quote(pos_pre, 0.5275, cfg_hi, proximity_pct=2.0) is True
+    # At 0.545 (+9.0% gross, +5.0% net > 4.0% threshold) -> no breakeven quote needed
+    assert needs_exact_jupiter_quote(pos_pre, 0.545, cfg_hi, proximity_pct=2.0) is False
+
+    # 2. Post-partial: realized_partial=+0.049, rem_basis=0.25, init=0.50, fee=0.001
+    cfg_p = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.001)
+    pos_post = ActivePosition(
+        mint=MINT_E2B, symbol="QPOST", pair_address=POOL_PINNED, dex_id="pumpswap",
+        entry_sol=0.50, initial_entry_sol=0.50, remaining_cost_basis_sol=0.25,
+        partial_tp_taken=True, realized_partial_pnl_sol=0.049,
+        token_amount=500_000, current_sol_value=0.26, peak_sol_value=0.26,
+        entry_fee_sol=0.001, accumulated_fees_sol=0.002, fee_accounting_status="PAPER_ASSUMED",
+        breakeven_armed=True, opened_at=warmed,
+    )
+    # At 0.254: remaining gross +1.6%, but lifecycle net = 0.049 + (0.254 - 0.25 - 0.001) - 0.001 = +0.051 (+10.2% of 0.50) -> False
+    assert needs_exact_jupiter_quote(pos_post, 0.254, cfg_p, proximity_pct=2.0) is False
+    # At 0.220: lifecycle net = 0.049 + (0.220 - 0.25 - 0.001) - 0.001 = +0.017 (+3.4% <= 2% + 2% proximity) -> True
+    assert needs_exact_jupiter_quote(pos_post, 0.220, cfg_p, proximity_pct=2.0) is True
+
+    # 3. UNKNOWN fees: breakeven quote threshold suppressed, but hard stop & trailing TP still trigger exact quote
+    pos_unk = ActivePosition(
+        mint=MINT_E2B, symbol="QUNK", pair_address=POOL_PINNED, dex_id="pumpswap",
+        entry_sol=0.50, token_amount=1_000_000, current_sol_value=0.55, peak_sol_value=0.55,
+        breakeven_armed=True, opened_at=warmed,
+    )
+    assert pos_unk.fee_accounting_status == "UNKNOWN"
+    # Breakeven zone (0.505) does NOT trigger quote when fees UNKNOWN
+    assert needs_exact_jupiter_quote(pos_unk, 0.505, cfg_p, proximity_pct=2.0) is False
+    # Hard stop (-10%) STILL triggers quote
+    assert needs_exact_jupiter_quote(pos_unk, 0.45, cfg_p, proximity_pct=2.0) is True
+    # Trailing TP STILL triggers quote
+    pos_unk.trail_armed = True
+    pos_unk.peak_sol_value = 0.60
+    assert needs_exact_jupiter_quote(pos_unk, 0.55, cfg_p, proximity_pct=2.0) is True

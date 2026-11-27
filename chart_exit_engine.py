@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel
 
-from batched_price_monitor import active_cost_basis_sol, is_hard_stop_hit
+from batched_price_monitor import active_cost_basis_sol, compute_net_lifecycle_pnl, is_hard_stop_hit
 from config import AgentConfig
 from state import ActivePosition, FocusState, PendingOrder
 
@@ -260,35 +260,6 @@ def compute_exodus(
         min_confirm_interval_seconds=min_confirm_interval_seconds,
     )
     return ev.triggered, ev.sell_ratio_5m, ev.liq_drop_pct, ev.detail
-
-
-def compute_net_lifecycle_pnl(
-    pos: ActivePosition,
-    current_sol_value: float,
-    config: AgentConfig,
-) -> tuple[bool, Optional[float], Optional[float], Optional[float], str]:
-    """Evaluate complete lifecycle net PnL accounting for entry, partial, and expected closing fees.
-
-    Returns (fees_known, net_lifecycle_sol, net_lifecycle_pct, net_peak_pct, breakeven_status).
-    If required fees are unknown (e.g., live mode without observed fee or historical UNKNOWN position),
-    returns (False, None, None, None, "BREAKEVEN_SUPPRESSED_UNKNOWN_FEES") and never substitutes zero.
-    """
-    if config.EXECUTION_MODE != "paper":
-        return False, None, None, None, "BREAKEVEN_SUPPRESSED_UNKNOWN_FEES"
-    if pos.fee_accounting_status != "PAPER_ASSUMED" or pos.entry_fee_sol is None:
-        return False, None, None, None, "BREAKEVEN_SUPPRESSED_UNKNOWN_FEES"
-
-    init_basis = float(pos.initial_entry_sol or pos.entry_sol or 0.0)
-    rem_basis = active_cost_basis_sol(pos)
-    if init_basis <= 0.0 or rem_basis <= 0.0:
-        return False, None, None, None, "BREAKEVEN_SUPPRESSED_UNKNOWN_FEES"
-
-    est_close_fee = float(config.PAPER_TX_FEE_SOL)
-    entry_fee = float(pos.entry_fee_sol)
-    realized_partial = float(pos.realized_partial_pnl_sol or 0.0)
-    net_now_sol = realized_partial + (current_sol_value - rem_basis - est_close_fee) - entry_fee
-    net_peak_sol = realized_partial + (max(pos.peak_sol_value, current_sol_value) - rem_basis - est_close_fee) - entry_fee
-    return True, net_now_sol, (net_now_sol / init_basis), (net_peak_sol / init_basis), "NET_FEES_KNOWN"
 
 
 def evaluate_chart_position_exit(

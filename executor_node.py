@@ -125,11 +125,9 @@ async def executor_node(
     whale_positions: list[dict[str, Any]] = list(st_live.get("whale_positions") or state.get("whale_positions") or [])
     if config.EXECUTION_MODE == "paper":
         tx_fee_opt: Optional[float] = float(config.PAPER_TX_FEE_SOL)
-        tx_fee_sol = float(tx_fee_opt)
         tx_fee_status = "PAPER_ASSUMED"
     else:
         tx_fee_opt = None
-        tx_fee_sol = 0.0
         tx_fee_status = "UNKNOWN"
     lane_tag = "whale" if is_whale_slot else "chart"
     reservation_id: Optional[str] = None
@@ -171,7 +169,8 @@ async def executor_node(
         lane_cap = config.MAX_WHALE_POSITIONS if is_whale_slot else config.MAX_CHART_POSITIONS
         fb_sol_state = float(state["sol_balance"]) if "sol_balance" in state and state["sol_balance"] is not None else None
         reservation_id, rej_reason = db.reserve_buy_slot(
-            lane=lane_tag, mint=order.mint, required_sol=req_sol, tx_fee_sol=tx_fee_sol,
+            lane=lane_tag, mint=order.mint, required_sol=req_sol,
+            tx_fee_sol=float(tx_fee_opt) if tx_fee_opt is not None else 0.0,
             max_lane_positions=lane_cap, max_open_positions=config.MAX_OPEN_POSITIONS,
             is_reentry_same_mint=is_reentry_same_mint, fallback_state_sol=fb_sol_state,
         )
@@ -279,8 +278,8 @@ async def executor_node(
 
     if is_buy:
         spent_sol = order.amount_atomic / LAMPORTS_PER_SOL
-        sol_delta = -(spent_sol + tx_fee_sol)
-        pnl_delta = -tx_fee_sol
+        sol_delta = -(spent_sol + tx_fee_opt) if tx_fee_opt is not None else -spent_sol
+        pnl_delta = -tx_fee_opt if tx_fee_opt is not None else 0.0
         pos_strategy = order.strategy or "SCALPER"
         prev_reentries = (
             int(existing_pos_dict.get("reentry_count") or 0)
@@ -320,6 +319,7 @@ async def executor_node(
             in_amount=order.amount_atomic, out_amount=out_amount, sol_value=spent_sol,
             reason=order.reason, tx_signature=tx_signature, rationale=order.rationale,
             strategy=pos_strategy, triggering_wallets=list(order.triggering_wallets),
+            opened_at=pos.opened_at,
             jupiter_price_impact_raw=raw_price_impact,
             pair_address=pos.pair_address, dex_id=pos.dex_id,
             tx_fee_sol=tx_fee_opt, fee_status=tx_fee_status,
@@ -349,9 +349,9 @@ async def executor_node(
         pos_obj = ActivePosition.model_validate(existing_pos_dict) if isinstance(existing_pos_dict, dict) else ActivePosition(mint=order.mint, symbol=order.symbol, entry_sol=default_entry, token_amount=order.amount_atomic * 2)
         frac = float((config.WHALE_PARTIAL_TP_SELL_FRACTION or config.PARTIAL_TP_SELL_FRACTION) if is_whale_slot else config.PARTIAL_TP_SELL_FRACTION)
         cost_of_sold = round(pos_obj.initial_entry_sol * frac, 6)
-        partial_pnl = round(received_sol - cost_of_sold - tx_fee_sol, 6)
+        partial_pnl = round(received_sol - cost_of_sold - tx_fee_opt, 6) if tx_fee_opt is not None else round(received_sol - cost_of_sold, 6)
         partial_pnl_pct = (partial_pnl / cost_of_sold) if cost_of_sold > 0 else 0.0
-        sol_delta = received_sol - tx_fee_sol
+        sol_delta = (received_sol - tx_fee_opt) if tx_fee_opt is not None else received_sol
 
         rem_tokens = max(0, int(pos_obj.token_amount) - int(order.amount_atomic))
         rem_basis = round(max(0.0, pos_obj.remaining_cost_basis_sol - cost_of_sold), 6)
@@ -418,13 +418,16 @@ async def executor_node(
         )
     else:
         received_sol = out_amount / LAMPORTS_PER_SOL
-        sol_delta = received_sol - tx_fee_sol
+        sol_delta = (received_sol - tx_fee_opt) if tx_fee_opt is not None else received_sol
         ex_dict = existing_pos_dict if isinstance(existing_pos_dict, dict) else {}
         entry_sol = float(ex_dict.get("entry_sol", 0.0))
         partial_taken = bool(ex_dict.get("partial_tp_taken", False))
         rem_basis_val = float(ex_dict.get("remaining_cost_basis_sol") or 0.0)
         cost_basis = rem_basis_val if (partial_taken and rem_basis_val > 0) else entry_sol
-        pnl_sol = round((received_sol - cost_basis - tx_fee_sol) if cost_basis > 0 else -tx_fee_sol, 6)
+        if tx_fee_opt is not None:
+            pnl_sol = round((received_sol - cost_basis - tx_fee_opt) if cost_basis > 0 else -tx_fee_opt, 6)
+        else:
+            pnl_sol = round((received_sol - cost_basis) if cost_basis > 0 else 0.0, 6)
         pnl_pct = (pnl_sol / cost_basis) if cost_basis > 0 else 0.0
 
         existing_strat = str(ex_dict.get("strategy") or "").strip()
@@ -523,6 +526,7 @@ async def executor_node(
         "tx_signature": tx_signature, "reason": order.reason,
         "jupiter_price_impact_raw": raw_price_impact,
         "tx_fee_sol": tx_fee_opt, "fee_status": tx_fee_status,
+        "fee_accounting_incomplete": tx_fee_opt is None,
     }
     if is_whale_slot:
         return {

@@ -1098,60 +1098,177 @@ class AgentDatabase:
         ]
         return [dict(zip(keys, r)) for r in rows]
 
-    def get_recent_closed_trades(self, limit: int = 15) -> list[dict[str, Any]]:
-        """Return the last N closed trades (SELL fills) with entry/exit SOL, PnL, and strategy."""
+    def _build_closed_lifecycles(self) -> list[dict[str, Any]]:
+        """Reconstruct lifecycle-level closed trade records from BUY, PARTIAL_SELL, and SELL rows."""
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT symbol, mint, sol_value, pnl_sol, pnl_pct, reason, timestamp,
-                       strategy, triggering_wallets_json
+                SELECT id, mode, side, mint, symbol, sol_value, pnl_sol, pnl_pct, reason,
+                       timestamp, strategy, triggering_wallets_json, opened_at, tx_fee_sol, fee_status
                 FROM trades
-                WHERE UPPER(side) = 'SELL'
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                [limit],
+                ORDER BY id ASC
+                """
             ).fetchall()
-        closed: list[dict[str, Any]] = []
-        for symbol, mint, exit_sol, pnl_sol, pnl_pct, reason, ts, strategy, trig_json in rows:
-            exit_val = float(exit_sol or 0.0)
-            pnl_val = float(pnl_sol or 0.0)
-            entry_val = max(0.0, exit_val - pnl_val)
-            pct_val = float(pnl_pct or 0.0) * 100.0
-            closed.append(
-                {
-                    "symbol": symbol,
-                    "mint": mint,
-                    "entry_sol": round(entry_val, 6),
-                    "exit_sol": round(exit_val, 6),
-                    "pnl_sol": round(pnl_val, 6),
-                    "pnl_pct": round(pct_val, 2),
-                    "exit_reason": reason,
-                    "strategy": strategy or "SCALPER",
-                    "triggering_wallets": json.loads(trig_json) if trig_json else [],
-                    "closed_at": ts,
-                }
-            )
-        return closed
+
+        open_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        unmatched_buys_by_mint: dict[str, list[dict[str, Any]]] = {}
+        unmatched_partials_by_mint: dict[str, list[dict[str, Any]]] = {}
+        closed_asc: list[dict[str, Any]] = []
+
+        for r in rows:
+            rec = {
+                "id": r[0],
+                "mode": r[1],
+                "side": str(r[2] or "").upper(),
+                "mint": str(r[3] or ""),
+                "symbol": r[4],
+                "sol_value": r[5],
+                "pnl_sol": r[6],
+                "pnl_pct": r[7],
+                "reason": r[8],
+                "timestamp": r[9],
+                "strategy": r[10],
+                "triggering_wallets_json": r[11],
+                "opened_at": str(r[12]).strip() if r[12] else None,
+                "tx_fee_sol": r[13],
+                "fee_status": str(r[14]).strip() if r[14] else None,
+            }
+            mint = rec["mint"]
+            opened_at = rec["opened_at"]
+            side = rec["side"]
+
+            if side == "BUY":
+                if opened_at:
+                    open_by_key[(mint, opened_at)] = {"buy": rec, "partials": []}
+                else:
+                    unmatched_buys_by_mint.setdefault(mint, []).append(rec)
+            elif side == "PARTIAL_SELL":
+                if opened_at:
+                    bucket = open_by_key.setdefault((mint, opened_at), {"buy": None, "partials": []})
+                    bucket["partials"].append(rec)
+                else:
+                    unmatched_partials_by_mint.setdefault(mint, []).append(rec)
+            elif side == "SELL":
+                if opened_at:
+                    bucket = open_by_key.pop((mint, opened_at), None)
+                    buy_row = bucket["buy"] if bucket else None
+                    partial_rows = bucket["partials"] if bucket else []
+                    if buy_row is None and unmatched_buys_by_mint.get(mint):
+                        buy_row = unmatched_buys_by_mint[mint].pop(-1)
+                    lifecycle_id = f"{mint}:{opened_at}"
+                else:
+                    buy_row = unmatched_buys_by_mint[mint].pop(-1) if unmatched_buys_by_mint.get(mint) else None
+                    partial_rows = unmatched_partials_by_mint.pop(mint, [])
+                    lifecycle_id = f"{mint}:id:{rec['id']}"
+
+                partial_sell_count = len(partial_rows)
+                partial_exit_sol = sum(float(p["sol_value"] or 0.0) for p in partial_rows)
+                final_sell_sol = float(rec["sol_value"] or 0.0)
+                total_exit_sol = partial_exit_sol + final_sell_sol
+
+                partial_pnls_present = all(p["pnl_sol"] is not None for p in partial_rows)
+                realized_partial_pnl: Optional[float] = (
+                    sum(float(p["pnl_sol"]) for p in partial_rows) if partial_pnls_present else None
+                )
+                final_sell_pnl: Optional[float] = float(rec["pnl_sol"]) if rec["pnl_sol"] is not None else None
+
+                if buy_row is not None:
+                    entry_sol: Optional[float] = float(buy_row["sol_value"] or 0.0)
+                elif partial_sell_count > 0:
+                    # Never infer original entry cost as exit_sol - final_sell_pnl when partial sales occurred
+                    entry_sol = None
+                elif final_sell_pnl is not None:
+                    entry_sol = max(0.0, final_sell_sol - final_sell_pnl)
+                else:
+                    entry_sol = None
+
+                all_legs_present = (buy_row is not None) and partial_pnls_present and (final_sell_pnl is not None)
+                leg_rows = [buy_row, *partial_rows, rec] if buy_row is not None else [*partial_rows, rec]
+                all_fees_known = all_legs_present and all(
+                    (lr["fee_status"] in ("PAPER_ASSUMED", "OBSERVED")) and (lr["tx_fee_sol"] is not None)
+                    for lr in leg_rows
+                )
+
+                if all_fees_known:
+                    assert buy_row is not None and realized_partial_pnl is not None and final_sell_pnl is not None
+                    entry_fee = float(buy_row["tx_fee_sol"])
+                    total_fees_sol: Optional[float] = round(
+                        entry_fee + sum(float(p["tx_fee_sol"]) for p in partial_rows) + float(rec["tx_fee_sol"]), 6
+                    )
+                    fee_accounting_status = (
+                        "OBSERVED" if all(lr["fee_status"] == "OBSERVED" for lr in leg_rows) else "PAPER_ASSUMED"
+                    )
+                    lifecycle_pnl = round(realized_partial_pnl + final_sell_pnl - entry_fee, 6)
+                    lifecycle_pnl_pct = (
+                        round((lifecycle_pnl / entry_sol) * 100.0, 2) if (entry_sol is not None and entry_sol > 0.0) else 0.0
+                    )
+                    lifecycle_complete = True
+                    net_pnl_known = True
+                else:
+                    entry_fee = (
+                        float(buy_row["tx_fee_sol"])
+                        if (
+                            buy_row is not None
+                            and buy_row["tx_fee_sol"] is not None
+                            and buy_row["fee_status"] in ("PAPER_ASSUMED", "OBSERVED")
+                        )
+                        else None
+                    )
+                    total_fees_sol = None
+                    fee_accounting_status = "UNKNOWN"
+                    lifecycle_complete = False
+                    net_pnl_known = False
+                    if realized_partial_pnl is not None and final_sell_pnl is not None:
+                        lifecycle_pnl = round(realized_partial_pnl + final_sell_pnl, 6)
+                    elif final_sell_pnl is not None:
+                        lifecycle_pnl = round(final_sell_pnl, 6)
+                    else:
+                        lifecycle_pnl = 0.0
+                    if entry_sol is not None and entry_sol > 0.0:
+                        lifecycle_pnl_pct = round((lifecycle_pnl / entry_sol) * 100.0, 2)
+                    else:
+                        lifecycle_pnl_pct = round(float(rec["pnl_pct"] or 0.0) * 100.0, 2)
+
+                closed_asc.append(
+                    {
+                        "symbol": rec["symbol"],
+                        "mint": mint,
+                        "opened_at": opened_at,
+                        "lifecycle_id": lifecycle_id,
+                        "entry_sol": round(entry_sol, 6) if entry_sol is not None else None,
+                        "exit_sol": round(total_exit_sol, 6),
+                        "final_sell_sol": round(final_sell_sol, 6),
+                        "pnl_sol": round(lifecycle_pnl, 6),
+                        "pnl_pct": round(lifecycle_pnl_pct, 2),
+                        "realized_partial_pnl_sol": round(realized_partial_pnl, 6) if realized_partial_pnl is not None else None,
+                        "final_sell_pnl_sol": round(final_sell_pnl, 6) if final_sell_pnl is not None else None,
+                        "partial_sell_count": partial_sell_count,
+                        "entry_fee_sol": round(entry_fee, 6) if entry_fee is not None else None,
+                        "total_fees_sol": total_fees_sol,
+                        "fee_accounting_status": fee_accounting_status,
+                        "net_pnl_known": net_pnl_known,
+                        "lifecycle_complete": lifecycle_complete,
+                        "exit_reason": rec["reason"],
+                        "strategy": rec["strategy"] or "SCALPER",
+                        "triggering_wallets": json.loads(rec["triggering_wallets_json"]) if rec["triggering_wallets_json"] else [],
+                        "closed_at": rec["timestamp"],
+                    }
+                )
+
+        closed_asc.reverse()
+        return closed_asc
+
+    def get_recent_closed_trades(self, limit: int = 15) -> list[dict[str, Any]]:
+        """Return the last N closed trade lifecycles (newest first) with complete lifecycle PnL."""
+        return self._build_closed_lifecycles()[: max(0, int(limit))]
 
     def get_closed_trades_summary(self) -> dict[str, Any]:
-        """Aggregate win/loss record, win rate %, and net realized SOL across all SELL rows."""
-        with self._lock:
-            row = self._conn.execute(
-                """
-                SELECT
-                    COUNT(*) AS total_trades,
-                    COALESCE(SUM(CASE WHEN COALESCE(pnl_sol, 0.0) > 0.0 THEN 1 ELSE 0 END), 0) AS wins,
-                    COALESCE(SUM(CASE WHEN COALESCE(pnl_sol, 0.0) <= 0.0 THEN 1 ELSE 0 END), 0) AS losses,
-                    COALESCE(SUM(COALESCE(pnl_sol, 0.0)), 0.0) AS net_pnl_sol
-                FROM trades
-                WHERE UPPER(side) = 'SELL'
-                """
-            ).fetchone()
-        total = int(row[0] or 0) if row else 0
-        wins = int(row[1] or 0) if row else 0
-        losses = int(row[2] or 0) if row else 0
-        net_pnl = float(row[3] or 0.0) if row else 0.0
+        """Aggregate win/loss record, win rate %, and net realized SOL across closed lifecycles."""
+        lifecycles = self._build_closed_lifecycles()
+        total = len(lifecycles)
+        wins = sum(1 for lc in lifecycles if float(lc.get("pnl_sol") or 0.0) > 0.0)
+        losses = sum(1 for lc in lifecycles if float(lc.get("pnl_sol") or 0.0) <= 0.0)
+        net_pnl = sum(float(lc.get("pnl_sol") or 0.0) for lc in lifecycles)
         win_rate = round((wins / total) * 100.0, 1) if total > 0 else 0.0
         return {
             "total_trades": total,

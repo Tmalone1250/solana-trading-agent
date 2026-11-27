@@ -511,6 +511,35 @@ def apply_dex_flow_and_pnl(
     return buys_5m, sells_5m, buy_ratio_5m, current_liq
 
 
+def compute_net_lifecycle_pnl(
+    pos: ActivePosition,
+    current_sol_value: float,
+    config: AgentConfig,
+) -> tuple[bool, Optional[float], Optional[float], Optional[float], str]:
+    """Evaluate complete lifecycle net PnL accounting for entry, partial, and expected closing fees.
+
+    Returns (fees_known, net_lifecycle_sol, net_lifecycle_pct, net_peak_pct, breakeven_status).
+    If required fees are unknown (e.g., live mode without observed fee or historical UNKNOWN position),
+    returns (False, None, None, None, "BREAKEVEN_SUPPRESSED_UNKNOWN_FEES") and never substitutes zero.
+    """
+    if config.EXECUTION_MODE != "paper":
+        return False, None, None, None, "BREAKEVEN_SUPPRESSED_UNKNOWN_FEES"
+    if pos.fee_accounting_status != "PAPER_ASSUMED" or pos.entry_fee_sol is None:
+        return False, None, None, None, "BREAKEVEN_SUPPRESSED_UNKNOWN_FEES"
+
+    init_basis = float(pos.initial_entry_sol or pos.entry_sol or 0.0)
+    rem_basis = active_cost_basis_sol(pos)
+    if init_basis <= 0.0 or rem_basis <= 0.0:
+        return False, None, None, None, "BREAKEVEN_SUPPRESSED_UNKNOWN_FEES"
+
+    est_close_fee = float(config.PAPER_TX_FEE_SOL)
+    entry_fee = float(pos.entry_fee_sol)
+    realized_partial = float(pos.realized_partial_pnl_sol or 0.0)
+    net_now_sol = realized_partial + (current_sol_value - rem_basis - est_close_fee) - entry_fee
+    net_peak_sol = realized_partial + (max(pos.peak_sol_value, current_sol_value) - rem_basis - est_close_fee) - entry_fee
+    return True, net_now_sol, (net_now_sol / init_basis), (net_peak_sol / init_basis), "NET_FEES_KNOWN"
+
+
 def needs_exact_jupiter_quote(
     pos: ActivePosition,
     estimated_sol_value: float,
@@ -581,14 +610,13 @@ def needs_exact_jupiter_quote(
         return True
     be_floor_100 = config.BREAKEVEN_FLOOR_PCT * 100.0
     be_arm_100 = config.BREAKEVEN_ARM_PCT * 100.0
-    # Account for known paper round-trip fee buffer when deciding whether to fetch exact exit quote
-    fee_buf_100 = (
-        ((2.0 * float(config.PAPER_TX_FEE_SOL)) / basis) * 100.0
-        if (config.EXECUTION_MODE == "paper" and basis > 0)
-        else 0.0
-    )
-    if (pos.breakeven_armed or peak_pct_100 >= be_arm_100) and pnl_pct_100 <= be_floor_100 + fee_buf_100 + proximity_pct:
-        return True
+    # Align breakeven quote selection with complete net-lifecycle PnL and known-fee rules
+    fees_known, _, net_now_pct, net_peak_pct, _ = compute_net_lifecycle_pnl(pos, estimated_sol_value, config)
+    if fees_known and net_now_pct is not None and net_peak_pct is not None:
+        net_now_100 = net_now_pct * 100.0
+        net_peak_100 = net_peak_pct * 100.0
+        if (pos.breakeven_armed or net_peak_100 >= be_arm_100) and net_now_100 <= be_floor_100 + proximity_pct:
+            return True
     trail_arm_100 = config.TRAIL_ARM_PCT * 100.0
     raw_runner_drop = float(config.RUNNER_TRAIL_PULLBACK_PCT)
     runner_drop_100 = raw_runner_drop if raw_runner_drop >= 1.0 else raw_runner_drop * 100.0
