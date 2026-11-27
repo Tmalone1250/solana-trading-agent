@@ -111,18 +111,18 @@ Validation rules (all fail closed):
 - **Mandatory age validation on `pre_attached_verified`:** `evaluate_ohlcv_provenance()` applies the **exact same `last_ok_at` age check** (`<= OHLCV_CACHE_SECONDS`) to `pre_attached_verified` as to fetched candles. A `pre_attached_verified` result with missing or expired `last_ok_at` fails closed.
 - Production `scanner_node` / `safety_gate_node` JSON payloads never construct `OhlcvFetchResult` instances, preventing any production bypass.
 
-### 3.3 Independent 1m Provenance Enforcement in `alpha_node.py`
+### 3.3 Explicit 5m/1m Interval Selection & Enforcement in `alpha_node.py`
 - Call `fetch_ohlcv_batch_with_provenance()` and `fetch_ohlcv_1m_batch_with_provenance()`.
 - Resolve `res_5m` (from `cand.get("_ohlcv_5m_result")` if `cand.get("candles_5m") is not None` and `isinstance(..., OhlcvFetchResult)`, else `pre_attached_unknown` if `candles_5m` is present, else `ohlcv_5m_by_pair[p_addr]`).
 - Resolve `res_1m` identically (`cand.get("_ohlcv_1m_result")`, else `pre_attached_unknown` if `candles_1m` is present, else `ohlcv_1m_by_pair.get(p_addr)` or `unavailable`).
-- **Independent interval selection & validation:**
-  1. Count closed 5m bars via `normalize_and_filter_candles(res_5m.candles, bar_minutes=5, decision_timestamp=ref_ts)`.
-  2. If `len(closed_5m) >= 12`: `active_prov = res_5m` (must pass `evaluate_ohlcv_provenance(res_5m, ...)`).
-  3. Else (`len(closed_5m) < 12`, 1m fallback path):
-     - `res_1m` **must independently pass `evaluate_ohlcv_provenance(res_1m, ...)`**.
-     - A fresh/eligible `res_5m` **never** authorizes stale, `unavailable`, or `pre_attached_unknown` 1m candles.
-     - If `res_1m` is eligible, `active_prov = res_1m`.
-     - If neither interval is eligible (`not ok_5m` and `not ok_1m`), fail closed (`active_prov` preserves the explicit stale/error reason from `res_5m` if `res_5m` was `stale_*`, else `res_1m`'s `prov_err` or `"unavailable OHLCV"`).
+- Compute `ok_5m, err_5m = evaluate_ohlcv_provenance(res_5m, ...)` and `ok_1m, err_1m = evaluate_ohlcv_provenance(res_1m, ...)`, plus `closed_5m` via `normalize_and_filter_candles(res_5m.candles, bar_minutes=5, decision_timestamp=ref_ts)`.
+- **Deterministic selection rules (never use stale 5m or 1m candles as entry evidence):**
+  1. **`ok_5m` and `len(closed_5m) >= 12`:** Use 5m (`active_prov = res_5m`). Stale or unavailable 1m data does not affect this path.
+  2. **`ok_5m` and `len(closed_5m) < 12`:** Evaluate 1m fallback **only** if permitted by the existing fallback policy (5m `last_ok=True, last_status=200`, no backoff, or trusted `pre_attached_verified` 1m); independently require `ok_1m` and `len(closed_1m) >= 15`. A fresh 5m result never authorizes stale, `unavailable`, or `pre_attached_unknown` 1m candles; if `not ok_1m`, fail closed with `err_1m`.
+  3. **`not ok_5m` (stale or unavailable 5m, regardless of whether `len(closed_5m) >= 12` or `< 12`):**
+     - Stale 5m candles are **never** used as entry evidence, even when `len(closed_5m) >= 12`.
+     - Do **not** let an ineligible 5m series's candle count suppress an independently eligible 1m fallback **if** the fallback policy permits 1m (note: in live fetching, `should_fetch_1m_fallback()` blocks 1m network requests when 5m failed with `429`/backoff/error, leaving `res_1m` as `unavailable`; however, if 1m is permitted/independently eligible—e.g., `unavailable` 5m or `pre_attached_verified` 1m—`ok_1m` with `len(closed_1m) >= 15` is evaluated on 1m).
+     - If `not ok_1m` as well, fail closed immediately (`eligible=False, setup_type="NONE"`), preserving `err_5m` if `res_5m` was `stale_*`, else `err_1m`.
 - Call `cache_breakout_telemetry()` (`L170`) **only** when `evaluate_ohlcv_provenance(active_prov, ...)[0]` is `True`.
 
 ---
@@ -155,8 +155,10 @@ Validation rules (all fail closed):
 - **Distinguish insertion time from originating OHLCV timestamp:**
   - `cache_breakout_telemetry(mint, telemetry, *, ohlcv_source, ohlcv_last_ok_at, now_ts=None)` stores:
     `{"cached_at": ts, "ohlcv_last_ok_at": ohlcv_last_ok_at, "ohlcv_source": ohlcv_source, "telemetry": dict(telemetry)}`.
-- **Calculate age from originating data timestamp:**
-  - `get_cached_breakout_telemetry_with_meta(mint, now_ts=...)` returns `BreakoutTelemetryCacheEntry(telemetry, cached_at, ohlcv_last_ok_at, ohlcv_source, data_age_seconds, is_historical=True)` where `data_age_seconds = max(0.0, now_ts - ohlcv_last_ok_at)` (not `now_ts - cached_at`!).
+- **Explicit validation of originating data timestamp (never clamp future timestamps to zero):**
+  - `get_cached_breakout_telemetry_with_meta(mint, now_ts=..., clock_skew_seconds=5.0)` returns `BreakoutTelemetryCacheEntry(telemetry, cached_at, ohlcv_last_ok_at, ohlcv_source, data_age_seconds, is_historical=True, is_trusted=...)`:
+    - If `ohlcv_last_ok_at` is `None`, `bool`, non-numeric, non-finite (`NaN`/`inf`), `<= 0`, or materially in the future (`ohlcv_last_ok_at > now_ts + clock_skew_seconds`): set `data_age_seconds = None` (unknown/invalid age), `is_historical = True`, and `is_trusted = False` (do **not** clamp future timestamps to `0.0`).
+    - Otherwise (`ohlcv_last_ok_at <= now_ts + clock_skew_seconds`): set `data_age_seconds = max(0.0, now_ts - ohlcv_last_ok_at)` (only minor skew within `clock_skew_seconds` clamps to `0.0`), `is_historical = True`, `is_trusted = True`.
   - If telemetry was computed from 15-minute-old candles (`ohlcv_last_ok_at = T - 900`) and inserted 5 seconds ago (`cached_at = T - 5`), `data_age_seconds` is `900.0s` and `is_historical=True`—never labeled as a current evaluation.
 - Keep `get_cached_breakout_telemetry()` backward-compatible for legacy callers.
 
@@ -176,10 +178,13 @@ Validation rules (all fail closed):
 | `B8` | Pre-attached trusted candles (`pre_attached_verified` with valid `last_ok_at`) | Passes `evaluate_ohlcv_provenance()` without weakening production validation |
 | `B9` | Pre-attached unknown-provenance candles (`pre_attached_unknown`, omitted `ohlcv_provenance`, or candidate-supplied dict/bool flags) | Fails closed in `evaluate_scalper_entry()` and `alpha_node()` |
 | `B10` | `whale_lane.py` with stale OHLCV (`stale_429` / `stale_backoff`) | `has_ohlcv=False`, `_breakout_telemetry_cache` not overwritten, independent whale entry not falsely blocked |
-| `B11` | Eligible 5m (`< 12` closed bars) + ineligible 1m (`stale_429` / `unavailable` / `pre_attached_unknown`) | `alpha_node` fails closed on 1m provenance; fresh 5m never authorizes stale 1m |
-| `B12` | Ineligible 5m (`< 12` closed bars, e.g., `stale_backoff`) + eligible 1m (`pre_attached_verified` or `network_200`) | When 1m is independently eligible, 1m path uses 1m provenance; when `>= 12` closed 5m bars exist, ineligible 5m fails closed |
+| `B11` | Fresh 5m (`< 12` closed bars) + stale/ineligible 1m (`stale_429` / `unavailable` / `pre_attached_unknown`) | `alpha_node` fails closed on 1m provenance; fresh 5m never authorizes stale 1m |
+| `B12a` | `12+` closed stale 5m candles + independently fresh 1m data (when fallback policy permits 1m) | Stale 5m is rejected and does not suppress eligible 1m (`>= 15` closed 1m bars); when 5m `429`/backoff blocks 1m fetch, fails closed on 5m |
+| `B12b` | `12+` closed fresh 5m candles + stale 1m data | 5m is selected (`active_prov = res_5m`) and entry is eligible; stale 1m does not affect 5m |
+| `B12c` | Unavailable 5m + independently fresh 1m data (when permitted) | 1m is evaluated (`>= 15` closed 1m bars) rather than blocked by unavailable 5m |
 | `B13` | Pre-attached `pre_attached_verified` with missing (`None`) or expired (`> 90s`) `last_ok_at` | `evaluate_ohlcv_provenance()` fails closed (`missing or invalid OHLCV last_ok_at` / `expired OHLCV cache`) |
-| `B14` | Telemetry computed from older candles (`ohlcv_last_ok_at` 900s old) but inserted recently (`cached_at` 5s ago) | `data_age_seconds == 900.0`, `is_historical=True`, never labeled current |
+| `B14a` | Telemetry computed from older candles (`ohlcv_last_ok_at` 900s old) but inserted recently (`cached_at` 5s ago) | `data_age_seconds == 900.0`, `is_historical=True`, never labeled current |
+| `B14b` | Telemetry with missing (`None`), `NaN`, `<= 0`, or materially future (`> now_ts + 5s`) `ohlcv_last_ok_at` | `data_age_seconds is None`, `is_historical=True`, `is_trusted=False` (never clamped to `0.0`) |
 | `B15` | Contradictory metadata (`source="stale_429"` with `last_status=200`, or `source="network_200"` with `last_status=429` / `last_ok_at=None`) | `evaluate_ohlcv_provenance()` rejects all contradictory combinations fail-closed |
 
 ---
