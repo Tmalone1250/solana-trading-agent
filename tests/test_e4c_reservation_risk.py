@@ -115,10 +115,13 @@ async def test_e4c_live_rpc_balance_success_insufficient_timeout_and_error(tmp_p
     cfg = AgentConfig(
         _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
         SOLANA_RPC_URL=RPC_URL, LIVE_MIN_SOL_RESERVE=0.05, LIVE_FEE_RESERVATION_BUFFER_SOL=0.01,
+        PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
     )
-
     # 1. Success: wallet has 0.56 SOL -> 0.56 - 0.05 reserve = 0.51 >= 0.50 + 0.01 buffer
     db = AgentDatabase(db_path=str(tmp_path / "e4c_live_ok.duckdb"), starting_sol=1.0)
+    for m in (MINT_A, MINT_B):
+        db.upsert_watchlist_entry(mint=m, symbol="E4C", pair_address=POOL_A, candidate={"mint": m}, safety_passed=True)
+        db.mark_watchlist_safety_passed(m, True, checked_at=datetime.now(timezone.utc).isoformat())
     rpc_mode = {"mode": "ok", "lamports": int(0.56 * LAMPORTS_PER_SOL)}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -298,7 +301,11 @@ async def test_e4c_prebroadcast_cancellation_and_post_quote_exception_release_re
     db = AgentDatabase(db_path=str(tmp_path / "e4c_cancel.duckdb"), starting_sol=2.0)
     cfg = AgentConfig(
         _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp), SOLANA_RPC_URL=RPC_URL,
+        PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
     )
+    for m in (MINT_A, MINT_B):
+        db.upsert_watchlist_entry(mint=m, symbol="E4C", pair_address=POOL_A, candidate={"mint": m}, safety_passed=True)
+        db.mark_watchlist_safety_passed(m, True, checked_at=datetime.now(timezone.utc).isoformat())
 
     # 1. Pre-broadcast CancelledError during quote fetch releases reservation
     async def _cancel_transport(request: httpx.Request) -> httpx.Response:
@@ -346,8 +353,11 @@ async def test_e4c_potentially_broadcast_live_timeout_remains_locked_past_task_e
     db = AgentDatabase(db_path=str(tmp_path / "e4c_unres.duckdb"), starting_sol=2.0)
     cfg = AgentConfig(
         _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
-        SOLANA_RPC_URL=RPC_URL, MAX_CHART_POSITIONS=3,
+        SOLANA_RPC_URL=RPC_URL, MAX_CHART_POSITIONS=3, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
     )
+    for m in (MINT_A, MINT_B):
+        db.upsert_watchlist_entry(mint=m, symbol="E4C", pair_address=POOL_A, candidate={"mint": m}, safety_passed=True)
+        db.mark_watchlist_safety_passed(m, True, checked_at=datetime.now(timezone.utc).isoformat())
 
     def _timeout_exec_handler(request: httpx.Request) -> httpx.Response:
         if str(request.url).startswith(RPC_URL):
@@ -392,8 +402,11 @@ async def test_e4c_concurrent_buys_rpc_outside_lock_and_release_on_prebroadcast_
     db = AgentDatabase(db_path=str(tmp_path / "e4c_conc.duckdb"), starting_sol=2.0)
     cfg = AgentConfig(
         _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
-        SOLANA_RPC_URL=RPC_URL, MAX_CHART_POSITIONS=1,
+        SOLANA_RPC_URL=RPC_URL, MAX_CHART_POSITIONS=1, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
     )
+    for m in (MINT_A, MINT_B):
+        db.upsert_watchlist_entry(mint=m, symbol="E4C", pair_address=POOL_A, candidate={"mint": m}, safety_passed=True)
+        db.mark_watchlist_safety_passed(m, True, checked_at=datetime.now(timezone.utc).isoformat())
 
     lock_was_free_during_rpc: list[bool] = []
     fail_quote = {"flag": False}
@@ -461,8 +474,11 @@ async def test_e4c_post_broadcast_settlement_failure_retains_reservation_and_rol
     db = AgentDatabase(db_path=str(tmp_path / "e4c_settle_fail.duckdb"), starting_sol=2.0)
     cfg = AgentConfig(
         _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
-        SOLANA_RPC_URL=RPC_URL, MAX_CHART_POSITIONS=3,
+        SOLANA_RPC_URL=RPC_URL, MAX_CHART_POSITIONS=3, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
     )
+    for m in (MINT_A, MINT_B):
+        db.upsert_watchlist_entry(mint=m, symbol="E4C", pair_address=POOL_A, candidate={"mint": m}, safety_passed=True)
+        db.mark_watchlist_safety_passed(m, True, checked_at=datetime.now(timezone.utc).isoformat())
 
     # 1. Direct apply_trade_settlement failure: reservation stays present and DB rolls back cleanly
     res_id, rej = db.reserve_buy_slot(

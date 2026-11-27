@@ -249,6 +249,8 @@ async def test_e4a_drift_worst_case_slippage_impact_rtse_and_expiry_gates(tmp_pa
     unsigned_tx = _mk_unsigned_tx(kp)
     cfg = _mk_live_e4a_cfg(kp)
     db = AgentDatabase(db_path=str(tmp_path / "e4a_gates.duckdb"), starting_sol=5.0)
+    db.upsert_watchlist_entry(mint=MINT_E4A, symbol="E4A", pair_address=POOL_PINNED, candidate={"mint": MINT_E4A}, safety_passed=True)
+    db.mark_watchlist_safety_passed(MINT_E4A, True, checked_at=datetime.now(timezone.utc).isoformat())
 
     # Verify helper parses priceImpact first, falls back to priceImpactPct, rejects missing/malformed
     assert _parse_e4a_price_impact_pct({"priceImpact": -0.4, "priceImpactPct": "-9.9"}) == pytest.approx(-0.4)
@@ -356,6 +358,8 @@ async def test_e4a_corrective_strict_parsing_missing_oat_and_router_allowlist(tm
     kp = Keypair()
     unsigned_tx = _mk_unsigned_tx(kp)
     db = AgentDatabase(db_path=str(tmp_path / "e4a_corr.duckdb"), starting_sol=5.0)
+    db.upsert_watchlist_entry(mint=MINT_E4A, symbol="E4A", pair_address=POOL_PINNED, candidate={"mint": MINT_E4A}, safety_passed=True)
+    db.mark_watchlist_safety_passed(MINT_E4A, True, checked_at=datetime.now(timezone.utc).isoformat())
     cfg = _mk_live_e4a_cfg(kp)
 
     base_quote = {
@@ -506,6 +510,8 @@ async def test_e4a_post_broadcast_output_amount_result_strict_and_unresolved_lif
         clear_buy_reservations()
         db = AgentDatabase(db_path=str(tmp_path / f"e4a_unres_{idx}.duckdb"), starting_sol=5.0)
         mint_i = str(Keypair().pubkey())
+        db.upsert_watchlist_entry(mint=mint_i, symbol="E4A", pair_address=POOL_PINNED, candidate={"mint": mint_i}, safety_passed=True)
+        db.mark_watchlist_safety_passed(mint_i, True, checked_at=datetime.now(timezone.utc).isoformat())
         order_i = _mk_e4a_order()
         order_i["mint"] = mint_i
 
@@ -561,6 +567,8 @@ async def test_e4a_post_broadcast_output_amount_result_strict_and_unresolved_lif
         clear_buy_reservations()
         db = AgentDatabase(db_path=str(tmp_path / f"e4a_ok_{idx}.duckdb"), starting_sol=5.0)
         mint_i = str(Keypair().pubkey())
+        db.upsert_watchlist_entry(mint=mint_i, symbol="E4A", pair_address=POOL_PINNED, candidate={"mint": mint_i}, safety_passed=True)
+        db.mark_watchlist_safety_passed(mint_i, True, checked_at=datetime.now(timezone.utc).isoformat())
         order_i = _mk_e4a_order()
         order_i["mint"] = mint_i
 

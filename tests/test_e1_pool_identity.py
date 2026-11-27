@@ -151,6 +151,7 @@ async def test_e1_pool_identity_full_lifecycle_watchlist_partial_and_final_settl
         CHART_ENABLED_STRATEGIES="BREAKOUT_IGNITION",
         WHALE_STRATEGY_ENABLED=False,
         PAPER_TX_FEE_SOL=0.001,
+        PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
     )
     now_dt = datetime(2026, 11, 26, 12, 0, 0, tzinfo=timezone.utc)
     dex_id = "pumpswap"
@@ -168,8 +169,9 @@ async def test_e1_pool_identity_full_lifecycle_watchlist_partial_and_final_settl
     }
     db.upsert_watchlist_entry(
         mint=MINT_LIFE, symbol="PLIFE", pair_address=POOL_PINNED, dex_id=dex_id,
-        candidate=cand, added_at=cand["added_at"],
+        candidate=cand, added_at=cand["added_at"], safety_passed=True,
     )
+    db.mark_watchlist_safety_passed(MINT_LIFE, True, checked_at=now_dt.isoformat())
     # Upsert again with a competing pool & different DEX -> original watchlist identity must remain intact
     db.upsert_watchlist_entry(
         mint=MINT_LIFE, symbol="PLIFE", pair_address=POOL_COMPETING, dex_id="raydium",
@@ -201,6 +203,13 @@ async def test_e1_pool_identity_full_lifecycle_watchlist_partial_and_final_settl
 
     # 4, 5, 6, 7 & L-1A. Executor BUY -> ActivePosition -> PARTIAL_SELL -> Final SELL
     def jup_handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": MINT_LIFE, "audit": {"isSus": False}}])
+        if "rugcheck.xyz" in url:
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/ultra/v1/shield" in url:
+            return httpx.Response(200, json={"warnings": {MINT_LIFE: []}})
         if request.url.params.get("inputMint") == SOL_MINT:
             return httpx.Response(200, json={"outAmount": "1000000", "priceImpactPct": "-0.01", "transaction": None})
         if request.url.params.get("amount") == "500000":

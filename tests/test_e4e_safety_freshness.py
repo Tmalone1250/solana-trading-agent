@@ -396,3 +396,223 @@ async def test_e4e_pre_execution_rejects_shield_issus_api_error_and_pool_mismatc
     assert out_d == {"pending_order": None}
     assert get_inflight_buy_reservations(str(db_d.db_path)) == []
     db_d.close()
+
+
+@pytest.mark.asyncio
+async def test_e4e_corrective_no_unconfigured_memory_cache_bypass(tmp_path):
+    """Blocker 1: In-memory cached pass is NEVER reused when SAFETY_CACHE_TTL_SECONDS is unset, expired, or has malformed/future timestamp."""
+    from safety_gate_node import _safety_cache, cache_safety_report, get_cached_safety_report
+    from state import SafetyReport
+
+    clear_safety_cache()
+    db = AgentDatabase(db_path=str(tmp_path / "e4e_mem_bypass.duckdb"), starting_sol=2.0)
+    t0 = datetime(2026, 11, 27, 16, 0, 0, tzinfo=timezone.utc)
+    calls = {"rug": 0, "shield": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "rugcheck.xyz" in str(request.url):
+            calls["rug"] += 1
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/ultra/v1/shield" in str(request.url):
+            calls["shield"] += 1
+            return httpx.Response(200, json={"warnings": {MINT_E4E: []}})
+        return httpx.Response(404)
+
+    # 1. TTL unset + pre-populated in-memory cache: must NOT authorize a pass without calling APIs
+    _safety_cache[MINT_E4E] = {
+        "fetched_at": t0.timestamp(),
+        "report": SafetyReport(mint=MINT_E4E, passed=True, reasons=[]),
+    }
+    assert get_cached_safety_report(MINT_E4E, now_ts=t0.timestamp(), ttl_seconds=None) is None
+
+    cfg_unset = AgentConfig(_env_file=None, EXECUTION_MODE="paper", SAFETY_CACHE_TTL_SECONDS=None)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        out = await safety_gate_node(
+            {"focus_state": FocusState.SCANNING.value, "raw_candidates": [{"mint": MINT_E4E, "symbol": "E4E"}]},
+            config=cfg_unset, db=db, http_client=client, now=t0,
+        )
+    assert len(out["safe_candidates"]) == 1
+    assert out["safe_candidates"][0]["safety_report"].get("cached") is not True
+    assert calls == {"rug": 1, "shield": 1}
+
+    # 2. Malformed / future cached fetched_at never authorizes a pass
+    _safety_cache[MINT_E4E] = {
+        "fetched_at": t0.timestamp() + 60.0,  # future
+        "report": SafetyReport(mint=MINT_E4E, passed=True, reasons=[]),
+    }
+    assert get_cached_safety_report(MINT_E4E, now_ts=t0.timestamp(), ttl_seconds=120.0) is None
+    _safety_cache[MINT_E4E] = {
+        "fetched_at": "bad-ts",
+        "report": SafetyReport(mint=MINT_E4E, passed=True, reasons=[]),
+    }
+    assert get_cached_safety_report(MINT_E4E, now_ts=t0.timestamp(), ttl_seconds=120.0) is None
+
+    # 3. Valid configured TTL reuses cache within TTL and expires after TTL
+    clear_safety_cache()
+    cache_safety_report(MINT_E4E, SafetyReport(mint=MINT_E4E, passed=True, reasons=[]), now_ts=t0.timestamp(), ttl_seconds=60.0)
+    assert get_cached_safety_report(MINT_E4E, now_ts=t0.timestamp() + 30.0, ttl_seconds=60.0) is not None
+    assert get_cached_safety_report(MINT_E4E, now_ts=t0.timestamp() + 61.0, ttl_seconds=60.0) is None
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_e4e_corrective_incomplete_evidence_fails_closed_without_eviction(tmp_path):
+    """Blocker 2: Missing/malformed Token v2 audit.isSus, empty/malformed RugCheck, and empty/missing-mint Shield fail closed WITHOUT evicting or marking fresh."""
+    clear_buy_reservations()
+    clear_sell_idempotency_guard()
+    kp = Keypair()
+    cfg = _mk_live_e4e_cfg(kp, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
+
+    incomplete_scenarios = [
+        # Missing isSus in audit
+        ([{"id": MINT_E4E, "audit": {}}], {"rugged": False}, {"warnings": {MINT_E4E: []}}),
+        # Null isSus
+        ([{"id": MINT_E4E, "audit": {"isSus": None}}], {"rugged": False}, {"warnings": {MINT_E4E: []}}),
+        # String isSus
+        ([{"id": MINT_E4E, "audit": {"isSus": "false"}}], {"rugged": False}, {"warnings": {MINT_E4E: []}}),
+        # Wrong-mint Token v2 result
+        ([{"id": "WrongMint1111111111111111111111111111111111", "audit": {"isSus": False}}], {"rugged": False}, {"warnings": {MINT_E4E: []}}),
+        # Empty RugCheck JSON
+        ([{"id": MINT_E4E, "audit": {"isSus": False}}], {}, {"warnings": {MINT_E4E: []}}),
+        # Malformed RugCheck JSON
+        ([{"id": MINT_E4E, "audit": {"isSus": False}}], {"unexpected": True}, {"warnings": {MINT_E4E: []}}),
+        # Empty Shield JSON
+        ([{"id": MINT_E4E, "audit": {"isSus": False}}], {"rugged": False}, {}),
+        # Missing-mint Shield JSON
+        ([{"id": MINT_E4E, "audit": {"isSus": False}}], {"rugged": False}, {"warnings": {}}),
+        # Malformed Shield warnings
+        ([{"id": MINT_E4E, "audit": {"isSus": False}}], {"rugged": False}, {"warnings": {MINT_E4E: "bad"}}),
+    ]
+
+    for idx, (v2_body, rug_body, shield_body) in enumerate(incomplete_scenarios):
+        clear_buy_reservations()
+        db = AgentDatabase(db_path=str(tmp_path / f"e4e_inc_{idx}.duckdb"), starting_sol=5.0)
+        db.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, safety_passed=False)
+
+        def handler(request: httpx.Request, vb=v2_body, rb=rug_body, sb=shield_body) -> httpx.Response:
+            url = str(request.url)
+            if url.startswith(RPC_URL):
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
+            if "/tokens/v2/search" in url:
+                return httpx.Response(200, json=vb)
+            if "rugcheck.xyz" in url:
+                return httpx.Response(200, json=rb)
+            if "/ultra/v1/shield" in url:
+                return httpx.Response(200, json=sb)
+            raise AssertionError(f"Unexpected request after incomplete safety evidence: {url}")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            out = await executor_node(
+                {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4e_order()},
+                config=cfg, db=db, http_client=client,
+            )
+        assert out == {"pending_order": None}
+        assert get_inflight_buy_reservations(str(db.db_path)) == []
+        assert db.get_active_locking_intents() == []
+        # Unavailable/malformed evidence must NOT evict or set cooldown or mark fresh
+        row = db.get_watchlist_entry(MINT_E4E)
+        assert row is not None and row["safety_checked_at"] is None
+        assert db.is_on_cooldown(MINT_E4E) is False
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_e4e_corrective_paper_and_non_breakout_live_require_ttl_and_sell_unaffected(tmp_path):
+    """Blocker 3: Unset PRE_EXECUTION_SAFETY_TTL_SECONDS blocks BUY in BOTH paper and live (including SCALPER), leaving SELL unaltered."""
+    clear_buy_reservations()
+    clear_sell_idempotency_guard()
+    kp = Keypair()
+    db = AgentDatabase(db_path=str(tmp_path / "e4e_ttl_both.duckdb"), starting_sol=5.0)
+    db.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, safety_passed=True)
+    db.mark_watchlist_safety_passed(MINT_E4E, True, checked_at=datetime.now(timezone.utc).isoformat())
+
+    jup_calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith(RPC_URL):
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
+        if "/swap/v2/" in str(request.url):
+            jup_calls["n"] += 1
+            return httpx.Response(200, json={"outAmount": str(int(0.50 * LAMPORTS_PER_SOL)), "transaction": None})
+        return httpx.Response(404)
+
+    # 1. Paper BUY with unset TTL -> blocked before Jupiter
+    cfg_paper_unset = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PRE_EXECUTION_SAFETY_TTL_SECONDS=None)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        out_p = await executor_node(
+            {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4e_order(strategy="SCALPER")},
+            config=cfg_paper_unset, db=db, http_client=client,
+        )
+    assert out_p == {"pending_order": None}
+    assert jup_calls["n"] == 0
+    assert get_inflight_buy_reservations(str(db.db_path)) == []
+    assert db.get_active_locking_intents() == []
+
+    # 2. Live SCALPER BUY with unset TTL -> blocked before Jupiter
+    cfg_live_unset = _mk_live_e4e_cfg(kp, PRE_EXECUTION_SAFETY_TTL_SECONDS=None)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        out_l = await executor_node(
+            {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4e_order(strategy="SCALPER")},
+            config=cfg_live_unset, db=db, http_client=client,
+        )
+    assert out_l == {"pending_order": None}
+    assert jup_calls["n"] == 0
+    assert get_inflight_buy_reservations(str(db.db_path)) == []
+    assert db.get_active_locking_intents() == []
+
+    # 3. Paper SELL with unset TTL -> unaltered (succeeds)
+    from state import ActivePosition
+    pos = ActivePosition(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, dex_id="pumpswap", entry_sol=0.50, token_amount=1_000_000).model_dump()
+    sell_order = PendingOrder(
+        side="SELL", mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, dex_id="pumpswap",
+        amount_atomic=1_000_000, reason="TRAILING_TP", target_state_after_fill=FocusState.SCANNING,
+    ).model_dump()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        out_sell = await executor_node(
+            {"focus_state": FocusState.IN_POSITION.value, "sol_balance": 4.5, "daily_pnl_sol": 0.0, "active_position": pos, "chart_positions": [pos], "pending_order": sell_order},
+            config=cfg_paper_unset, db=db, http_client=client,
+        )
+    assert out_sell["last_execution"]["side"] == "SELL"
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_e4e_corrective_pinned_pool_required_before_any_safety_or_quote(tmp_path):
+    """Blocker 4: Missing watchlist row, empty/invalid watchlist pair_address, or mismatch blocks BREAKOUT_IGNITION BUY before safety API or Jupiter."""
+    clear_buy_reservations()
+    clear_sell_idempotency_guard()
+    kp = Keypair()
+    cfg = _mk_live_e4e_cfg(kp, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
+    api_calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith(RPC_URL):
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
+        api_calls["n"] += 1
+        return httpx.Response(500)
+
+    # 1. Missing watchlist row
+    db1 = AgentDatabase(db_path=str(tmp_path / "e4e_nowl.duckdb"), starting_sol=5.0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        out1 = await executor_node(
+            {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4e_order()},
+            config=cfg, db=db1, http_client=client,
+        )
+    assert out1 == {"pending_order": None}
+    assert api_calls["n"] == 0
+    assert get_inflight_buy_reservations(str(db1.db_path)) == []
+    db1.close()
+
+    # 2. Empty watchlist pair_address
+    db2 = AgentDatabase(db_path=str(tmp_path / "e4e_emptypool.duckdb"), starting_sol=5.0)
+    db2.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address="", candidate={"mint": MINT_E4E}, safety_passed=True)
+    db2.mark_watchlist_safety_passed(MINT_E4E, True, checked_at=datetime.now(timezone.utc).isoformat())
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        out2 = await executor_node(
+            {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4e_order()},
+            config=cfg, db=db2, http_client=client,
+        )
+    assert out2 == {"pending_order": None}
+    assert api_calls["n"] == 0
+    assert get_inflight_buy_reservations(str(db2.db_path)) == []
+    db2.close()

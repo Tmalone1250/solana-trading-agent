@@ -57,7 +57,9 @@ async def test_e2b_buy_to_sell_reconciles_account_and_lifecycle_pnl(tmp_path):
     clear_buy_reservations()
     clear_sell_idempotency_guard()
     db = AgentDatabase(db_path=str(tmp_path / "e2b_buy_sell.duckdb"), starting_sol=2.0)
-    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.001)
+    db.upsert_watchlist_entry(mint=MINT_E2B, symbol="E2B", pair_address=POOL_PINNED, candidate={"mint": MINT_E2B}, safety_passed=True)
+    db.mark_watchlist_safety_passed(MINT_E2B, True, checked_at=datetime.now(timezone.utc).isoformat())
+    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.001, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.params.get("inputMint") == SOL_MINT:
@@ -101,11 +103,20 @@ async def test_e2b_partial_sell_then_final_sell_trailing_and_reentry_scope(tmp_p
     clear_buy_reservations()
     clear_sell_idempotency_guard()
     db = AgentDatabase(db_path=str(tmp_path / "e2b_partial_reentry.duckdb"), starting_sol=3.0)
-    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.001, PARTIAL_TP_SELL_FRACTION=0.50)
+    db.upsert_watchlist_entry(mint=MINT_E2B, symbol="E2B", pair_address=POOL_PINNED, candidate={"mint": MINT_E2B}, safety_passed=True)
+    db.mark_watchlist_safety_passed(MINT_E2B, True, checked_at=datetime.now(timezone.utc).isoformat())
+    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.001, PARTIAL_TP_SELL_FRACTION=0.50, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
 
     sell_calls = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": MINT_E2B, "audit": {"isSus": False}}])
+        if "rugcheck.xyz" in url:
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/ultra/v1/shield" in url:
+            return httpx.Response(200, json={"warnings": {MINT_E2B: []}})
         in_mint = request.url.params.get("inputMint")
         if in_mint == SOL_MINT:
             return httpx.Response(200, json={"outAmount": "1000000", "transaction": None})
@@ -153,7 +164,7 @@ async def test_e2b_partial_sell_then_final_sell_trailing_and_reentry_scope(tmp_p
         # Re-entry BUY must start a fresh position fee scope (never inherit Leg 1's 0.002+ fees or partial PnL)
         clear_sell_idempotency_guard()
         out_rb = await executor_node(
-            {**db.get_state(), "pending_order": _mk_paper_buy_order(reason="LEG_2_REENTRY")},
+            {**db.get_state(), "pending_order": _mk_paper_buy_order(reason="LEG_2_REENTRY", strategy="SCALPER")},
             config=cfg, db=db, http_client=client,
         )
         pos2 = out_rb["chart_positions"][0]
@@ -219,10 +230,12 @@ async def test_e2b_live_unknown_fee_remains_null_and_historical_migration_preser
     # 2. Live mode BUY without observed RPC fee records tx_fee_sol=NULL & fee_status='UNKNOWN'
     clear_buy_reservations()
     db_live = AgentDatabase(db_path=str(tmp_path / "e2b_live.duckdb"), starting_sol=2.0)
+    db_live.upsert_watchlist_entry(mint=MINT_E2B, symbol="E2B", pair_address=POOL_PINNED, candidate={"mint": MINT_E2B}, safety_passed=True)
+    db_live.mark_watchlist_safety_passed(MINT_E2B, True, checked_at=datetime.now(timezone.utc).isoformat())
     kp = Keypair()
     cfg_live = AgentConfig(
         _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
-        SOLANA_RPC_URL="https://rpc.example.test",
+        SOLANA_RPC_URL="https://rpc.example.test", PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
     )
 
     from solders.message import MessageV0
@@ -526,10 +539,12 @@ async def test_e2b_c2_live_unknown_fees_no_zero_substitution(tmp_path, monkeypat
     clear_sell_idempotency_guard()
     kp = Keypair()
     db = AgentDatabase(db_path=str(tmp_path / "c2_live.duckdb"), starting_sol=3.0)
+    db.upsert_watchlist_entry(mint=MINT_E2B, symbol="E2B", pair_address=POOL_PINNED, candidate={"mint": MINT_E2B}, safety_passed=True)
+    db.mark_watchlist_safety_passed(MINT_E2B, True, checked_at=datetime.now(timezone.utc).isoformat())
     cfg = AgentConfig(
         _env_file=None, EXECUTION_MODE="live",
         SOLANA_PRIVATE_KEY_BS58=str(kp), JUPITER_API_KEY="k", PAPER_TX_FEE_SOL=0.001,
-        SOLANA_RPC_URL="https://rpc.example.test",
+        SOLANA_RPC_URL="https://rpc.example.test", PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
     )
 
     monkeypatch.setattr("executor_node.sign_jupiter_transaction", lambda tx, k: "signed-b64")

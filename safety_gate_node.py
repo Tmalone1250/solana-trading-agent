@@ -35,9 +35,16 @@ def cache_safety_report(
     now_ts: Optional[float] = None,
     ttl_seconds: Optional[float] = None,
 ) -> None:
-    """Store a SafetyReport in the bounded in-memory cache with TTL & max-size eviction."""
+    """Store a SafetyReport in the bounded in-memory cache when a positive finite TTL is configured."""
+    if ttl_seconds is None or isinstance(ttl_seconds, bool):
+        return
+    try:
+        ttl = float(ttl_seconds)
+    except (TypeError, ValueError):
+        return
+    if not math.isfinite(ttl) or ttl <= 0.0:
+        return
     ts = now_ts if now_ts is not None else time.time()
-    ttl = float(ttl_seconds) if ttl_seconds is not None else SAFETY_CACHE_TTL_SECONDS
     _safety_cache[mint] = {"fetched_at": ts, "report": report}
     prune_timestamped_cache(
         _safety_cache,
@@ -53,9 +60,22 @@ def get_cached_safety_report(
     now_ts: Optional[float] = None,
     ttl_seconds: Optional[float] = None,
 ) -> Optional[SafetyReport]:
-    """Retrieve a non-expired SafetyReport from the bounded in-memory cache."""
+    """Retrieve a non-expired SafetyReport from the bounded in-memory cache; returns None if TTL is unset/invalid."""
+    if ttl_seconds is None or isinstance(ttl_seconds, bool):
+        return None
+    try:
+        ttl = float(ttl_seconds)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(ttl) or ttl <= 0.0:
+        return None
     ts = now_ts if now_ts is not None else time.time()
-    ttl = float(ttl_seconds) if ttl_seconds is not None else SAFETY_CACHE_TTL_SECONDS
+    if not math.isfinite(ts):
+        return None
+    for k, v in list(_safety_cache.items()):
+        fa = v.get("fetched_at") if isinstance(v, dict) else None
+        if isinstance(fa, bool) or not isinstance(fa, (int, float)) or not math.isfinite(float(fa)):
+            _safety_cache.pop(k, None)
     prune_timestamped_cache(
         _safety_cache,
         now_ts=ts,
@@ -63,9 +83,15 @@ def get_cached_safety_report(
         ttl_seconds=ttl,
     )
     entry = _safety_cache.get(mint)
-    if entry and isinstance(entry.get("report"), SafetyReport):
-        return entry["report"]
-    return None
+    if not isinstance(entry, dict) or not isinstance(entry.get("report"), SafetyReport):
+        return None
+    fetched_at = entry.get("fetched_at")
+    if isinstance(fetched_at, bool) or not isinstance(fetched_at, (int, float)) or not math.isfinite(float(fetched_at)):
+        return None
+    age = ts - float(fetched_at)
+    if age < 0.0 or age > ttl:
+        return None
+    return entry["report"]
 
 
 def parse_utc_timestamp(raw: Any) -> Optional[datetime]:
@@ -261,6 +287,48 @@ def evaluate_jupiter_shield(shield_payload: dict[str, Any], mint: str) -> list[s
     return reasons
 
 
+_RUGCHECK_EXPECTED_KEYS = {
+    "riskScore", "score", "rugged", "risks", "markets",
+    "mintAuthority", "freezeAuthority", "topHolders",
+}
+
+
+def validate_rugcheck_structure(summary: Any) -> Optional[str]:
+    """Return error reason if RugCheck payload is empty or structurally malformed, else None."""
+    if not isinstance(summary, dict) or not summary:
+        return "empty or non-object RugCheck response"
+    if not (_RUGCHECK_EXPECTED_KEYS & set(summary.keys())):
+        return "missing recognized RugCheck fields"
+    if "risks" in summary and summary["risks"] is not None and not isinstance(summary["risks"], list):
+        return "malformed RugCheck risks field"
+    if "markets" in summary and summary["markets"] is not None and not isinstance(summary["markets"], list):
+        return "malformed RugCheck markets field"
+    if "rugged" in summary and summary["rugged"] is not None and not isinstance(summary["rugged"], bool):
+        return "malformed RugCheck rugged field"
+    return None
+
+
+def validate_jupiter_shield_structure(shield_payload: Any, mint: str) -> Optional[str]:
+    """Return error reason if Jupiter Shield payload lacks a valid entry for mint, else None."""
+    if isinstance(shield_payload, dict):
+        warnings_map = shield_payload.get("warnings")
+        if isinstance(warnings_map, dict) and mint in warnings_map:
+            entries = warnings_map.get(mint)
+            if isinstance(entries, list) and all(isinstance(w, (dict, str)) for w in entries):
+                return None
+            return "malformed Jupiter Shield warnings list"
+        mints_map = shield_payload.get("mints")
+        if isinstance(mints_map, dict) and isinstance(mints_map.get(mint), dict):
+            return None
+        return "missing mint entry in Jupiter Shield response"
+    if isinstance(shield_payload, list):
+        for item in shield_payload:
+            if isinstance(item, dict) and item.get("mint") == mint:
+                return None
+        return "missing mint entry in Jupiter Shield list response"
+    return "malformed Jupiter Shield response"
+
+
 async def check_token_safety(
     mint: str,
     config: AgentConfig,
@@ -278,10 +346,14 @@ async def check_token_safety(
         rug_resp = await client.get(rug_url, timeout=10.0)
         rug_resp.raise_for_status()
         rug_data = rug_resp.json()
-        r_reasons, rugcheck_score, top10_pct, lp_locked_pct = evaluate_rugcheck_summary(
-            rug_data, config
-        )
-        reasons.extend(r_reasons)
+        rug_err = validate_rugcheck_structure(rug_data)
+        if rug_err is not None:
+            reasons.append(f"RugCheck unavailable/failed: {rug_err}")
+        else:
+            r_reasons, rugcheck_score, top10_pct, lp_locked_pct = evaluate_rugcheck_summary(
+                rug_data, config
+            )
+            reasons.extend(r_reasons)
     except Exception as exc:
         reasons.append(f"RugCheck unavailable/failed: {exc}")
 
@@ -298,7 +370,11 @@ async def check_token_safety(
         )
         sh_resp.raise_for_status()
         sh_data = sh_resp.json()
-        reasons.extend(evaluate_jupiter_shield(sh_data, mint))
+        sh_err = validate_jupiter_shield_structure(sh_data, mint)
+        if sh_err is not None:
+            reasons.append(f"Jupiter Shield unavailable/failed: {sh_err}")
+        else:
+            reasons.extend(evaluate_jupiter_shield(sh_data, mint))
     except Exception as exc:
         reasons.append(f"Jupiter Shield unavailable/failed: {exc}")
 
@@ -339,7 +415,14 @@ async def safety_gate_node(
     if now_dt.tzinfo is None:
         now_dt = now_dt.replace(tzinfo=timezone.utc)
     ttl_cfg = config.SAFETY_CACHE_TTL_SECONDS
-    mem_ttl = float(ttl_cfg) if ttl_cfg is not None else SAFETY_CACHE_TTL_SECONDS
+    valid_ttl: Optional[float] = None
+    if ttl_cfg is not None and not isinstance(ttl_cfg, bool):
+        try:
+            t_val = float(ttl_cfg)
+            if math.isfinite(t_val) and t_val > 0.0:
+                valid_ttl = t_val
+        except (TypeError, ValueError):
+            valid_ttl = None
     watchlist_by_mint = (
         {w["mint"]: w for w in db.get_watchlist()}
         if db is not None
@@ -373,14 +456,23 @@ async def safety_gate_node(
                 rejected.append({"mint": mint, "symbol": symbol, "reasons": [reason_str]})
                 continue
 
-            # Cache hit: reuse persisted watchlist pass ONLY when safety_checked_at is valid & within SAFETY_CACHE_TTL_SECONDS
+            # Cache hit: reuse persisted or in-memory safety pass ONLY when SAFETY_CACHE_TTL_SECONDS is valid & timestamp is fresh
             w_row = watchlist_by_mint.get(mint)
             persisted_fresh = bool(
-                w_row
+                valid_ttl is not None
+                and w_row
                 and w_row.get("safety_passed") is True
-                and is_safety_timestamp_fresh(w_row.get("safety_checked_at"), ttl_cfg, now_dt=now_dt)
+                and is_safety_timestamp_fresh(w_row.get("safety_checked_at"), valid_ttl, now_dt=now_dt)
             )
-            cached_rep = get_cached_safety_report(mint, now_ts=now_dt.timestamp(), ttl_seconds=mem_ttl)
+            cached_rep = (
+                get_cached_safety_report(mint, now_ts=now_dt.timestamp(), ttl_seconds=valid_ttl)
+                if valid_ttl is not None
+                else None
+            )
+            if w_row is not None and w_row.get("safety_checked_at") is not None and not is_safety_timestamp_fresh(
+                w_row.get("safety_checked_at"), valid_ttl, now_dt=now_dt
+            ):
+                cached_rep = None
             if persisted_fresh or (cached_rep and cached_rep.passed):
                 enriched = dict(cand)
                 enriched["safety_passed"] = True
@@ -389,9 +481,9 @@ async def safety_gate_node(
                 logger.info("[SafetyGate] $%s | CACHED PASS (skipped redundant API calls)", symbol)
                 continue
 
-            report = cached_rep or await check_token_safety(mint, config, client)
+            report = await check_token_safety(mint, config, client)
             if report.passed:
-                cache_safety_report(mint, report, now_ts=now_dt.timestamp(), ttl_seconds=mem_ttl)
+                cache_safety_report(mint, report, now_ts=now_dt.timestamp(), ttl_seconds=valid_ttl)
                 if db is not None:
                     db.mark_watchlist_safety_passed(mint, True, checked_at=now_dt.isoformat())
                 enriched = dict(cand)

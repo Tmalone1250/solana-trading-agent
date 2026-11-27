@@ -467,9 +467,7 @@ async def _validate_e4e_pre_execution_safety(
     ttl = config.PRE_EXECUTION_SAFETY_TTL_SECONDS
     is_breakout = (order.strategy or "").strip().upper() == "BREAKOUT_IGNITION"
     if ttl is None:
-        if config.EXECUTION_MODE == "live" and is_breakout:
-            raise E4AValidationError("BLOCKED: PRE_EXECUTION_SAFETY_TTL_UNSET")
-        return
+        raise E4AValidationError("BLOCKED: PRE_EXECUTION_SAFETY_TTL_UNSET")
     if isinstance(ttl, bool) or not math.isfinite(float(ttl)) or float(ttl) <= 0.0:
         raise E4AValidationError("BLOCKED: INVALID_PRE_EXECUTION_SAFETY_TTL")
 
@@ -479,9 +477,13 @@ async def _validate_e4e_pre_execution_safety(
 
     # Read watchlist entry under db._lock (released before any network request)
     w_row = db.get_watchlist_entry(order.mint)
-    if w_row is not None and is_breakout:
+    if is_breakout:
+        if w_row is None:
+            raise E4AValidationError("BLOCKED: MISSING_WATCHLIST_ROW_AT_SAFETY")
         w_pair = str(w_row.get("pair_address") or "").strip()
-        if w_pair and w_pair != str(order.pair_address or "").strip():
+        if not w_pair or not is_valid_pool_address(w_pair, mint=order.mint):
+            raise E4AValidationError(f"BLOCKED: INVALID_WATCHLIST_PINNED_POOL ({w_pair!r})")
+        if w_pair != str(order.pair_address or "").strip():
             raise E4AValidationError(
                 f"BLOCKED: PINNED_POOL_MISMATCH_AT_SAFETY (order={order.pair_address}, watchlist={w_pair})"
             )
@@ -492,7 +494,7 @@ async def _validate_e4e_pre_execution_safety(
         return
 
     confirmed_unsafe: list[str] = []
-    # 1. Lightweight Jupiter Token v2 isSus check
+    # 1. Lightweight Jupiter Token v2 explicit audit.isSus check (must be present and bool)
     try:
         v2_resp = await client.get(
             f"{config.JUPITER_TOKENS_V2_BASE_URL}/search",
@@ -505,15 +507,17 @@ async def _validate_e4e_pre_execution_safety(
         items = _extract_token_list(v2_payload)
         if not items and isinstance(v2_payload, dict) and (v2_payload.get("id") or v2_payload.get("address")):
             items = [v2_payload]
-        matched_meta: Optional[dict[str, Any]] = None
+        matched_item: Optional[dict[str, Any]] = None
         for item in items:
-            parsed = parse_jupiter_token_v2(item)
-            if parsed and parsed[0] == order.mint:
-                matched_meta = parsed[1]
+            if isinstance(item, dict) and str(item.get("id") or item.get("address") or "").strip() == order.mint:
+                matched_item = item
                 break
-        if matched_meta is None:
+        if matched_item is None:
             raise E4AValidationError("BLOCKED: PRE_EXECUTION_JUPITER_V2_MISSING_MINT")
-        if matched_meta.get("is_sus") is True:
+        audit_obj = matched_item.get("audit")
+        if not isinstance(audit_obj, dict) or "isSus" not in audit_obj or not isinstance(audit_obj["isSus"], bool):
+            raise E4AValidationError("BLOCKED: PRE_EXECUTION_JUPITER_V2_MALFORMED_AUDIT")
+        if audit_obj["isSus"] is True:
             confirmed_unsafe.append("Jupiter Token v2: audit.isSus=True")
     except E4AValidationError:
         raise

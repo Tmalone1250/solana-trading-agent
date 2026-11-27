@@ -110,7 +110,9 @@ async def test_alpha_node_single_batched_decision_1_call(tmp_path):
 @pytest.mark.asyncio
 async def test_executor_paper_mode_omits_taker_and_logs_out_amount(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "exec_paper.duckdb"), starting_sol=0.7)
-    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", JUPITER_API_KEY="jup-secret", PAPER_TX_FEE_SOL=0.0)
+    db.upsert_watchlist_entry(mint="MintAlpha1111111111111111111111111111111111", symbol="ALPHA", pair_address="PoolA", candidate={"mint": "MintAlpha1111111111111111111111111111111111"}, safety_passed=True)
+    db.mark_watchlist_safety_passed("MintAlpha1111111111111111111111111111111111", True, checked_at=datetime.now(timezone.utc).isoformat())
+    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", JUPITER_API_KEY="jup-secret", PAPER_TX_FEE_SOL=0.0, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
 
     seen_params = {}
 
@@ -161,6 +163,8 @@ async def test_executor_paper_mode_omits_taker_and_logs_out_amount(tmp_path):
 @pytest.mark.asyncio
 async def test_executor_live_mode_passes_taker_signs_and_executes(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "exec_live.duckdb"), starting_sol=0.7)
+    db.upsert_watchlist_entry(mint="MintLive11111111111111111111111111111111111", symbol="LIVE", pair_address="PoolL", candidate={"mint": "MintLive11111111111111111111111111111111111"}, safety_passed=True)
+    db.mark_watchlist_safety_passed("MintLive11111111111111111111111111111111111", True, checked_at=datetime.now(timezone.utc).isoformat())
     kp = Keypair()
     cfg = AgentConfig(
         _env_file=None,
@@ -168,6 +172,7 @@ async def test_executor_live_mode_passes_taker_signs_and_executes(tmp_path):
         JUPITER_API_KEY="jup-live-key",
         SOLANA_PRIVATE_KEY_BS58=str(kp),
         SOLANA_RPC_URL="https://rpc.example.test",
+        PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
     )
 
     # Build a valid unsigned VersionedTransaction for the mock Jupiter response

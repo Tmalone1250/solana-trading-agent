@@ -42,3 +42,16 @@
 - See [e4e_test_results.md](file:///home/tmalone1250/ToshibaDrive/Dev/Web3_Dev/solana-trading-agent/reports/phase_e4_entry_execution/e4e_test_results.md) and [e4e_full_diff.patch](file:///home/tmalone1250/ToshibaDrive/Dev/Web3_Dev/solana-trading-agent/reports/phase_e4_entry_execution/e4e_full_diff.patch).
 - `solana_meme_agent.duckdb` (`sha256: ef8a11baf9537e12d91873933f202a68af37ba1566253727caae5d8dd6ecbc03`) and `.env` were not modified.
 - Confirmed: no merge, deployment, `.env` change, Raspberry Pi modification, threshold tuning, or live-mode enablement occurred.
+
+## E4E Corrective Pass (from `2d221dbf2784584c6a2c3923f644d710c0381b04`)
+1. **Removed unconfigured in-memory safety-cache bypass (`safety_gate_node.py`):**
+   - `get_cached_safety_report` and `cache_safety_report` no longer fall back to the legacy `SAFETY_CACHE_TTL_SECONDS = 300.0` constant when `config.SAFETY_CACHE_TTL_SECONDS` is `None` or invalid.
+   - `get_cached_safety_report` sanitizes malformed/non-finite `fetched_at` entries before pruning and rejects future or expired cached entries.
+   - `safety_gate_node` applies `config.SAFETY_CACHE_TTL_SECONDS` consistently to both persisted watchlist `safety_checked_at` and in-memory cached reports, and never refreshes `safety_checked_at` on cache hits.
+2. **Complete safety evidence validation (`executor_node.py`, `safety_gate_node.py`):**
+   - Token v2 `audit.isSus` at the BUY execution boundary must be explicitly present and a `bool` on the matching mint entry (never defaulted to `False`); missing/malformed `audit` or `isSus` fails closed as unavailable/malformed evidence without evicting or marking fresh.
+   - Added `validate_rugcheck_structure` and `validate_jupiter_shield_structure` in `safety_gate_node.py` so empty objects, missing mint entries, or malformed structures fail closed as `unavailable/failed` without evicting or marking fresh, while confirmed unsafe outcomes continue to evict + set cooldown.
+3. **Pre-execution safety boundary enforced for all BUYs (`executor_node.py`):**
+   - `_validate_e4e_pre_execution_safety` requires a positive finite `PRE_EXECUTION_SAFETY_TTL_SECONDS` for every `BUY` in both paper and live modes (all strategies), rejecting before Jupiter quoting/signing/broadcast and leaving `SELL`/`PARTIAL_SELL` unaltered.
+4. **Fail-closed pinned pool verification (`executor_node.py`):**
+   - For `BREAKOUT_IGNITION` BUYs, `_validate_e4e_pre_execution_safety` requires an existing watchlist row with a non-empty valid `pair_address` matching `order.pair_address` before any safety API request, Jupiter quote, signing, or broadcast.

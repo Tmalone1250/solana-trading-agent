@@ -174,8 +174,10 @@ async def test_e4d_intent_persisted_before_broadcast_and_timeout_restores_block_
     db1 = AgentDatabase(db_path=db_path, starting_sol=2.0)
     cfg = AgentConfig(
         _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
-        SOLANA_RPC_URL=RPC_URL, MAX_CHART_POSITIONS=3,
+        SOLANA_RPC_URL=RPC_URL, MAX_CHART_POSITIONS=3, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
     )
+    db1.upsert_watchlist_entry(mint=MINT_A, symbol="E4D", pair_address=POOL_A, candidate={"mint": MINT_A}, safety_passed=True)
+    db1.mark_watchlist_safety_passed(MINT_A, True, checked_at=datetime.now(timezone.utc).isoformat())
 
     seen_pre_broadcast_intent: list[dict[str, Any]] = []
 

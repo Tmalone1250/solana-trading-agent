@@ -39,6 +39,7 @@ def _isolation_cfg(**overrides: Any) -> AgentConfig:
         MAX_REENTRIES_PER_MINT=0,
         PAPER_TX_FEE_SOL=0.001,
         TRADE_SIZE_SOL=0.50,
+        PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
     )
     defaults.update(overrides)
     return AgentConfig(**defaults)
@@ -237,7 +238,14 @@ async def test_executor_final_guard_blocks_unauthorized_chart_buy_allows_sells_a
     cfg = _isolation_cfg()
 
     def _jup_ok(request: httpx.Request) -> httpx.Response:
-        if "/swap/v2/order" in str(request.url):
+        url = str(request.url)
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", "MintGoodBO"), "audit": {"isSus": False}}])
+        if "rugcheck.xyz" in url:
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/ultra/v1/shield" in url:
+            return httpx.Response(200, json={"warnings": {request.url.params.get("mints", "MintGoodBO"): []}})
+        if "/swap/v2/order" in url:
             if f"inputMint={SOL_MINT}" in str(request.url):
                 return httpx.Response(200, json={"outAmount": "1000000", "priceImpactPct": "-0.3", "transaction": None})
             return httpx.Response(200, json={"outAmount": str(int(0.30 * LAMPORTS_PER_SOL)), "priceImpactPct": "-0.3", "transaction": None})
@@ -255,6 +263,11 @@ async def test_executor_final_guard_blocks_unauthorized_chart_buy_allows_sells_a
         assert db.get_state()["chart_positions"] == []
 
         # 2. Authorized BREAKOUT_IGNITION BUY is accepted
+        db.upsert_watchlist_entry(
+            mint="MintGoodBO", symbol="GBO", pair_address="GgBaCs3NCBuZN12kCJgAW63ydqohFkHEdfdEXBPzLHq",
+            candidate={"mint": "MintGoodBO"}, safety_passed=True,
+        )
+        db.mark_watchlist_safety_passed("MintGoodBO", True, checked_at=datetime.now(timezone.utc).isoformat())
         ok_order = PendingOrder(
             side="BUY", mint="MintGoodBO", symbol="GBO", amount_atomic=int(0.50 * LAMPORTS_PER_SOL),
             pair_address="GgBaCs3NCBuZN12kCJgAW63ydqohFkHEdfdEXBPzLHq", dex_id="pumpswap",

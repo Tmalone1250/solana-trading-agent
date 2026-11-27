@@ -196,9 +196,16 @@ async def test_jupiter_raw_price_impact_persisted_without_altering_fills(tmp_pat
     assert extract_raw_price_impact({"outAmount": "100"}) is None
 
     db = AgentDatabase(db_path=str(tmp_path / "impact.duckdb"), starting_sol=1.0)
-    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper")
+    cfg = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0, EXECUTION_MODE="paper")
 
     # Even with an extreme price impact (e.g. "25.5"), instrumentation MUST NOT veto or block the fill
+    db.upsert_watchlist_entry(
+        mint="MintImpact11111111111111111111111111111111", symbol="IMP",
+        pair_address="4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi",
+        candidate={"mint": "MintImpact11111111111111111111111111111111"}, safety_passed=True,
+    )
+    db.mark_watchlist_safety_passed("MintImpact11111111111111111111111111111111", True, checked_at=datetime.now(timezone.utc).isoformat())
+
     def jup_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"outAmount": "2000000", "priceImpactPct": "25.5", "transaction": None})
 
@@ -258,7 +265,7 @@ async def test_gemini_narrative_cache_ttl_eviction_and_timestamp_preservation(tm
     # 2. alpha_node 30m TTL cache hit vs expiry without changing decision eligibility
     clear_narrative_cache()
     db = AgentDatabase(db_path=str(tmp_path / "narr_cache.duckdb"), starting_sol=1.0)
-    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", NARRATIVE_CACHE_TTL_SECONDS=1800)
+    cfg = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0, EXECUTION_MODE="paper", NARRATIVE_CACHE_TTL_SECONDS=1800)
     stub = CountingStubDecisionClient(
         {
             "t0_narrative_strength": {"type": "score", "score": 3.5, "confidence": 0.85},
@@ -303,7 +310,7 @@ async def test_hard_stop_loss_no_duplicate_sell_in_graph_or_concurrent_executor(
 
     # 1. End-to-end LangGraph tick at -12.30% (must execute HARD_STOP_LOSS SELL exactly ONCE)
     db1 = AgentDatabase(db_path=str(tmp_path / "graph_hs.duckdb"), starting_sol=1.0)
-    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", HARD_STOP_LOSS_PCT=0.12, PAPER_TX_FEE_SOL=0.001)
+    cfg = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0, EXECUTION_MODE="paper", HARD_STOP_LOSS_PCT=0.12, PAPER_TX_FEE_SOL=0.001)
     pos = ActivePosition(
         mint=mint, symbol="ZOL", entry_sol=0.50, token_amount=1_000_000,
         strategy="BREAKOUT_IGNITION", opened_at=t0.isoformat(),
@@ -385,7 +392,7 @@ async def test_graph_multi_slot_chart_routing_scans_below_cap_and_stops_at_cap(t
 
     db = AgentDatabase(db_path=str(tmp_path / "multislot.duckdb"), starting_sol=2.0)
     cfg = AgentConfig(
-        _env_file=None, EXECUTION_MODE="paper", HUNTING_LANE="graduations",
+        _env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0, EXECUTION_MODE="paper", HUNTING_LANE="graduations",
         MAX_CHART_POSITIONS=3, MAX_OPEN_POSITIONS=6, TRADE_SIZE_SOL=0.50,
         OHLCV_PACING_DELAY_SECONDS=0.0, ENABLE_JUPITER_DISCOVERY=False,
     )

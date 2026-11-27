@@ -75,7 +75,7 @@ def test_leg2_predictor_dead_cat_and_low_volume_bounce():
 @pytest.mark.asyncio
 async def test_safety_gate_caches_pass_for_retained_watchlist_slots(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "safety_cache.duckdb"), starting_sol=0.7)
-    cfg = AgentConfig(_env_file=None, JUPITER_API_KEY="test-key")
+    cfg = AgentConfig(_env_file=None, JUPITER_API_KEY="test-key", SAFETY_CACHE_TTL_SECONDS=300.0)
     now_iso = datetime.now(timezone.utc).isoformat()
 
     db.upsert_watchlist_entry(

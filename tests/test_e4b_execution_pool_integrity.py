@@ -103,6 +103,8 @@ async def test_e4b_live_metis_verified_pinned_pool_and_multi_hop_continuity(tmp_
     kp = Keypair()
     unsigned_tx = _mk_unsigned_tx(kp)
     db = AgentDatabase(db_path=str(tmp_path / "e4b_ok.duckdb"), starting_sol=5.0)
+    db.upsert_watchlist_entry(mint=MINT_E4B, symbol="E4B", pair_address=POOL_PINNED, candidate={"mint": MINT_E4B}, safety_passed=True)
+    db.mark_watchlist_safety_passed(MINT_E4B, True, checked_at=datetime.now(timezone.utc).isoformat())
     cfg = _mk_live_e4b_cfg(kp)
 
     # Multi-hop: SOL -> USDC (POOL_OTHER) then USDC -> MINT_E4B (POOL_PINNED)
@@ -172,6 +174,8 @@ async def test_e4b_live_rejects_mismatched_missing_and_unverifiable_routes_witho
     kp = Keypair()
     unsigned_tx = _mk_unsigned_tx(kp)
     db = AgentDatabase(db_path=str(tmp_path / "e4b_rej.duckdb"), starting_sol=5.0)
+    db.upsert_watchlist_entry(mint=MINT_E4B, symbol="E4B", pair_address=POOL_PINNED, candidate={"mint": MINT_E4B}, safety_passed=True)
+    db.mark_watchlist_safety_passed(MINT_E4B, True, checked_at=datetime.now(timezone.utc).isoformat())
     cfg = _mk_live_e4b_cfg(kp)
 
     base_quote = {
@@ -270,13 +274,15 @@ async def test_e4b_paper_telemetry_all_statuses_and_opt_in_enforcement(tmp_path)
     ]
 
     # 1. Default paper mode (REQUIRE_PINNED_POOL_ROUTE_IN_PAPER=False): all 4 execute & persist telemetry
-    cfg_obs = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.001)
+    cfg_obs = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.001, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
     assert cfg_obs.REQUIRE_PINNED_POOL_ROUTE_IN_PAPER is False
 
     for idx, (quote_payload, expected_status, expected_keys, _allowed_enforced) in enumerate(paper_cases):
         clear_buy_reservations()
         db = AgentDatabase(db_path=str(tmp_path / f"e4b_paper_obs_{idx}.duckdb"), starting_sol=5.0)
         mint_i = MINT_E4B
+        db.upsert_watchlist_entry(mint=mint_i, symbol="E4B", pair_address=POOL_PINNED, candidate={"mint": mint_i}, safety_passed=True)
+        db.mark_watchlist_safety_passed(mint_i, True, checked_at=datetime.now(timezone.utc).isoformat())
         order_i = _mk_e4b_order(mint=mint_i)
 
         def handler_p(_req: httpx.Request, qp: dict[str, Any] = quote_payload) -> httpx.Response:
@@ -298,11 +304,14 @@ async def test_e4b_paper_telemetry_all_statuses_and_opt_in_enforcement(tmp_path)
 
     # 2. Paper enforcement enabled (REQUIRE_PINNED_POOL_ROUTE_IN_PAPER=True): non-verified statuses reject cleanly
     cfg_enf = AgentConfig(
-        _env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.001, REQUIRE_PINNED_POOL_ROUTE_IN_PAPER=True,
+        _env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.001,
+        REQUIRE_PINNED_POOL_ROUTE_IN_PAPER=True, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
     )
     for idx, (quote_payload, expected_status, _expected_keys, allowed_enforced) in enumerate(paper_cases):
         clear_buy_reservations()
         db = AgentDatabase(db_path=str(tmp_path / f"e4b_paper_enf_{idx}.duckdb"), starting_sol=5.0)
+        db.upsert_watchlist_entry(mint=MINT_E4B, symbol="E4B", pair_address=POOL_PINNED, candidate={"mint": MINT_E4B}, safety_passed=True)
+        db.mark_watchlist_safety_passed(MINT_E4B, True, checked_at=datetime.now(timezone.utc).isoformat())
         order_i = _mk_e4b_order(mint=MINT_E4B)
 
         def handler_e(_req: httpx.Request, qp: dict[str, Any] = quote_payload) -> httpx.Response:
