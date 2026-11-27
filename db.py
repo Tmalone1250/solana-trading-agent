@@ -1174,12 +1174,8 @@ class AgentDatabase:
 
                 if buy_row is not None:
                     entry_sol: Optional[float] = float(buy_row["sol_value"] or 0.0)
-                elif partial_sell_count > 0:
-                    # Never infer original entry cost as exit_sol - final_sell_pnl when partial sales occurred
-                    entry_sol = None
-                elif final_sell_pnl is not None:
-                    entry_sol = max(0.0, final_sell_sol - final_sell_pnl)
                 else:
+                    # C1-R2: Never infer historical entry cost when no matching BUY row exists
                     entry_sol = None
 
                 all_legs_present = (buy_row is not None) and partial_pnls_present and (final_sell_pnl is not None)
@@ -1188,6 +1184,15 @@ class AgentDatabase:
                     (lr["fee_status"] in ("PAPER_ASSUMED", "OBSERVED")) and (lr["tx_fee_sol"] is not None)
                     for lr in leg_rows
                 )
+
+                if buy_row is not None and entry_sol is not None:
+                    gross_pnl_sol: Optional[float] = round(total_exit_sol - entry_sol, 6)
+                elif realized_partial_pnl is not None and final_sell_pnl is not None:
+                    gross_pnl_sol = round(realized_partial_pnl + final_sell_pnl, 6)
+                elif final_sell_pnl is not None:
+                    gross_pnl_sol = round(final_sell_pnl, 6)
+                else:
+                    gross_pnl_sol = None
 
                 if all_fees_known:
                     assert buy_row is not None and realized_partial_pnl is not None and final_sell_pnl is not None
@@ -1198,12 +1203,13 @@ class AgentDatabase:
                     fee_accounting_status = (
                         "OBSERVED" if all(lr["fee_status"] == "OBSERVED" for lr in leg_rows) else "PAPER_ASSUMED"
                     )
-                    lifecycle_pnl = round(realized_partial_pnl + final_sell_pnl - entry_fee, 6)
-                    lifecycle_pnl_pct = (
+                    lifecycle_pnl: Optional[float] = round(realized_partial_pnl + final_sell_pnl - entry_fee, 6)
+                    lifecycle_pnl_pct: Optional[float] = (
                         round((lifecycle_pnl / entry_sol) * 100.0, 2) if (entry_sol is not None and entry_sol > 0.0) else 0.0
                     )
                     lifecycle_complete = True
                     net_pnl_known = True
+                    gross_pnl_incomplete = False
                 else:
                     entry_fee = (
                         float(buy_row["tx_fee_sol"])
@@ -1218,16 +1224,10 @@ class AgentDatabase:
                     fee_accounting_status = "UNKNOWN"
                     lifecycle_complete = False
                     net_pnl_known = False
-                    if realized_partial_pnl is not None and final_sell_pnl is not None:
-                        lifecycle_pnl = round(realized_partial_pnl + final_sell_pnl, 6)
-                    elif final_sell_pnl is not None:
-                        lifecycle_pnl = round(final_sell_pnl, 6)
-                    else:
-                        lifecycle_pnl = 0.0
-                    if entry_sol is not None and entry_sol > 0.0:
-                        lifecycle_pnl_pct = round((lifecycle_pnl / entry_sol) * 100.0, 2)
-                    else:
-                        lifecycle_pnl_pct = round(float(rec["pnl_pct"] or 0.0) * 100.0, 2)
+                    # C1-R1: Unknown-fee or incomplete lifecycles must never expose gross PnL as net pnl_sol
+                    lifecycle_pnl = None
+                    lifecycle_pnl_pct = None
+                    gross_pnl_incomplete = True
 
                 closed_asc.append(
                     {
@@ -1238,8 +1238,10 @@ class AgentDatabase:
                         "entry_sol": round(entry_sol, 6) if entry_sol is not None else None,
                         "exit_sol": round(total_exit_sol, 6),
                         "final_sell_sol": round(final_sell_sol, 6),
-                        "pnl_sol": round(lifecycle_pnl, 6),
-                        "pnl_pct": round(lifecycle_pnl_pct, 2),
+                        "pnl_sol": round(lifecycle_pnl, 6) if lifecycle_pnl is not None else None,
+                        "pnl_pct": round(lifecycle_pnl_pct, 2) if lifecycle_pnl_pct is not None else None,
+                        "gross_pnl_sol": gross_pnl_sol,
+                        "gross_pnl_incomplete": gross_pnl_incomplete,
                         "realized_partial_pnl_sol": round(realized_partial_pnl, 6) if realized_partial_pnl is not None else None,
                         "final_sell_pnl_sol": round(final_sell_pnl, 6) if final_sell_pnl is not None else None,
                         "partial_sell_count": partial_sell_count,
@@ -1263,19 +1265,32 @@ class AgentDatabase:
         return self._build_closed_lifecycles()[: max(0, int(limit))]
 
     def get_closed_trades_summary(self) -> dict[str, Any]:
-        """Aggregate win/loss record, win rate %, and net realized SOL across closed lifecycles."""
+        """Aggregate win/loss record, win rate %, and net realized SOL over known-fee closed lifecycles only."""
         lifecycles = self._build_closed_lifecycles()
         total = len(lifecycles)
-        wins = sum(1 for lc in lifecycles if float(lc.get("pnl_sol") or 0.0) > 0.0)
-        losses = sum(1 for lc in lifecycles if float(lc.get("pnl_sol") or 0.0) <= 0.0)
-        net_pnl = sum(float(lc.get("pnl_sol") or 0.0) for lc in lifecycles)
-        win_rate = round((wins / total) * 100.0, 1) if total > 0 else 0.0
+        known = [lc for lc in lifecycles if lc.get("net_pnl_known") is True and lc.get("pnl_sol") is not None]
+        known_trades = len(known)
+        unknown_trades = total - known_trades
+        wins = sum(1 for lc in known if float(lc["pnl_sol"]) > 0.0)
+        losses = sum(1 for lc in known if float(lc["pnl_sol"]) <= 0.0)
+        if known_trades > 0:
+            net_pnl: Optional[float] = round(sum(float(lc["pnl_sol"]) for lc in known), 6)
+            win_rate: Optional[float] = round((wins / known_trades) * 100.0, 1)
+        elif total == 0:
+            net_pnl = 0.0
+            win_rate = 0.0
+        else:
+            net_pnl = None
+            win_rate = None
         return {
             "total_trades": total,
+            "known_trades": known_trades,
+            "unknown_trades": unknown_trades,
             "wins": wins,
             "losses": losses,
             "win_rate_pct": win_rate,
-            "net_pnl_sol": round(net_pnl, 6),
+            "win_rate_basis": "known_lifecycles_only",
+            "net_pnl_sol": net_pnl,
         }
 
     def get_whale_trades(self, limit: int = 25) -> list[dict[str, Any]]:

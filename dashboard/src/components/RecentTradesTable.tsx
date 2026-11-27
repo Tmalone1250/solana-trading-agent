@@ -16,8 +16,8 @@ interface Props {
   summary?: ClosedTradesSummary;
 }
 
-function getWinRateBadgeStyle(winRatePct: number, totalTrades: number): string {
-  if (totalTrades === 0) {
+function getWinRateBadgeStyle(winRatePct: number | null, knownTrades: number): string {
+  if (knownTrades === 0 || winRatePct === null) {
     return "border-slate-700 bg-slate-900 text-slate-400";
   }
   if (winRatePct >= 50) {
@@ -44,19 +44,26 @@ export function RecentTradesTable({ trades, summary }: Props) {
   const startIdx = (safePage - 1) * PAGE_SIZE;
   const pageTrades = trades.slice(startIdx, startIdx + PAGE_SIZE);
 
+  const knownFallback = trades.filter(
+    (t) => t.net_pnl_known !== false && t.pnl_sol !== null,
+  );
   const totalTrades = summary ? summary.total_trades : trades.length;
+  const knownTrades = summary?.known_trades ?? knownFallback.length;
+  const unknownTrades = summary?.unknown_trades ?? Math.max(0, totalTrades - knownTrades);
   const wins = summary
     ? summary.wins
-    : trades.filter((t) => t.pnl_sol > 0).length;
+    : knownFallback.filter((t) => (t.pnl_sol ?? 0) > 0).length;
   const losses = summary
     ? summary.losses
-    : trades.filter((t) => t.pnl_sol <= 0).length;
+    : knownFallback.filter((t) => (t.pnl_sol ?? 0) <= 0).length;
   const winRatePct = summary
     ? summary.win_rate_pct
-    : totalTrades > 0
-      ? Number(((wins / totalTrades) * 100).toFixed(1))
-      : 0.0;
-  const wrStyle = getWinRateBadgeStyle(winRatePct, totalTrades);
+    : knownTrades > 0
+      ? Number(((wins / knownTrades) * 100).toFixed(1))
+      : totalTrades === 0
+        ? 0.0
+        : null;
+  const wrStyle = getWinRateBadgeStyle(winRatePct, knownTrades);
 
   return (
     <section className="rounded-2xl border border-slate-800/80 bg-slate-900/60">
@@ -73,10 +80,12 @@ export function RecentTradesTable({ trades, summary }: Props) {
           <span
             className={`rounded-full border px-2.5 py-0.5 font-mono text-xs font-semibold ${wrStyle}`}
           >
-            {wins}W / {losses}L • {winRatePct.toFixed(1)}% WR
+            {wins}W / {losses}L •{" "}
+            {winRatePct !== null ? `${winRatePct.toFixed(1)}% WR` : "UNKNOWN WR"}
           </span>
           <span className="rounded-full border border-slate-700 bg-slate-950 px-2.5 py-0.5 font-mono text-xs text-slate-300">
             {totalTrades} trades
+            {unknownTrades > 0 ? ` (${unknownTrades} unknown)` : ""}
           </span>
         </div>
       </div>
@@ -106,13 +115,16 @@ export function RecentTradesTable({ trades, summary }: Props) {
               </tr>
             ) : (
               pageTrades.map((t, idx) => {
-                const win = t.pnl_sol > 0;
-                const loss = t.pnl_sol < 0;
-                const pnlColor = win
-                  ? "text-emerald-400"
-                  : loss
-                    ? "text-rose-400"
-                    : "text-slate-300";
+                const isKnownNet = t.net_pnl_known !== false && t.pnl_sol !== null;
+                const win = isKnownNet && (t.pnl_sol ?? 0) > 0;
+                const loss = isKnownNet && (t.pnl_sol ?? 0) < 0;
+                const pnlColor = !isKnownNet
+                  ? "text-amber-300"
+                  : win
+                    ? "text-emerald-400"
+                    : loss
+                      ? "text-rose-400"
+                      : "text-slate-300";
                 const strat = (t.strategy || "SCALPER").toUpperCase();
                 const isWhale = strat === "WHALE_SCALP";
 
@@ -144,7 +156,7 @@ export function RecentTradesTable({ trades, summary }: Props) {
                       </span>
                     </td>
                     <td className="px-4 py-3 tabular-nums text-slate-300">
-                      {formatSol(t.entry_sol)}
+                      {t.entry_sol !== null ? formatSol(t.entry_sol) : "UNKNOWN"}
                     </td>
                     <td className="px-4 py-3 tabular-nums text-slate-200">
                       {formatSol(t.exit_sol)}
@@ -152,11 +164,19 @@ export function RecentTradesTable({ trades, summary }: Props) {
                     <td
                       className={`px-4 py-3 font-semibold tabular-nums ${pnlColor}`}
                     >
-                      {formatSol(t.pnl_sol, true)}{" "}
-                      <span className="text-[11px] font-normal">
-                        ({t.pnl_pct > 0 ? "+" : ""}
-                        {t.pnl_pct.toFixed(2)}%)
-                      </span>
+                      {isKnownNet && t.pnl_sol !== null ? (
+                        <>
+                          {formatSol(t.pnl_sol, true)}{" "}
+                          <span className="text-[11px] font-normal">
+                            ({(t.pnl_pct ?? 0) > 0 ? "+" : ""}
+                            {(t.pnl_pct ?? 0).toFixed(2)}%)
+                          </span>
+                        </>
+                      ) : (
+                        <span title={t.gross_pnl_sol !== undefined && t.gross_pnl_sol !== null ? `Incomplete gross: ${formatSol(t.gross_pnl_sol, true)}` : "Fees or entry unknown"}>
+                          UNKNOWN
+                        </span>
+                      )}
                     </td>
                     <td className="px-4 py-3">
                       <span className="rounded border border-slate-700/80 bg-slate-950 px-2 py-0.5 text-[11px] text-slate-300">

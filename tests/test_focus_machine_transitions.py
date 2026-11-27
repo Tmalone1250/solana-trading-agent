@@ -384,6 +384,21 @@ async def test_langgraph_end_to_end_and_telemetry_api(tmp_path):
     assert result["active_position"]["symbol"] == "GRAD"
 
     # Verify FastAPI GET /api/telemetry reflects the live DuckDB state, CORS, & closed recent_trades
+    closed_open_ts = "2026-11-26T08:00:00+00:00"
+    db.log_trade(
+        mode="paper",
+        side="BUY",
+        mint="MintClosed1",
+        symbol="WIN",
+        in_amount=500_000_000,
+        out_amount=1_000_000,
+        sol_value=0.5,
+        reason="ENTRY",
+        tx_signature="paper-buy-1",
+        opened_at=closed_open_ts,
+        tx_fee_sol=0.0,
+        fee_status="PAPER_ASSUMED",
+    )
     db.log_trade(
         mode="paper",
         side="SELL",
@@ -396,6 +411,9 @@ async def test_langgraph_end_to_end_and_telemetry_api(tmp_path):
         pnl_pct=0.15,
         reason="TRAILING_TP",
         tx_signature="paper-sell-1",
+        opened_at=closed_open_ts,
+        tx_fee_sol=0.0,
+        fee_status="PAPER_ASSUMED",
     )
     app = create_telemetry_app(config=cfg, db=db)
     test_client = TestClient(app)

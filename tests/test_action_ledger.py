@@ -273,27 +273,34 @@ def test_closed_trades_summary_all_wins_mixed_breakeven_and_empty(tmp_path):
     empty = db.get_closed_trades_summary()
     assert empty == {
         "total_trades": 0,
+        "known_trades": 0,
+        "unknown_trades": 0,
         "wins": 0,
         "losses": 0,
         "win_rate_pct": 0.0,
+        "win_rate_basis": "known_lifecycles_only",
         "net_pnl_sol": 0.0,
     }
     tel_empty = tc.get("/api/telemetry").json()
     assert tel_empty["closed_trades_summary"] == empty
 
-    # 2. All wins (2 SELLs with positive PnL; BUY rows ignored)
-    db.log_trade(mode="paper", side="BUY", mint="M1", symbol="T1", in_amount=500, out_amount=100, sol_value=0.5, reason="ENTRY")
-    db.log_trade(mode="paper", side="SELL", mint="M1", symbol="T1", in_amount=100, out_amount=600, sol_value=0.6, pnl_sol=0.10, pnl_pct=0.20, reason="TP")
-    db.log_trade(mode="paper", side="SELL", mint="M2", symbol="T2", in_amount=100, out_amount=550, sol_value=0.55, pnl_sol=0.05, pnl_pct=0.10, reason="TP")
+    # 2. All wins (2 complete paper lifecycles with known fees)
+    db.log_trade(mode="paper", side="BUY", mint="M1", symbol="T1", in_amount=500, out_amount=100, sol_value=0.5, reason="ENTRY", opened_at="2026-11-26T01:00:00+00:00", tx_fee_sol=0.0, fee_status="PAPER_ASSUMED")
+    db.log_trade(mode="paper", side="SELL", mint="M1", symbol="T1", in_amount=100, out_amount=600, sol_value=0.6, pnl_sol=0.10, pnl_pct=0.20, reason="TP", opened_at="2026-11-26T01:00:00+00:00", tx_fee_sol=0.0, fee_status="PAPER_ASSUMED")
+    db.log_trade(mode="paper", side="BUY", mint="M2", symbol="T2", in_amount=500, out_amount=100, sol_value=0.5, reason="ENTRY", opened_at="2026-11-26T02:00:00+00:00", tx_fee_sol=0.0, fee_status="PAPER_ASSUMED")
+    db.log_trade(mode="paper", side="SELL", mint="M2", symbol="T2", in_amount=100, out_amount=550, sol_value=0.55, pnl_sol=0.05, pnl_pct=0.10, reason="TP", opened_at="2026-11-26T02:00:00+00:00", tx_fee_sol=0.0, fee_status="PAPER_ASSUMED")
     all_wins = db.get_closed_trades_summary()
     assert all_wins["total_trades"] == 2
+    assert all_wins["known_trades"] == 2
+    assert all_wins["unknown_trades"] == 0
     assert all_wins["wins"] == 2
     assert all_wins["losses"] == 0
     assert all_wins["win_rate_pct"] == 100.0
     assert all_wins["net_pnl_sol"] == pytest.approx(0.15, rel=1e-4)
 
     # 3. Breakeven 0.0 PnL counts as loss (pnl <= 0)
-    db.log_trade(mode="paper", side="SELL", mint="M3", symbol="T3", in_amount=100, out_amount=500, sol_value=0.50, pnl_sol=0.0, pnl_pct=0.0, reason="BE")
+    db.log_trade(mode="paper", side="BUY", mint="M3", symbol="T3", in_amount=500, out_amount=100, sol_value=0.50, reason="ENTRY", opened_at="2026-11-26T03:00:00+00:00", tx_fee_sol=0.0, fee_status="PAPER_ASSUMED")
+    db.log_trade(mode="paper", side="SELL", mint="M3", symbol="T3", in_amount=100, out_amount=500, sol_value=0.50, pnl_sol=0.0, pnl_pct=0.0, reason="BE", opened_at="2026-11-26T03:00:00+00:00", tx_fee_sol=0.0, fee_status="PAPER_ASSUMED")
     with_be = db.get_closed_trades_summary()
     assert with_be["total_trades"] == 3
     assert with_be["wins"] == 2
@@ -303,9 +310,16 @@ def test_closed_trades_summary_all_wins_mixed_breakeven_and_empty(tmp_path):
 
     # 4. Mixed wins + losses -> verify /api/telemetry summary & expanded >15 history
     for i in range(18):
+        ts_open = f"2026-11-26T04:{i:02d}:00+00:00"
+        db.log_trade(
+            mode="paper", side="BUY", mint=f"ML{i}", symbol=f"L{i}",
+            in_amount=500, out_amount=100, sol_value=0.50, reason="ENTRY",
+            opened_at=ts_open, tx_fee_sol=0.0, fee_status="PAPER_ASSUMED",
+        )
         db.log_trade(
             mode="paper", side="SELL", mint=f"ML{i}", symbol=f"L{i}",
             in_amount=100, out_amount=450, sol_value=0.45, pnl_sol=-0.05, pnl_pct=-0.10, reason="STOP",
+            opened_at=ts_open, tx_fee_sol=0.0, fee_status="PAPER_ASSUMED",
         )
     tel_mixed = tc.get("/api/telemetry").json()
     summ = tel_mixed["closed_trades_summary"]

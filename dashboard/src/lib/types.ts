@@ -74,10 +74,15 @@ export interface WatchlistSlot {
 export interface ClosedTrade {
   symbol: string;
   mint: string;
-  entry_sol: number;
+  entry_sol: number | null;
   exit_sol: number;
-  pnl_sol: number;
-  pnl_pct: number;
+  pnl_sol: number | null;
+  pnl_pct: number | null;
+  gross_pnl_sol?: number | null;
+  gross_pnl_incomplete?: boolean;
+  net_pnl_known?: boolean;
+  lifecycle_complete?: boolean;
+  fee_accounting_status?: string;
   exit_reason: string;
   strategy?: string;
   closed_at: string;
@@ -85,10 +90,13 @@ export interface ClosedTrade {
 
 export interface ClosedTradesSummary {
   total_trades: number;
+  known_trades?: number;
+  unknown_trades?: number;
   wins: number;
   losses: number;
-  win_rate_pct: number;
-  net_pnl_sol: number;
+  win_rate_pct: number | null;
+  win_rate_basis?: string;
+  net_pnl_sol: number | null;
 }
 
 export interface DecisionRationale {

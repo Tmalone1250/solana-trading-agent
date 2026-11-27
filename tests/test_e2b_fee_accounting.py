@@ -401,9 +401,12 @@ def test_e2b_c1_lifecycle_reporting_and_summary_reconciliation(tmp_path):
     summ = db.get_closed_trades_summary()
     assert summ == {
         "total_trades": 3,
+        "known_trades": 3,
+        "unknown_trades": 0,
         "wins": 2,
         "losses": 1,
         "win_rate_pct": 66.7,
+        "win_rate_basis": "known_lifecycles_only",
         "net_pnl_sol": pytest.approx(0.092),  # 0.048 - 0.053 + 0.097
     }
     tel = TestClient(create_telemetry_app(config=cfg, db=db)).get("/api/telemetry").json()
@@ -413,20 +416,98 @@ def test_e2b_c1_lifecycle_reporting_and_summary_reconciliation(tmp_path):
 
 
 def test_e2b_c1_historical_incomplete_lifecycle_not_fabricated(tmp_path):
-    """C-1 Test 7: Missing BUY with PARTIAL_SELL must NOT infer entry_sol = exit_sol - final_sell_pnl."""
+    """C1-R1 & C1-R2: Missing BUY (with or without PARTIAL_SELL) must leave entry_sol=None, pnl_sol=None, net_pnl_known=False."""
     db = AgentDatabase(db_path=str(tmp_path / "c1_incomplete.duckdb"), starting_sol=1.0)
     t_hist = "2026-11-20T09:00:00+00:00"
     db.log_trade(mode="paper", side="PARTIAL_SELL", mint=MINT_E2B, symbol="HIST", in_amount=500, out_amount=300, sol_value=0.30, pnl_sol=0.05, pnl_pct=0.20, reason="PARTIAL_TP_50PCT", opened_at=t_hist)
     db.log_trade(mode="paper", side="SELL", mint=MINT_E2B, symbol="HIST", in_amount=500, out_amount=320, sol_value=0.32, pnl_sol=0.07, pnl_pct=0.28, reason="TRAILING_TP", opened_at=t_hist)
+    # Standalone historical SELL without BUY and without partial sells must ALSO leave entry_sol=None (never 0.60 - 0.10 = 0.50)
+    db.log_trade(mode="paper", side="SELL", mint="MintHistOnly1111111111111111111111111111111", symbol="HIST2", in_amount=100, out_amount=600, sol_value=0.60, pnl_sol=0.10, pnl_pct=0.20, reason="TRAILING_TP")
 
     recent = db.get_recent_closed_trades(limit=5)
-    assert len(recent) == 1
-    lc = recent[0]
-    assert lc["entry_sol"] is None  # never fabricated as 0.32 - 0.07 = 0.25
-    assert lc["total_fees_sol"] is None
-    assert lc["fee_accounting_status"] == "UNKNOWN"
-    assert lc["lifecycle_complete"] is False
-    assert lc["net_pnl_known"] is False
+    assert len(recent) == 2
+    lc_single, lc_partial = recent[0], recent[1]
+    assert lc_single["entry_sol"] is None
+    assert lc_single["pnl_sol"] is None
+    assert lc_single["pnl_pct"] is None
+    assert lc_single["gross_pnl_sol"] == pytest.approx(0.10)
+    assert lc_single["gross_pnl_incomplete"] is True
+    assert lc_single["net_pnl_known"] is False
+    assert lc_single["lifecycle_complete"] is False
+
+    assert lc_partial["entry_sol"] is None
+    assert lc_partial["pnl_sol"] is None
+    assert lc_partial["pnl_pct"] is None
+    assert lc_partial["gross_pnl_sol"] == pytest.approx(0.12)
+    assert lc_partial["gross_pnl_incomplete"] is True
+    assert lc_partial["total_fees_sol"] is None
+    assert lc_partial["fee_accounting_status"] == "UNKNOWN"
+    assert lc_partial["lifecycle_complete"] is False
+    assert lc_partial["net_pnl_known"] is False
+
+    # Summary with ONLY unknown lifecycles must not substitute 0.0 for net_pnl_sol or win_rate_pct
+    summ = db.get_closed_trades_summary()
+    assert summ == {
+        "total_trades": 2,
+        "known_trades": 0,
+        "unknown_trades": 2,
+        "wins": 0,
+        "losses": 0,
+        "win_rate_pct": None,
+        "win_rate_basis": "known_lifecycles_only",
+        "net_pnl_sol": None,
+    }
+    db.close()
+
+
+def test_e2b_c1_r1_r2_mixed_known_unknown_and_telemetry(tmp_path):
+    """Directive 26: Mixed known paper + live unknown-fee + historical incomplete lifecycles in summary & telemetry."""
+    from fastapi.testclient import TestClient
+    from telemetry_api import create_telemetry_app
+
+    db = AgentDatabase(db_path=str(tmp_path / "d26_mixed.duckdb"), starting_sol=5.0)
+    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.001)
+
+    # 1. Complete paper WIN: +0.048 net
+    t1 = "2026-11-26T10:00:00+00:00"
+    db.log_trade(mode="paper", side="BUY", mint=MINT_E2B, symbol="E2B", in_amount=500_000_000, out_amount=1_000_000, sol_value=0.50, reason="ENTRY", opened_at=t1, tx_fee_sol=0.001, fee_status="PAPER_ASSUMED")
+    db.log_trade(mode="paper", side="SELL", mint=MINT_E2B, symbol="E2B", in_amount=1_000_000, out_amount=550_000_000, sol_value=0.55, pnl_sol=0.049, pnl_pct=0.098, reason="TRAILING_TP", opened_at=t1, tx_fee_sol=0.001, fee_status="PAPER_ASSUMED")
+
+    # 2. Complete paper LOSS (re-entry on same mint): -0.052 net
+    t2 = "2026-11-26T11:00:00+00:00"
+    db.log_trade(mode="paper", side="BUY", mint=MINT_E2B, symbol="E2B", in_amount=500_000_000, out_amount=1_000_000, sol_value=0.50, reason="LEG_2_REENTRY", opened_at=t2, tx_fee_sol=0.001, fee_status="PAPER_ASSUMED")
+    db.log_trade(mode="paper", side="SELL", mint=MINT_E2B, symbol="E2B", in_amount=1_000_000, out_amount=450_000_000, sol_value=0.45, pnl_sol=-0.051, pnl_pct=-0.102, reason="HARD_STOP_LOSS", opened_at=t2, tx_fee_sol=0.001, fee_status="PAPER_ASSUMED")
+
+    # 3. Live UNKNOWN-fee lifecycle (gross +0.15, MUST be excluded from wins/losses/net_pnl_sol)
+    t3 = "2026-11-26T12:00:00+00:00"
+    db.log_trade(mode="live", side="BUY", mint="MintLive11111111111111111111111111111111111", symbol="LIVE", in_amount=500_000_000, out_amount=1_000_000, sol_value=0.50, reason="ENTRY", opened_at=t3, tx_fee_sol=None, fee_status="UNKNOWN")
+    db.log_trade(mode="live", side="SELL", mint="MintLive11111111111111111111111111111111111", symbol="LIVE", in_amount=1_000_000, out_amount=650_000_000, sol_value=0.65, pnl_sol=0.15, pnl_pct=0.30, reason="TRAILING_TP", opened_at=t3, tx_fee_sol=None, fee_status="UNKNOWN")
+
+    # 4. Historical SELL without BUY (MUST remain entry_sol=None, pnl_sol=None, excluded from known)
+    db.log_trade(mode="paper", side="SELL", mint="MintLegacy111111111111111111111111111111111", symbol="LEG", in_amount=100, out_amount=600, sol_value=0.60, pnl_sol=0.10, pnl_pct=0.20, reason="TRAILING_TP")
+
+    summ = db.get_closed_trades_summary()
+    assert summ == {
+        "total_trades": 4,
+        "known_trades": 2,
+        "unknown_trades": 2,
+        "wins": 1,
+        "losses": 1,
+        "win_rate_pct": 50.0,
+        "win_rate_basis": "known_lifecycles_only",
+        "net_pnl_sol": pytest.approx(-0.004),  # +0.048 - 0.052; live +0.15 & legacy +0.10 excluded
+    }
+
+    tel = TestClient(create_telemetry_app(config=cfg, db=db)).get("/api/telemetry").json()
+    assert tel["closed_trades_summary"] == summ
+    by_sym = {t["symbol"]: t for t in tel["recent_trades"]}
+    assert by_sym["LIVE"]["pnl_sol"] is None
+    assert by_sym["LIVE"]["gross_pnl_sol"] == pytest.approx(0.15)
+    assert by_sym["LIVE"]["gross_pnl_incomplete"] is True
+    assert by_sym["LIVE"]["net_pnl_known"] is False
+    assert by_sym["LEG"]["entry_sol"] is None
+    assert by_sym["LEG"]["pnl_sol"] is None
+    assert by_sym["LEG"]["net_pnl_known"] is False
     db.close()
 
 
