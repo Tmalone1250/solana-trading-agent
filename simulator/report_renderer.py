@@ -470,7 +470,7 @@ def render_aggregate_soak_report(
         f"| Closed Lifecycles / Open at Snapshot | `{execution_report.closed_lifecycles}` / `{execution_report.open_lifecycles}` |",
         f"| `PARTIAL_SELL` Legs / Final `SELL` Legs | `{execution_report.partial_sell_count}` / `{execution_report.full_sell_count}` |",
         f"| Configured Paper Fee Per Leg (`PAPER_TX_FEE_SOL`) | `{execution_report.fee_per_leg_sol:.4f} SOL` (`{profile.field_provenance('PAPER_TX_FEE_SOL')}`) |",
-        f"| All Trade Fee Deductions Verified Exact | `{execution_report.all_fees_verified}` (`{execution_report.total_fees_paid_sol:.4f} SOL` total fees) |",
+        f"| All Trade Fee Deductions Verified Exact | `{execution_report.all_fees_verified}` (`VERIFIED={execution_report.fee_verified_count}`, `FAILED={execution_report.fee_failed_count}`, `UNKNOWN={execution_report.fee_unknown_count}`, coverage=`{execution_report.fee_verification_coverage_pct:.2f}%`, `{execution_report.total_fees_paid_sol:.4f} SOL` expected fees) |",
         f"| Gross PnL (Before Fees) | `{execution_report.gross_pnl_sol:+.6f} SOL` |",
         f"| Net Realized PnL (After Fees) | `{execution_report.net_realized_pnl_sol:+.6f} SOL` |",
         f"| Win Rate (Closed Lifecycles) | `{execution_report.win_rate_pct:.2f}%` (`{execution_report.win_count}W / {execution_report.loss_count}L`) |",

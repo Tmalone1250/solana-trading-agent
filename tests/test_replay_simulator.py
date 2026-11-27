@@ -184,12 +184,31 @@ def test_02_hermetic_config_profiles_prevent_dotenv_and_os_environ_leakage(tmp_p
     assert prof_pi.field_provenance("PAPER_TX_FEE_SOL") == "EXPECTED_FROM_CODE_DEFAULT_OMITTED_IN_SUPPLIED_SNAPSHOT"
 
 
-def test_03_snapshot_consistency_writer_lock_rejection_and_wal_preservation(tmp_path):
-    """Checks #1, #2, #3: Rejects active writer lock, replays WAL in /tmp, and never mutates source DB/WAL."""
+def test_03_snapshot_consistency_writer_lock_rejection_and_wal_preservation(tmp_path, monkeypatch):
+    """Checks #1, #2, #3: Enforces Option A1 (LIVE_WRITER_LOCK_HELD, zero copy, no A2 flag) and offline load."""
+    import inspect
+    import shutil
+    from simulator import data_loader
+
+    assert "allow_quiescent_live_copy" not in inspect.signature(load_historical_dataset).parameters
+    with pytest.raises(SystemExit) as exc_info:
+        run_cli(["--db", str(tmp_path / "x.duckdb"), "--allow-quiescent-live-copy"])
+    assert exc_info.value.code != 0
+
     db_file = tmp_path / "test_snap.duckdb"
     _create_minimal_valid_duckdb(db_file)
 
-    # Hold an active writer connection in a child process and verify `load_historical_dataset` fails closed!
+    copy_calls: list[tuple[Any, Any]] = []
+    real_copy2 = shutil.copy2
+
+    def _spy_copy2(src: Any, dst: Any, *args: Any, **kwargs: Any) -> Any:
+        copy_calls.append((src, dst))
+        return real_copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(data_loader.shutil, "copy2", _spy_copy2)
+
+    # Hold an active writer connection in a child process and verify `load_historical_dataset` fails closed
+    # WITHOUT attempting any DB or WAL copy!
     holder = subprocess.Popen(
         [
             sys.executable,
@@ -207,9 +226,15 @@ def test_03_snapshot_consistency_writer_lock_rejection_and_wal_preservation(tmp_
         assert ready == "LOCKED"
         with pytest.raises(SnapshotConsistencyError, match="LIVE_WRITER_LOCK_HELD"):
             load_historical_dataset(db_file)
+        assert copy_calls == [], "Option A1 must not copy DB or WAL when a writer lock is held"
     finally:
         holder.terminate()
         holder.wait(timeout=5)
+
+    # Once unlocked, offline snapshot loading succeeds cleanly
+    ds_unlocked = load_historical_dataset(db_file)
+    assert ds_unlocked.provenance.snapshot_method == "OFFLINE_LOCK_FREE_SHA256_VERIFIED_SNAPSHOT"
+    assert len(copy_calls) >= 1
 
     # Verify schema validation fails safely when a required column is missing
     bad_db = tmp_path / "bad_schema.duckdb"
@@ -420,6 +445,152 @@ def test_06_phase1_pair_reference_case_no_network_no_db_mutation_and_determinism
     assert agg_payload["decision_replay_summary"]["mismatch_count"] == 0
     assert agg_payload["execution_analysis"]["total_breakout_entries"] == 17
     assert agg_payload["execution_analysis"]["all_fees_verified"] is True
+    assert agg_payload["execution_analysis"]["fee_verified_count"] == 17
+    assert agg_payload["execution_analysis"]["fee_failed_count"] == 0
+    assert agg_payload["execution_analysis"]["fee_unknown_count"] == 0
+    assert agg_payload["execution_analysis"]["fee_verification_coverage_pct"] == pytest.approx(100.0)
     assert agg_payload["execution_analysis"]["trigger_evidence_counts"][OBSERVED_QUOTE] == 6
     assert agg_payload["execution_analysis"]["trigger_evidence_counts"][PRICE_ONLY] == 11
     assert agg_payload["outcome_analysis"]["approved_episodes_missing_entered_outcome"] == 17
+
+
+def test_07_three_state_fee_verification_integrity(tmp_path):
+    """Correction B: Three-state fee verification (VERIFIED / FAILED / UNKNOWN) never coerces None to VERIFIED."""
+    from simulator.execution_analyzer import (
+        FEE_STATUS_FAILED,
+        FEE_STATUS_UNKNOWN,
+        FEE_STATUS_VERIFIED,
+    )
+
+    prof = get_config_profile(PROFILE_SUPPLIED_PHASE1_PI)
+
+    # 1. Empty lifecycle dataset -> all_fees_verified must be False (coverage 0.0%)
+    db_empty = tmp_path / "fee_empty.duckdb"
+    _create_minimal_valid_duckdb(db_empty)
+    rep_empty = analyze_breakout_executions(load_historical_dataset(db_empty), prof)
+    assert rep_empty.total_breakout_entries == 0
+    assert rep_empty.all_fees_verified is False
+    assert rep_empty.fee_verified_count == 0
+    assert rep_empty.fee_failed_count == 0
+    assert rep_empty.fee_unknown_count == 0
+    assert rep_empty.fee_verification_coverage_pct == 0.0
+
+    # Helper to build synthetic trade + action_log scenarios
+    def _run_fee_case(name: str, actions: list[tuple[Any, ...]], trades: list[tuple[Any, ...]]):
+        p = tmp_path / f"{name}.duckdb"
+        _create_minimal_valid_duckdb(p)
+        c = duckdb.connect(str(p))
+        try:
+            for row in actions:
+                c.execute(
+                    "INSERT INTO action_log (id, timestamp_utc, mode, action, symbol, asset_id, strategy, daily_realized_sol) "
+                    "VALUES (?, ?, 'paper', ?, ?, ?, 'BREAKOUT_IGNITION', ?)",
+                    row,
+                )
+            for tr in trades:
+                c.execute(
+                    "INSERT INTO trades (id, timestamp, mode, side, mint, symbol, in_amount, out_amount, sol_value, pnl_sol, pnl_pct, reason, strategy) "
+                    "VALUES (?, ?, 'paper', ?, ?, ?, 500000000, 1000000, ?, ?, 0.0, 'TEST', 'BREAKOUT_IGNITION')",
+                    tr,
+                )
+        finally:
+            c.close()
+        return analyze_breakout_executions(load_historical_dataset(p), prof)
+
+    # 2. BUY verified + SELL verified -> VERIFIED, all_fees_verified=True
+    rep_ok = _run_fee_case(
+        "fee_verified",
+        actions=[
+            (1, "2026-11-26T10:00:00+00:00", "DECISION_1", "TOK", "M1", 0.0),
+            (2, "2026-11-26T10:00:05+00:00", "BUY", "TOK", "M1", -0.001),
+            (3, "2026-11-26T10:05:00+00:00", "SELL", "TOK", "M1", 0.098),
+        ],
+        trades=[
+            (1, "2026-11-26T10:00:05+00:00", "BUY", "M1", "TOK", 0.5, None),
+            (2, "2026-11-26T10:05:00+00:00", "SELL", "M1", "TOK", 0.6, 0.099),
+        ],
+    )
+    assert rep_ok.lifecycles[0].entry_fee_verification_status == FEE_STATUS_VERIFIED
+    assert rep_ok.lifecycles[0].exit_legs[0].fee_verification_status == FEE_STATUS_VERIFIED
+    assert rep_ok.lifecycles[0].lifecycle_fee_verification_status == FEE_STATUS_VERIFIED
+    assert rep_ok.all_fees_verified is True
+    assert rep_ok.fee_verified_count == 1
+    assert rep_ok.fee_verification_coverage_pct == 100.0
+
+    # 3. BUY unknown (missing prior daily_realized_sol) + SELL verified -> UNKNOWN
+    rep_buy_unk = _run_fee_case(
+        "fee_buy_unknown",
+        actions=[
+            (1, "2026-11-26T10:00:05+00:00", "BUY", "TOK", "M1", -0.001),
+            (2, "2026-11-26T10:05:00+00:00", "SELL", "TOK", "M1", 0.098),
+        ],
+        trades=[
+            (1, "2026-11-26T10:00:05+00:00", "BUY", "M1", "TOK", 0.5, None),
+            (2, "2026-11-26T10:05:00+00:00", "SELL", "M1", "TOK", 0.6, 0.099),
+        ],
+    )
+    assert rep_buy_unk.lifecycles[0].entry_fee_verification_status == FEE_STATUS_UNKNOWN
+    assert rep_buy_unk.lifecycles[0].exit_legs[0].fee_verification_status == FEE_STATUS_VERIFIED
+    assert rep_buy_unk.lifecycles[0].lifecycle_fee_verification_status == FEE_STATUS_UNKNOWN
+    assert rep_buy_unk.all_fees_verified is False
+    assert rep_buy_unk.fee_unknown_count == 1
+
+    # 4. BUY verified + SELL unknown (pnl_sol is NULL) -> UNKNOWN
+    rep_sell_unk = _run_fee_case(
+        "fee_sell_unknown",
+        actions=[
+            (1, "2026-11-26T10:00:00+00:00", "DECISION_1", "TOK", "M1", 0.0),
+            (2, "2026-11-26T10:00:05+00:00", "BUY", "TOK", "M1", -0.001),
+            (3, "2026-11-26T10:05:00+00:00", "SELL", "TOK", "M1", 0.098),
+        ],
+        trades=[
+            (1, "2026-11-26T10:00:05+00:00", "BUY", "M1", "TOK", 0.5, None),
+            (2, "2026-11-26T10:05:00+00:00", "SELL", "M1", "TOK", 0.6, None),
+        ],
+    )
+    assert rep_sell_unk.lifecycles[0].entry_fee_verification_status == FEE_STATUS_VERIFIED
+    assert rep_sell_unk.lifecycles[0].exit_legs[0].fee_verification_status == FEE_STATUS_UNKNOWN
+    assert rep_sell_unk.lifecycles[0].lifecycle_fee_verification_status == FEE_STATUS_UNKNOWN
+    assert rep_sell_unk.all_fees_verified is False
+    assert rep_sell_unk.fee_unknown_count == 1
+
+    # 5. Mismatched SELL fee -> FAILED
+    rep_fail = _run_fee_case(
+        "fee_failed",
+        actions=[
+            (1, "2026-11-26T10:00:00+00:00", "DECISION_1", "TOK", "M1", 0.0),
+            (2, "2026-11-26T10:00:05+00:00", "BUY", "TOK", "M1", -0.001),
+            (3, "2026-11-26T10:05:00+00:00", "SELL", "TOK", "M1", 0.099),
+        ],
+        trades=[
+            (1, "2026-11-26T10:00:05+00:00", "BUY", "M1", "TOK", 0.5, None),
+            (2, "2026-11-26T10:05:00+00:00", "SELL", "M1", "TOK", 0.6, 0.100),
+        ],
+    )
+    assert rep_fail.lifecycles[0].lifecycle_fee_verification_status == FEE_STATUS_FAILED
+    assert rep_fail.all_fees_verified is False
+    assert rep_fail.fee_failed_count == 1
+
+    # 6. Mixed verified + unknown lifecycles -> all_fees_verified=False, coverage=50.0%
+    rep_mixed = _run_fee_case(
+        "fee_mixed",
+        actions=[
+            (1, "2026-11-26T10:00:00+00:00", "DECISION_1", "T1", "M1", 0.0),
+            (2, "2026-11-26T10:00:05+00:00", "BUY", "T1", "M1", -0.001),
+            (3, "2026-11-26T10:05:00+00:00", "SELL", "T1", "M1", 0.098),
+            (4, "2026-11-26T10:10:05+00:00", "BUY", "T2", "M2", 0.097),
+            (5, "2026-11-26T10:15:00+00:00", "SELL", "T2", "M2", 0.096),
+        ],
+        trades=[
+            (1, "2026-11-26T10:00:05+00:00", "BUY", "M1", "T1", 0.5, None),
+            (2, "2026-11-26T10:05:00+00:00", "SELL", "M1", "T1", 0.6, 0.099),
+            (3, "2026-11-26T10:10:05+00:00", "BUY", "M2", "T2", 0.5, None),
+            (4, "2026-11-26T10:15:00+00:00", "SELL", "M2", "T2", 0.5, None),
+        ],
+    )
+    assert rep_mixed.total_breakout_entries == 2
+    assert rep_mixed.fee_verified_count == 1
+    assert rep_mixed.fee_unknown_count == 1
+    assert rep_mixed.fee_failed_count == 0
+    assert rep_mixed.fee_verification_coverage_pct == pytest.approx(50.0)
+    assert rep_mixed.all_fees_verified is False

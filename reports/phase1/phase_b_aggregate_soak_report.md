@@ -36,7 +36,7 @@
 | Closed Lifecycles / Open at Snapshot | `17` / `0` |
 | `PARTIAL_SELL` Legs / Final `SELL` Legs | `0` / `17` |
 | Configured Paper Fee Per Leg (`PAPER_TX_FEE_SOL`) | `0.0010 SOL` (`EXPECTED_FROM_CODE_DEFAULT_OMITTED_IN_SUPPLIED_SNAPSHOT`) |
-| All Trade Fee Deductions Verified Exact | `True` (`0.0340 SOL` total fees) |
+| All Trade Fee Deductions Verified Exact | `True` (`VERIFIED=17`, `FAILED=0`, `UNKNOWN=0`, coverage=`100.00%`, `0.0340 SOL` expected fees) |
 | Gross PnL (Before Fees) | `-0.277308 SOL` |
 | Net Realized PnL (After Fees) | `-0.311308 SOL` |
 | Win Rate (Closed Lifecycles) | `23.53%` (`4W / 13L`) |

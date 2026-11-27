@@ -25,6 +25,11 @@ from simulator.config_profiles import ConfigProfile
 from simulator.data_loader import HistoricalDataset, parse_iso_utc
 
 
+FEE_STATUS_VERIFIED = "VERIFIED"
+FEE_STATUS_FAILED = "FAILED"
+FEE_STATUS_UNKNOWN = "UNKNOWN"
+
+
 def classify_exit_reason(reason: Optional[str]) -> str:
     r = str(reason or "").upper()
     for prefix in (
@@ -63,6 +68,7 @@ class ExitLegRecord:
     recorded_pnl_pct: Optional[float]
     expected_fee_sol: float
     recomputed_pnl_sol: Optional[float]
+    fee_verification_status: str  # VERIFIED | FAILED | UNKNOWN
     fee_accounting_verified: bool
     exit_category: str
     reason: str
@@ -94,6 +100,8 @@ class TradeLifecycleRecord:
     entry_quote_evidence_class: str
     entry_fee_sol: float
     entry_daily_pnl_delta_verified: Optional[bool]
+    entry_fee_verification_status: str  # VERIFIED | FAILED | UNKNOWN
+    lifecycle_fee_verification_status: str  # VERIFIED | FAILED | UNKNOWN
     exit_legs: tuple[ExitLegRecord, ...]
     status: str  # "CLOSED" or "OPEN_AT_SNAPSHOT"
     gross_exit_sol: float
@@ -131,6 +139,10 @@ class AggregateExecutionReport:
     full_sell_count: int
     fee_per_leg_sol: float
     all_fees_verified: bool
+    fee_verified_count: int
+    fee_failed_count: int
+    fee_unknown_count: int
+    fee_verification_coverage_pct: float
     total_fees_paid_sol: float
     gross_pnl_sol: float
     net_realized_pnl_sol: float
@@ -233,11 +245,13 @@ def analyze_breakout_executions(
             entry_sol = float(t.get("sol_value") or 0.0)
             impact = str(t["jupiter_price_impact_raw"]) if t.get("jupiter_price_impact_raw") is not None else None
             buy_fee_ok: Optional[bool] = None
+            buy_fee_status = FEE_STATUS_UNKNOWN
             if matched_act is not None and matched_act.get("daily_realized_sol") is not None:
                 aid = int(matched_act["id"])
                 if aid in prev_daily_pnl_by_action_id:
                     obs_delta = round(float(matched_act["daily_realized_sol"]) - prev_daily_pnl_by_action_id[aid], 6)
                     buy_fee_ok = abs(obs_delta - (-fee_sol)) <= 2e-5
+                    buy_fee_status = FEE_STATUS_VERIFIED if buy_fee_ok else FEE_STATUS_FAILED
 
             lot = {
                 "buy_trade": t,
@@ -255,6 +269,7 @@ def analyze_breakout_executions(
                 "entry_evidence": OBSERVED_QUOTE if impact is not None or int(t.get("out_amount") or 0) > 0 else UNAVAILABLE,
                 "entry_fee_sol": fee_sol,
                 "buy_fee_ok": buy_fee_ok,
+                "buy_fee_status": buy_fee_status,
                 "exit_legs": [],
                 "closed": False,
             }
@@ -292,9 +307,18 @@ def analyze_breakout_executions(
                 else:
                     cost_leg = float(target_lot["remaining_basis_sol"])
                 recomp_pnl: Optional[float] = round(received_sol - cost_leg - fee_sol, 6)
-                fee_ok = rec_pnl is not None and abs(rec_pnl - recomp_pnl) <= 2e-5
+                if rec_pnl is None:
+                    fee_status = FEE_STATUS_UNKNOWN
+                    fee_ok = False
+                elif abs(rec_pnl - recomp_pnl) <= 2e-5:
+                    fee_status = FEE_STATUS_VERIFIED
+                    fee_ok = True
+                else:
+                    fee_status = FEE_STATUS_FAILED
+                    fee_ok = False
             else:
                 recomp_pnl = None
+                fee_status = FEE_STATUS_UNKNOWN
                 fee_ok = False
 
             mon_sol = (
@@ -328,6 +352,7 @@ def analyze_breakout_executions(
                 recorded_pnl_pct=round(rec_pnl_pct, 4) if rec_pnl_pct is not None else None,
                 expected_fee_sol=fee_sol,
                 recomputed_pnl_sol=recomp_pnl,
+                fee_verification_status=fee_status,
                 fee_accounting_verified=fee_ok,
                 exit_category=classify_exit_reason(t.get("reason")),
                 reason=str(t.get("reason") or ""),
@@ -369,7 +394,9 @@ def analyze_breakout_executions(
     partial_cnt = 0
     sell_cnt = 0
     instant_exodus_cnt = 0
-    all_fees_ok = True
+    fee_verified_cnt = 0
+    fee_failed_cnt = 0
+    fee_unknown_cnt = 0
     total_fees = 0.0
     total_gross_pnl = 0.0
     total_net_pnl = 0.0
@@ -382,11 +409,18 @@ def analyze_breakout_executions(
         fees = round(float(lot["entry_fee_sol"]) + sum(lg.expected_fee_sol for lg in legs), 6)
         total_fees = round(total_fees + fees, 6)
 
-        if lot["buy_fee_ok"] is False:
-            all_fees_ok = False
+        req_statuses = [lot["buy_fee_status"]] + [lg.fee_verification_status for lg in legs]
+        if any(s == FEE_STATUS_FAILED for s in req_statuses):
+            lc_fee_status = FEE_STATUS_FAILED
+            fee_failed_cnt += 1
+        elif any(s == FEE_STATUS_UNKNOWN for s in req_statuses):
+            lc_fee_status = FEE_STATUS_UNKNOWN
+            fee_unknown_cnt += 1
+        else:
+            lc_fee_status = FEE_STATUS_VERIFIED
+            fee_verified_cnt += 1
+
         for lg in legs:
-            if not lg.fee_accounting_verified:
-                all_fees_ok = False
             if lg.side == "PARTIAL_SELL":
                 partial_cnt += 1
             else:
@@ -431,6 +465,8 @@ def analyze_breakout_executions(
                 entry_quote_evidence_class=lot["entry_evidence"],
                 entry_fee_sol=float(lot["entry_fee_sol"]),
                 entry_daily_pnl_delta_verified=lot["buy_fee_ok"],
+                entry_fee_verification_status=lot["buy_fee_status"],
+                lifecycle_fee_verification_status=lc_fee_status,
                 exit_legs=legs,
                 status=status,
                 gross_exit_sol=gross_out,
@@ -455,6 +491,14 @@ def analyze_breakout_executions(
     closed_cnt = sum(1 for lc in lifecycles if lc.status == "CLOSED")
     open_cnt = len(lifecycles) - closed_cnt
     fee_per_leg = float(cfg.PAPER_TX_FEE_SOL) if cfg.EXECUTION_MODE == "paper" else 0.0
+    total_lc = len(lifecycles)
+    fee_cov_pct = round((fee_verified_cnt / total_lc) * 100.0, 2) if total_lc > 0 else 0.0
+    all_fees_ok = (
+        total_lc > 0
+        and fee_verified_cnt == total_lc
+        and fee_failed_cnt == 0
+        and fee_unknown_cnt == 0
+    )
 
     return AggregateExecutionReport(
         strategy_scope=SUPPORTED_STRATEGY,
@@ -463,13 +507,17 @@ def analyze_breakout_executions(
         config_profile_provenance=profile.profile_provenance,
         since_utc=since_utc,
         excluded_non_breakout_trade_rows=excluded_other_strat,
-        total_breakout_entries=len(lifecycles),
+        total_breakout_entries=total_lc,
         closed_lifecycles=closed_cnt,
         open_lifecycles=open_cnt,
         partial_sell_count=partial_cnt,
         full_sell_count=sell_cnt,
         fee_per_leg_sol=fee_per_leg,
         all_fees_verified=all_fees_ok,
+        fee_verified_count=fee_verified_cnt,
+        fee_failed_count=fee_failed_cnt,
+        fee_unknown_count=fee_unknown_cnt,
+        fee_verification_coverage_pct=fee_cov_pct,
         total_fees_paid_sol=total_fees,
         gross_pnl_sol=total_gross_pnl,
         net_realized_pnl_sol=total_net_pnl,
@@ -526,6 +574,9 @@ def analyze_mint_execution(
 __all__ = [
     "AggregateExecutionReport",
     "ExitLegRecord",
+    "FEE_STATUS_FAILED",
+    "FEE_STATUS_UNKNOWN",
+    "FEE_STATUS_VERIFIED",
     "MintExecutionSummary",
     "TradeLifecycleRecord",
     "analyze_breakout_executions",

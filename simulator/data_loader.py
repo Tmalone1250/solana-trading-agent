@@ -1,12 +1,16 @@
 """Safe, consistent read-only DuckDB snapshot acquisition, schema validation & episode grouping.
 
-Guarantees:
+Guarantees (Option A1 — Strict Offline Fail-Closed Snapshot):
 - Never opens the source `.duckdb` or `.duckdb.wal` with DuckDB directly (zero source mutation).
-- Detects active writer locks via read-only `/proc/locks` and POSIX `fcntl(F_GETLK)` probes.
-- Fails closed (`SnapshotConsistencyError`) if a writer holds a lock (unless quiescent retry is
-  explicitly enabled) or if `.duckdb` / `.duckdb.wal` changes `(inode, size, mtime_ns, sha256)`
-  between pre-copy and post-copy verification.
-- Opens only the isolated `/tmp` snapshot with `duckdb.connect(..., read_only=True)`.
+- Probes for active writer locks via read-only `/proc/locks` and POSIX `fcntl(F_GETLK)` before
+  touching or copying any file.
+- Fails closed immediately (`LIVE_WRITER_LOCK_HELD`) whenever a writer holds a lock, without
+  copying the live database or WAL.
+- For an unlocked source, verifies pre/post `(inode, size, mtime_ns, sha256)` stability across the
+  copy to `/tmp` (note: file fingerprints verify copy stability on an unlocked source, not
+  transactional atomicity against an active writer).
+- Opens only the isolated `/tmp` snapshot with `duckdb.connect(..., read_only=True)` and cleans up
+  temporary files in `finally:`.
 """
 
 from __future__ import annotations
@@ -17,7 +21,6 @@ import os
 import shutil
 import struct
 import tempfile
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -485,121 +488,108 @@ def load_historical_dataset(
     db_path: str | Path,
     *,
     since_utc: Optional[str] = None,
-    allow_quiescent_live_copy: bool = False,
-    max_attempts: int = 3,
-    retry_delay_seconds: float = 0.15,
 ) -> HistoricalDataset:
-    """Acquire a verified read-only DuckDB (+ WAL) snapshot, validate schema, and load dataset.
+    """Acquire a verified offline read-only DuckDB (+ WAL) snapshot, validate schema, and load dataset.
 
-    Never writes to `db_path` or its `.wal` file, and cleans up temporary snapshot files in `finally:`.
+    Option A1 workflow:
+    1. Probe for an active writer lock on `.duckdb` and `.duckdb.wal`.
+    2. Reject immediately (`LIVE_WRITER_LOCK_HELD`) without copying if a writer lock is held.
+    3. Fingerprint unlocked source `.duckdb` and `.duckdb.wal`.
+    4. Copy to an isolated temporary directory.
+    5. Verify source-file stability and unlocked state across the copy.
+    6. Open only the temporary copy with `read_only=True`.
+    7. Validate schemas and WAL replay.
+    8. Clean up temporary files in `finally:`.
     """
     src_db = Path(db_path).resolve()
     if not src_db.is_file():
         raise FileNotFoundError(f"Source DuckDB file does not exist: {src_db}")
     src_wal = Path(f"{src_db}.wal")
 
-    attempts = max(1, int(max_attempts)) if allow_quiescent_live_copy else 1
-    last_err: Optional[Exception] = None
+    # 1-2. Probe for an active writer lock and fail closed before any copy
+    lock_info = detect_active_writer_lock(src_db) or (
+        detect_active_writer_lock(src_wal) if src_wal.is_file() else None
+    )
+    if lock_info is not None:
+        raise SnapshotConsistencyError(
+            f"LIVE_WRITER_LOCK_HELD on {src_db} ({lock_info}). "
+            "Option A1 enforces fail-closed rejection; use a separate offline unlocked snapshot."
+        )
 
-    for attempt in range(1, attempts + 1):
-        lock_info = detect_active_writer_lock(src_db) or (
+    # 3-8. Fingerprint unlocked source, copy to isolated /tmp, verify stability, open read-only, clean up
+    tmp_dir = Path(tempfile.mkdtemp(prefix="breakout_replay_snap_"))
+    try:
+        pre_db_fp = compute_file_fingerprint(src_db)
+        pre_wal_fp = compute_file_fingerprint(src_wal)
+
+        snap_db = tmp_dir / src_db.name
+        snap_wal = Path(f"{snap_db}.wal")
+        shutil.copy2(src_db, snap_db)
+        if pre_wal_fp.exists:
+            shutil.copy2(src_wal, snap_wal)
+
+        post_db_fp = compute_file_fingerprint(src_db)
+        post_wal_fp = compute_file_fingerprint(src_wal)
+        post_lock = detect_active_writer_lock(src_db) or (
             detect_active_writer_lock(src_wal) if src_wal.is_file() else None
         )
-        if lock_info is not None and not allow_quiescent_live_copy:
+
+        if post_lock is not None:
             raise SnapshotConsistencyError(
-                f"LIVE_WRITER_LOCK_HELD on {src_db} ({lock_info}). "
-                "Refusing blind live copy; use a separate offline snapshot or pass "
-                "allow_quiescent_live_copy=True for verified quiescent-window retry."
+                f"LIVE_WRITER_LOCK_ACQUIRED_DURING_COPY on {src_db} ({post_lock})."
+            )
+        if pre_db_fp != post_db_fp or pre_wal_fp != post_wal_fp:
+            raise SnapshotConsistencyError(
+                f"SOURCE_MODIFIED_DURING_COPY: "
+                f"db_changed={pre_db_fp != post_db_fp}, wal_changed={pre_wal_fp != post_wal_fp}"
             )
 
-        tmp_dir = Path(tempfile.mkdtemp(prefix="breakout_replay_snap_"))
         try:
-            pre_db_fp = compute_file_fingerprint(src_db)
-            pre_wal_fp = compute_file_fingerprint(src_wal)
+            conn = duckdb.connect(str(snap_db), read_only=True)
+        except Exception as exc:
+            raise SnapshotConsistencyError(
+                f"DUCKDB_READONLY_OPEN_OR_WAL_REPLAY_FAILED: {exc}"
+            ) from exc
 
-            snap_db = tmp_dir / src_db.name
-            snap_wal = Path(f"{snap_db}.wal")
-            shutil.copy2(src_db, snap_db)
-            if pre_wal_fp.exists:
-                shutil.copy2(src_wal, snap_wal)
-
-            post_db_fp = compute_file_fingerprint(src_db)
-            post_wal_fp = compute_file_fingerprint(src_wal)
-            post_lock = detect_active_writer_lock(src_db) or (
-                detect_active_writer_lock(src_wal) if src_wal.is_file() else None
-            )
-
-            if post_lock is not None and not allow_quiescent_live_copy:
-                raise SnapshotConsistencyError(
-                    f"LIVE_WRITER_LOCK_ACQUIRED_DURING_COPY on {src_db} ({post_lock})."
-                )
-            if pre_db_fp != post_db_fp or pre_wal_fp != post_wal_fp:
-                raise SnapshotConsistencyError(
-                    f"SOURCE_MODIFIED_DURING_COPY on attempt {attempt}/{attempts}: "
-                    f"db_changed={pre_db_fp != post_db_fp}, wal_changed={pre_wal_fp != post_wal_fp}"
-                )
-
-            # Open isolated snapshot in strict read_only=True mode (replays WAL inside tmp_dir)
-            try:
-                conn = duckdb.connect(str(snap_db), read_only=True)
-            except Exception as exc:
-                raise SnapshotConsistencyError(
-                    f"DUCKDB_READONLY_OPEN_OR_WAL_REPLAY_FAILED: {exc}"
-                ) from exc
-
-            try:
-                validated_cols = validate_snapshot_schema(conn)
-                action_rows = _fetch_table_dicts(conn, "action_log", "timestamp_utc ASC, id ASC")
-                trade_rows = _fetch_table_dicts(conn, "trades", "timestamp ASC, id ASC")
-                outcome_rows = _fetch_table_dicts(conn, "candidate_outcomes", "discovered_at ASC, id ASC")
-                decision_rows = _fetch_table_dicts(conn, "decisions_log", "timestamp ASC, id ASC")
-                state_rows = _fetch_table_dicts(conn, "agent_state", "id ASC")
-                cooldown_rows = _fetch_table_dicts(conn, "cooldowns", "expires_at ASC, mint ASC")
-                watchlist_rows = _fetch_table_dicts(conn, "active_watchlist", "added_at ASC, mint ASC")
-            finally:
-                conn.close()
-
-            method = (
-                "QUIESCENT_VERIFIED_FILE_AND_WAL_COPY_UNVERIFIED_IN_MEMORY_BUFFERS"
-                if lock_info is not None
-                else "OFFLINE_LOCK_FREE_SHA256_VERIFIED_SNAPSHOT"
-            )
-            provenance = SnapshotProvenance(
-                source_db_path=str(src_db),
-                source_wal_path=str(src_wal) if pre_wal_fp.exists else "",
-                wal_included=pre_wal_fp.exists,
-                snapshot_method=method,
-                acquired_at_utc=datetime.now(timezone.utc).isoformat(),
-                db_sha256=pre_db_fp.sha256,
-                wal_sha256=pre_wal_fp.sha256,
-                db_size_bytes=pre_db_fp.size,
-                wal_size_bytes=pre_wal_fp.size,
-                runtime_code_provenance=RUNTIME_CODE_PROVENANCE,
-            )
-            episodes, ep_by_mint = group_decision_episodes(
-                action_rows, decision_rows, outcome_rows, since_utc=since_utc
-            )
-            return HistoricalDataset(
-                provenance=provenance,
-                table_columns=validated_cols,
-                action_log=action_rows,
-                trades=trade_rows,
-                candidate_outcomes=outcome_rows,
-                decisions_log=decision_rows,
-                agent_state=state_rows,
-                cooldowns=cooldown_rows,
-                active_watchlist=watchlist_rows,
-                episodes=episodes,
-                episodes_by_mint=ep_by_mint,
-            )
-        except SnapshotConsistencyError as exc:
-            last_err = exc
-            if attempt < attempts:
-                time.sleep(retry_delay_seconds)
-                continue
-            raise
+        try:
+            validated_cols = validate_snapshot_schema(conn)
+            action_rows = _fetch_table_dicts(conn, "action_log", "timestamp_utc ASC, id ASC")
+            trade_rows = _fetch_table_dicts(conn, "trades", "timestamp ASC, id ASC")
+            outcome_rows = _fetch_table_dicts(conn, "candidate_outcomes", "discovered_at ASC, id ASC")
+            decision_rows = _fetch_table_dicts(conn, "decisions_log", "timestamp ASC, id ASC")
+            state_rows = _fetch_table_dicts(conn, "agent_state", "id ASC")
+            cooldown_rows = _fetch_table_dicts(conn, "cooldowns", "expires_at ASC, mint ASC")
+            watchlist_rows = _fetch_table_dicts(conn, "active_watchlist", "added_at ASC, mint ASC")
         finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            conn.close()
 
-    assert last_err is not None
-    raise last_err
+        provenance = SnapshotProvenance(
+            source_db_path=str(src_db),
+            source_wal_path=str(src_wal) if pre_wal_fp.exists else "",
+            wal_included=pre_wal_fp.exists,
+            snapshot_method="OFFLINE_LOCK_FREE_SHA256_VERIFIED_SNAPSHOT",
+            acquired_at_utc=datetime.now(timezone.utc).isoformat(),
+            db_sha256=pre_db_fp.sha256,
+            wal_sha256=pre_wal_fp.sha256,
+            db_size_bytes=pre_db_fp.size,
+            wal_size_bytes=pre_wal_fp.size,
+            runtime_code_provenance=RUNTIME_CODE_PROVENANCE,
+        )
+        episodes, ep_by_mint = group_decision_episodes(
+            action_rows, decision_rows, outcome_rows, since_utc=since_utc
+        )
+        return HistoricalDataset(
+            provenance=provenance,
+            table_columns=validated_cols,
+            action_log=action_rows,
+            trades=trade_rows,
+            candidate_outcomes=outcome_rows,
+            decisions_log=decision_rows,
+            agent_state=state_rows,
+            cooldowns=cooldown_rows,
+            active_watchlist=watchlist_rows,
+            episodes=episodes,
+            episodes_by_mint=ep_by_mint,
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)

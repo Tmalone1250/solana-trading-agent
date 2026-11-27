@@ -84,12 +84,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Directory to write Markdown and JSON report files (prints to stdout if omitted).",
     )
-    parser.add_argument(
-        "--allow-quiescent-live-copy",
-        action="store_true",
-        default=False,
-        help="Opt into bounded quiescent-window SHA-256 verified retry if an active writer lock exists.",
-    )
     return parser
 
 
@@ -102,7 +96,6 @@ def run_cli(argv: Optional[Sequence[str]] = None) -> int:
     dataset = load_historical_dataset(
         args.db,
         since_utc=since_utc,
-        allow_quiescent_live_copy=bool(args.allow_quiescent_live_copy),
     )
 
     out_dir = Path(args.out_dir).resolve() if args.out_dir else None

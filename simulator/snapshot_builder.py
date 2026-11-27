@@ -24,7 +24,7 @@ from simulator.data_loader import HistoricalDataset, parse_iso_utc
 
 
 def _get_dataset_index(dataset: HistoricalDataset) -> dict[str, Any]:
-    """Build O(N) sorted lookup indices once per HistoricalDataset for O(log N) snapshot building."""
+    """Build sorted lookup indices once per HistoricalDataset (O(N log N) one-time setup)."""
     cached = getattr(dataset, "_sim_lookup_index", None)
     if cached is not None:
         return cached
@@ -218,7 +218,12 @@ def _reconstruct_open_positions_indexed(
     idx_obj: dict[str, Any],
     decision_epoch: float,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Reconstruct open Chart and Whale mints at `decision_epoch` using ONLY trades `<= decision_epoch`."""
+    """Reconstruct open Chart and Whale mints at `decision_epoch` using ONLY trades `<= decision_epoch`.
+
+    Complexity:
+    - Timestamp boundary lookup (`bisect_right`): O(log N)
+    - Historical trade-prefix traversal (`parsed_trades[:hi]`): O(N) in the number of preceding trade records
+    """
     open_chart: list[tuple[str, str]] = []
     open_whale: list[tuple[str, str]] = []
     hi = bisect.bisect_right(idx_obj["trade_epochs"], decision_epoch)
@@ -238,7 +243,7 @@ def _estimate_sol_balance_indexed(
     idx_obj: dict[str, Any],
     decision_epoch: float,
 ) -> Optional[float]:
-    """Return latest recorded `sol_equity` strictly `<= decision_epoch` in O(log N)."""
+    """Return latest recorded `sol_equity` strictly `<= decision_epoch` in O(log N) via bisect_right."""
     pos = bisect.bisect_right(idx_obj["sol_epochs"], decision_epoch) - 1
     if pos >= 0:
         return float(idx_obj["sol_vals"][pos])
@@ -254,7 +259,12 @@ def build_decision_snapshot(
     vamp_warn_threshold: float = 0.75,
     low_score_threshold: float = 2.0,
 ) -> DecisionSnapshot:
-    """Build a strictly timestamp-bounded `DecisionSnapshot` for one `DECISION_1` row."""
+    """Build a strictly timestamp-bounded `DecisionSnapshot` for one `DECISION_1` row.
+
+    Complexity per observation (after one-time index build):
+    - `sol_equity` and `decisions_log` timestamp boundary lookups: O(log N) / O(log M)
+    - Open-position reconstruction: O(N) worst-case traversal of the preceding trade prefix
+    """
     if str(action_row.get("action") or "").upper() != "DECISION_1":
         raise ValueError(f"Expected DECISION_1 row, got action={action_row.get('action')!r}")
 

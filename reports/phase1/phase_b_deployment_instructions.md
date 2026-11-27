@@ -17,9 +17,10 @@
 
 Because DuckDB holds an exclusive OS write lock while `solana-trading-agent.service` is active, `simulator/data_loader.py` refuses to blindly copy a write-locked database by default (`LIVE_WRITER_LOCK_HELD`).
 
-Always point `solana-replay-simulator.service` at a **separate offline snapshot** under `/home/tmalone1250/solana-trading-agent/reports/snapshots/`:
-- Either copy an archived post-soak `.duckdb` (+ `.duckdb.wal` if present) when the live writer is not holding the lock, **or**
-- Stage a quiescent-verified snapshot copy explicitly into `reports/snapshots/` and verify its read-only load before running full reports.
+Always point `solana-replay-simulator.service` at a **separate offline, unlocked snapshot** under `/home/tmalone1250/solana-trading-agent/reports/snapshots/`:
+- Copy an archived post-soak `.duckdb` (+ `.duckdb.wal` if present) when no writer process holds the DuckDB lock, **or**
+- Export/stage an offline unlocked snapshot copy into `reports/snapshots/` and verify its read-only load before running full reports.
+- `simulator/data_loader.py` enforces Option A1 (fail-closed `LIVE_WRITER_LOCK_HELD` without copying) if pointed at a write-locked database.
 
 Never open or point any writable tool at `/home/tmalone1250/solana-trading-agent/solana_meme_agent.duckdb`.
 
