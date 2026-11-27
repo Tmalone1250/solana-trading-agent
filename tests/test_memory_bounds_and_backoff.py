@@ -110,13 +110,13 @@ async def test_bounded_in_memory_caches_evict_ttl_and_max_size(tmp_path: Path):
     # 3. SafetyGate cache capped at MAX_SAFETY_CACHE_ENTRIES (128) & expires after TTL
     for i in range(MAX_SAFETY_CACHE_ENTRIES + 25):
         rep = SafetyReport(mint=f"SafeMint_{i:03d}", passed=True, reasons=[])
-        cache_safety_report(rep.mint, rep, now_ts=base_ts + i)
+        cache_safety_report(rep.mint, rep, now_ts=base_ts + i, ttl_seconds=300.0)
     assert len(_safety_cache) <= MAX_SAFETY_CACHE_ENTRIES
-    assert get_cached_safety_report("SafeMint_000", now_ts=base_ts + 200) is None
+    assert get_cached_safety_report("SafeMint_000", now_ts=base_ts + 200, ttl_seconds=300.0) is None
     # Verify TTL expiration after 301s
     latest_mint = f"SafeMint_{MAX_SAFETY_CACHE_ENTRIES + 24:03d}"
-    assert get_cached_safety_report(latest_mint, now_ts=base_ts + 200) is not None
-    assert get_cached_safety_report(latest_mint, now_ts=base_ts + 1000) is None
+    assert get_cached_safety_report(latest_mint, now_ts=base_ts + 200, ttl_seconds=300.0) is not None
+    assert get_cached_safety_report(latest_mint, now_ts=base_ts + 1000, ttl_seconds=300.0) is None
 
     # 4. Helius webhook signature ring buffer capped at MAX_RECENT_WEBHOOK_SIGS (500)
     db = AgentDatabase(db_path=str(tmp_path / "wh_bound.duckdb"), starting_sol=1.0)

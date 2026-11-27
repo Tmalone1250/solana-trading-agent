@@ -229,26 +229,35 @@ async def test_ohlcv_90s_cache_and_429_exponential_backoff():
 
 
 def test_scalper_blocks_tick1_soak_and_overbought_spike():
+    from tests.test_e3b_cache_provenance import make_verified_ohlcv_result
     cfg = AgentConfig(_env_file=None)
     good_flow = {"buys_5m": 30, "sells_5m": 10}  # 75% buys, n=40
 
     # (c) Block tick-1 chase via 3m soak even on a valid SWEEP_RECLAIM
+    c_sr = make_sweep_reclaim_candles()
+    t_sr = c_sr[-1]["timestamp"] + 300.0
     res_soak = evaluate_scalper_entry(
-        make_sweep_reclaim_candles(),
+        c_sr,
         good_flow,
         time_in_slot_min=0.2,
         config=cfg,
+        decision_timestamp=t_sr,
+        ohlcv_provenance=make_verified_ohlcv_result(c_sr, last_ok_at=t_sr),
     )
     assert res_soak.eligible is False
     assert res_soak.rejection_reason is not None
     assert "soak 0.2m < 3m" in res_soak.rejection_reason
 
     # (d) Block overbought vertical spike (RSI > 70 and within 5% of 1h high)
+    c_sp = make_overbought_spike_candles()
+    t_sp = c_sp[-1]["timestamp"] + 300.0
     res_spike = evaluate_scalper_entry(
-        make_overbought_spike_candles(),
+        c_sp,
         good_flow,
         time_in_slot_min=5.0,
         config=cfg,
+        decision_timestamp=t_sp,
+        ohlcv_provenance=make_verified_ohlcv_result(c_sp, last_ok_at=t_sp),
     )
     assert res_spike.eligible is False
     assert res_spike.rsi_5m > 70.0
@@ -258,16 +267,21 @@ def test_scalper_blocks_tick1_soak_and_overbought_spike():
 
 
 def test_scalper_approves_sweep_reclaim_and_displacement_retest_with_order_flow():
+    from tests.test_e3b_cache_provenance import make_verified_ohlcv_result
     cfg = AgentConfig(_env_file=None)
     good_flow = {"txns": {"m5": {"buys": 24, "sells": 12}}}  # 66.7% >= 58%, n=36 >= 15
     weak_flow = {"txns": {"m5": {"buys": 8, "sells": 10}}}  # 44% < 58%
 
     # SWEEP_RECLAIM approved with strong order flow
+    c_sr = make_sweep_reclaim_candles()
+    t_sr = c_sr[-1]["timestamp"] + 300.0
     res_sweep = evaluate_scalper_entry(
-        make_sweep_reclaim_candles(),
+        c_sr,
         good_flow,
         time_in_slot_min=4.5,
         config=cfg,
+        decision_timestamp=t_sr,
+        ohlcv_provenance=make_verified_ohlcv_result(c_sr, last_ok_at=t_sr),
     )
     assert res_sweep.eligible is True
     assert res_sweep.setup_type == "SWEEP_RECLAIM"
@@ -276,11 +290,15 @@ def test_scalper_approves_sweep_reclaim_and_displacement_retest_with_order_flow(
     assert res_sweep.rejection_reason is None
 
     # DISPLACEMENT_RETEST approved with strong order flow
+    c_dr = make_displacement_retest_candles()
+    t_dr = c_dr[-1]["timestamp"] + 300.0
     res_disp = evaluate_scalper_entry(
-        make_displacement_retest_candles(),
+        c_dr,
         good_flow,
         time_in_slot_min=6.0,
         config=cfg,
+        decision_timestamp=t_dr,
+        ohlcv_provenance=make_verified_ohlcv_result(c_dr, last_ok_at=t_dr),
     )
     assert res_disp.eligible is True
     assert res_disp.setup_type == "DISPLACEMENT_RETEST"
@@ -289,10 +307,12 @@ def test_scalper_approves_sweep_reclaim_and_displacement_retest_with_order_flow(
 
     # Weak order flow blocks even a valid SWEEP_RECLAIM
     res_weak = evaluate_scalper_entry(
-        make_sweep_reclaim_candles(),
+        c_sr,
         weak_flow,
         time_in_slot_min=5.0,
         config=cfg,
+        decision_timestamp=t_sr,
+        ohlcv_provenance=make_verified_ohlcv_result(c_sr, last_ok_at=t_sr),
     )
     assert res_weak.eligible is False
     assert "buy_ratio" in (res_weak.rejection_reason or "")
@@ -323,6 +343,7 @@ async def test_alpha_blocks_unsoaked_spike_logs_reason_and_exposes_telemetry(tmp
         }
     )
 
+    c_w = make_overbought_spike_candles()
     cand = {
         "mint": "MintWiggles",
         "symbol": "WIGGLES",
@@ -331,7 +352,8 @@ async def test_alpha_blocks_unsoaked_spike_logs_reason_and_exposes_telemetry(tmp
         "buys_5m": 30,
         "sells_5m": 10,
         "added_at": just_added,
-        "candles_5m": make_overbought_spike_candles(),
+        "candles_5m": c_w,
+        "_ohlcv_5m_result": __import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(c_w, last_ok_at=now_dt.timestamp()),
     }
 
     with caplog.at_level(logging.INFO, logger="alpha_node"):

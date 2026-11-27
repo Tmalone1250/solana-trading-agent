@@ -61,7 +61,7 @@ async def test_whale_scalp_fast_track_confluence_and_solo_buy_within_mcap_band(t
 
     db = AgentDatabase(db_path=str(tmp_path / "whale_ft.duckdb"), starting_sol=0.7)
     cfg = AgentConfig(
-        _env_file=None,
+        _env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
         WHALE_STRATEGY_ENABLED=True,
         WHALE_POSITION_SOL=0.25,
         WHALE_MIN_SOLO_BUY_SOL=1.5,
@@ -180,7 +180,7 @@ async def test_whale_scalp_mcap_band_gating_stale_60s_and_is_sus(tmp_path):
     clear_jupiter_token_cache()
     db = AgentDatabase(db_path=str(tmp_path / "whale_gate.duckdb"), starting_sol=0.7)
     cfg = AgentConfig(
-        _env_file=None,
+        _env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
         WHALE_STRATEGY_ENABLED=True,
         WHALE_ENTRY_MAX_AGE_SECONDS=60,
         WHALE_MIN_MCAP_USD=15_000.0,
@@ -275,7 +275,7 @@ async def test_whale_scalp_mcap_band_gating_stale_60s_and_is_sus(tmp_path):
 
 @pytest.mark.asyncio
 async def test_whale_scalp_five_layer_exit_engine(tmp_path):
-    cfg = AgentConfig(_env_file=None)
+    cfg = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
     dec = DummyDecisionClient()
     mint = "MintWhaleExit111111111111111111111111111111"
     now_dt = datetime.now(timezone.utc)
@@ -414,7 +414,7 @@ def test_topup_paper_sol_helper(tmp_path):
 def test_telemetry_whale_trades_stats_and_confluence_agent_reasons(tmp_path):
     clear_helius_roster_cache()
     db = AgentDatabase(db_path=str(tmp_path / "whale_vis.duckdb"), starting_sol=1.0)
-    cfg = AgentConfig(_env_file=None, ENABLE_HELIUS_WHALE_WEBHOOK=True)
+    cfg = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0, ENABLE_HELIUS_WHALE_WEBHOOK=True)
     now_dt = datetime.now(timezone.utc)
     jijo = "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk"
 

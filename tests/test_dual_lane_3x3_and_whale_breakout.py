@@ -32,13 +32,22 @@ from whale_lane import run_whale_lane_tick
 async def test_3x3_dual_lane_caps_and_duplicate_mint_rejection(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "dual_3x3.duckdb"), starting_sol=5.0)
     cfg = AgentConfig(
-        _env_file=None,
+        _env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
         MAX_CHART_POSITIONS=3,
         MAX_WHALE_POSITIONS=3,
         MAX_OPEN_POSITIONS=6,
     )
 
-    def jup_handler(_request: httpx.Request) -> httpx.Response:
+    def jup_handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+        if "rugcheck.xyz" in url:
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ign_mint), "audit": {"isSus": False}}])
+        if "/ultra/v1/shield" in url:
+            return httpx.Response(200, json={"warnings": {request.url.params.get("mints", ""): []}})
         return httpx.Response(200, json={"outAmount": "1000000", "transaction": None})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(jup_handler)) as client:
@@ -49,6 +58,8 @@ async def test_3x3_dual_lane_caps_and_duplicate_mint_rejection(tmp_path):
         ]
         # Open 3 Chart positions -> all 3 succeed
         for i in range(3):
+            db.upsert_watchlist_entry(mint=f"MintChart{i}", symbol=f"CH{i}", pair_address=chart_pools[i], candidate={"mint": f"MintChart{i}"}, safety_passed=True)
+            db.mark_watchlist_safety_passed(f"MintChart{i}", True, checked_at=datetime.now(timezone.utc).isoformat())
             st = db.get_state()
             order = PendingOrder(
                 side="BUY", mint=f"MintChart{i}", symbol=f"CH{i}",
@@ -116,7 +127,7 @@ async def test_3x3_dual_lane_caps_and_duplicate_mint_rejection(tmp_path):
 @pytest.mark.asyncio
 async def test_batched_price_polling_and_on_demand_quote_near_thresholds():
     clear_price_backoff()
-    cfg = AgentConfig(_env_file=None)
+    cfg = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
     calls = {"price_v3": 0, "dex": 0, "swap_quote": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -166,7 +177,7 @@ async def test_whale_breakout_gate_blocks_extended_and_low_score_and_logs_csv(tm
     clear_ohlcv_cache()
     db = AgentDatabase(db_path=str(tmp_path / "whale_bo.duckdb"), starting_sol=2.0)
     cfg = AgentConfig(
-        _env_file=None,
+        _env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
         WHALE_STRATEGY_ENABLED=True,
         WHALE_MIN_UNIQUE_WALLETS=2,
         WHALE_MIN_LIQ_USD=40_000.0,
@@ -184,7 +195,7 @@ async def test_whale_breakout_gate_blocks_extended_and_low_score_and_logs_csv(tm
         db.record_whale_event(signature=f"{tag}-2", wallet=f"W{tag}2", mint=m, side="BUY", sol_amount=2.0, token_amount=100.0, timestamp_utc=(now_dt - timedelta(seconds=10)).isoformat())
         db.recompute_whale_signal(m, ttl_minutes=30, now=now_dt)
 
-    ext_candles = _make_breakout_candles(count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.07, breakout_vol=3500.0)
+    ext_candles = _make_breakout_candles(count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.06, breakout_vol=3500.0)
     ign_candles = _make_breakout_candles(count=18, breakout_close=1.12, breakout_high=1.13, breakout_low=1.06, breakout_vol=3000.0)
 
     def _to_gecko(cs: list[dict[str, float]]) -> dict[str, Any]:
@@ -206,6 +217,8 @@ async def test_whale_breakout_gate_blocks_extended_and_low_score_and_logs_csv(tm
             return httpx.Response(200, json=_to_gecko(ign_candles))
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ign_mint), "audit": {"isSus": False}}])
         if "/ultra/v1/shield" in url:
             return httpx.Response(200, json={"warnings": {ign_mint: []}})
         if "/swap/v2/order" in url:
@@ -245,12 +258,18 @@ async def test_jupiter_v3_flat_schema_dexscreener_pricenative_fallback_and_telem
     when Jupiter omits a meme coin, and (c) /api/telemetry returning live updated chart_positions."""
     clear_price_backoff()
     db = AgentDatabase(db_path=str(tmp_path / "live_chart_tel.duckdb"), starting_sol=2.0)
-    cfg = AgentConfig(_env_file=None)
+    cfg = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
     mint_v3 = "MintJupV3Flat111111111111111111111111111111"
     mint_meme = "Fn95NtGXWPaJXc4N5y9rVkUq1NwZbjBNJzPVvNRLpump"  # omitted from /price/v3 -> uses priceNative
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+        if "rugcheck.xyz" in url:
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/ultra/v1/shield" in url:
+            return httpx.Response(200, json={"warnings": {request.url.params.get("mints", ""): []}})
         if "/swap/v2/order" in url:
             # 10,000,000,000 atomic units (10,000 tokens at 6 decimals)
             return httpx.Response(200, json={"outAmount": "10000000000", "transaction": None})
@@ -356,7 +375,7 @@ async def test_whale_scalp_two_step_partial_tp_runner_trail_and_shadow_exit_on_r
     clear_price_backoff()
     db = AgentDatabase(db_path=str(tmp_path / "whale_partial_tp.duckdb"), starting_sol=1.0)
     cfg = AgentConfig(
-        _env_file=None,
+        _env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
         WHALE_STRATEGY_ENABLED=True,
         WHALE_POSITION_SOL=0.25,
         WHALE_PARTIAL_TP_TRIGGER_PCT=15.0,

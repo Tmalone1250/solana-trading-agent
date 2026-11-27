@@ -13,9 +13,26 @@ from fastapi.testclient import TestClient
 from alpha_node import alpha_node
 from config import AgentConfig
 from db import AgentDatabase
+from ohlcv_client import OhlcvFetchResult
 from scalper_entry_engine import evaluate_scalper_entry
 from state import FocusState
 from telemetry_api import create_telemetry_app
+
+
+def make_verified_ohlcv_result(
+    candles: list[dict[str, float]],
+    *,
+    last_ok_at: float,
+    source: str = "pre_attached_verified",
+) -> OhlcvFetchResult:
+    """Test helper to supply trusted OHLCV provenance without weakening production validation."""
+    return OhlcvFetchResult(
+        candles=list(candles),
+        source=source,  # type: ignore[arg-type]
+        fetched_at=last_ok_at,
+        last_ok_at=last_ok_at,
+        last_status=200,
+    )
 
 
 def _make_breakout_candles(
@@ -29,7 +46,7 @@ def _make_breakout_candles(
 ) -> list[dict[str, float]]:
     """Build a realistic uptrend with pullbacks (RSI ~72) coiling under 1.08, then breaking out."""
     candles: list[dict[str, float]] = []
-    t0 = 1_760_000_000
+    t0 = 1_760_000_400
     base_len = count - 1
     # Alternating impulse + small red pullback bars into a tight 4-bar coil under 1.08
     for i in range(base_len):
@@ -87,7 +104,11 @@ def test_breakout_ignition_valid_5m_bypasses_near_1h_high_and_allows_rsi_up_to_7
     candles = _make_breakout_candles(
         count=18, breakout_close=1.12, breakout_high=1.13, breakout_low=1.06, breakout_vol=3000.0
     )
-    res = evaluate_scalper_entry(candles, _strong_flow_pair(1.12), time_in_slot_min=5.0)
+    t = candles[-1]["timestamp"] + 300.0
+    res = evaluate_scalper_entry(
+        candles, _strong_flow_pair(1.12), time_in_slot_min=5.0,
+        decision_timestamp=t, ohlcv_provenance=make_verified_ohlcv_result(candles, last_ok_at=t),
+    )
     assert res.eligible is True
     assert res.setup_type == "BREAKOUT_IGNITION"
     assert res.dist_from_1h_high_pct < 0.05  # Near 1h high bypassed for breakout ignition
@@ -101,9 +122,13 @@ def test_breakout_ignition_valid_5m_bypasses_near_1h_high_and_allows_rsi_up_to_7
 def test_breakout_ignition_rejects_over_extended_chase_above_12_pct():
     # Huge parabolic spike to 1.35 (> 12% above EMA9 ~1.08 and VWAP ~1.05) -> rejected!
     candles = _make_breakout_candles(
-        count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.07, breakout_vol=3500.0
+        count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.06, breakout_vol=3500.0
     )
-    res = evaluate_scalper_entry(candles, _strong_flow_pair(1.34), time_in_slot_min=5.0)
+    t = candles[-1]["timestamp"] + 300.0
+    res = evaluate_scalper_entry(
+        candles, _strong_flow_pair(1.34), time_in_slot_min=5.0,
+        decision_timestamp=t, ohlcv_provenance=make_verified_ohlcv_result(candles, last_ok_at=t),
+    )
     assert res.eligible is False
     assert res.setup_type == "NONE"
     assert res.rejection_reason is not None
@@ -115,7 +140,11 @@ def test_breakout_ignition_rejects_upper_wick_fakeout():
     candles = _make_breakout_candles(
         count=18, breakout_close=1.095, breakout_high=1.20, breakout_low=1.06, breakout_vol=3000.0
     )
-    res = evaluate_scalper_entry(candles, _strong_flow_pair(1.095), time_in_slot_min=5.0)
+    t = candles[-1]["timestamp"] + 300.0
+    res = evaluate_scalper_entry(
+        candles, _strong_flow_pair(1.095), time_in_slot_min=5.0,
+        decision_timestamp=t, ohlcv_provenance=make_verified_ohlcv_result(candles, last_ok_at=t),
+    )
     assert res.eligible is False
     assert res.setup_type == "NONE"
     assert res.rejection_reason is not None
@@ -127,8 +156,10 @@ def test_breakout_ignition_1m_candle_fallback_when_fewer_than_12_5m_bars():
     bars_1m = _make_breakout_candles(
         count=20, bar_seconds=60, breakout_close=1.12, breakout_high=1.13, breakout_low=1.06, breakout_vol=3000.0
     )
+    t = bars_1m[-1]["timestamp"] + 60.0
     res = evaluate_scalper_entry(
-        short_5m, _strong_flow_pair(1.12), time_in_slot_min=4.0, candles_1m=bars_1m
+        short_5m, _strong_flow_pair(1.12), time_in_slot_min=4.0, candles_1m=bars_1m,
+        decision_timestamp=t, ohlcv_provenance=make_verified_ohlcv_result(bars_1m, last_ok_at=t),
     )
     assert res.eligible is True
     assert res.setup_type == "BREAKOUT_IGNITION"
@@ -166,6 +197,7 @@ async def test_coiling_base_retention_and_breakout_ignition_csv_logging(tmp_path
         "mint": coil_mint, "symbol": "COIL", "added_at": added_20m_ago,
         "liquidity_usd": 60_000.0, "market_cap_usd": 400_000.0,
         "price_usd": 1.075, "candles_5m": coil_candles,
+        "_ohlcv_5m_result": make_verified_ohlcv_result(coil_candles, last_ok_at=now_dt.timestamp()),
         "txns": {"m5": {"buys": 10, "sells": 10}},
     }
     # Strike 1 -> retained (NOT evicted!)
@@ -193,12 +225,14 @@ async def test_coiling_base_retention_and_breakout_ignition_csv_logging(tmp_path
             }
 
     bo_mint = "MintBreakout1111111111111111111111111111111"
+    bo_c = _make_breakout_candles(count=18)
     bo_cand = {
         "mint": bo_mint, "symbol": "IGNITE",
         "pair_address": "8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR",
         "dex_id": "pumpswap",
         "added_at": (now_dt - timedelta(minutes=5)).isoformat(),
-        "candles_5m": _make_breakout_candles(count=18),
+        "candles_5m": bo_c,
+        "_ohlcv_5m_result": make_verified_ohlcv_result(bo_c, last_ok_at=now_dt.timestamp()),
         **_strong_flow_pair(1.12),
     }
     out = await alpha_node(
@@ -253,7 +287,11 @@ def test_breakout_telemetry_score_states_and_failed_gates_formatting():
     candles_low_vol = _make_breakout_candles(
         count=18, breakout_close=1.12, breakout_high=1.13, breakout_low=1.06, breakout_vol=1200.0
     )
-    res_lv = evaluate_scalper_entry(candles_low_vol, _strong_flow_pair(1.12), time_in_slot_min=5.0)
+    t_lv = candles_low_vol[-1]["timestamp"] + 300.0
+    res_lv = evaluate_scalper_entry(
+        candles_low_vol, _strong_flow_pair(1.12), time_in_slot_min=5.0,
+        decision_timestamp=t_lv, ohlcv_provenance=make_verified_ohlcv_result(candles_low_vol, last_ok_at=t_lv),
+    )
     bt_lv = res_lv.breakout_telemetry
     assert bt_lv is not None
     assert bt_lv["score"] == 95  # 100 - 5 (partial vol credit for 1.2x >= 1.2x)
@@ -263,9 +301,13 @@ def test_breakout_telemetry_score_states_and_failed_gates_formatting():
 
     # Over-extended breakout -> state == EXTENDED and hard-blocked even though score >= 75
     candles_ext = _make_breakout_candles(
-        count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.07, breakout_vol=3500.0
+        count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.06, breakout_vol=3500.0
     )
-    res_ext = evaluate_scalper_entry(candles_ext, _strong_flow_pair(1.34), time_in_slot_min=5.0)
+    t_ext = candles_ext[-1]["timestamp"] + 300.0
+    res_ext = evaluate_scalper_entry(
+        candles_ext, _strong_flow_pair(1.34), time_in_slot_min=5.0,
+        decision_timestamp=t_ext, ohlcv_provenance=make_verified_ohlcv_result(candles_ext, last_ok_at=t_ext),
+    )
     assert res_ext.eligible is False
     assert res_ext.breakout_telemetry is not None
     assert res_ext.breakout_telemetry["score"] >= 75
@@ -273,11 +315,15 @@ def test_breakout_telemetry_score_states_and_failed_gates_formatting():
     assert any(g.startswith("EXT(") for g in res_ext.breakout_telemetry["failed_gates"])
 
     # 1m fallback reports timeframe == "1m_fallback"
+    bars_1m = _make_breakout_candles(count=20, bar_seconds=60)
+    t_1m = bars_1m[-1]["timestamp"] + 60.0
     res_1m = evaluate_scalper_entry(
         _make_breakout_candles(count=5),
         _strong_flow_pair(1.12),
         time_in_slot_min=4.0,
-        candles_1m=_make_breakout_candles(count=20, bar_seconds=60),
+        candles_1m=bars_1m,
+        decision_timestamp=t_1m,
+        ohlcv_provenance=make_verified_ohlcv_result(bars_1m, last_ok_at=t_1m),
     )
     assert res_1m.breakout_telemetry is not None
     assert res_1m.breakout_telemetry["timeframe"] == "1m_fallback"
@@ -302,7 +348,11 @@ def test_breakout_ignition_allows_1_6x_vol_9_5_pct_coil_and_1_0x_buy_accel_and_c
         "market_cap_usd": 650_000.0,
         "txns": {"m5": {"buys": 20, "sells": 8}, "h1": {"buys": 240, "sells": 120}},
     }
-    res = evaluate_scalper_entry(candles, pair_1x_accel, time_in_slot_min=5.0)
+    t_c = candles[-1]["timestamp"] + 300.0
+    res = evaluate_scalper_entry(
+        candles, pair_1x_accel, time_in_slot_min=5.0,
+        decision_timestamp=t_c, ohlcv_provenance=make_verified_ohlcv_result(candles, last_ok_at=t_c),
+    )
     assert res.eligible is True
     assert res.setup_type == "BREAKOUT_IGNITION"
     assert res.breakout_telemetry is not None
@@ -318,7 +368,11 @@ def test_breakout_ignition_allows_1_6x_vol_9_5_pct_coil_and_1_0x_buy_accel_and_c
     candles_greg = _make_breakout_candles(
         count=18, breakout_close=1.12, breakout_high=1.13, breakout_low=1.06, breakout_vol=120.0
     )
-    res_greg = evaluate_scalper_entry(candles_greg, _strong_flow_pair(1.12), time_in_slot_min=5.0)
+    t_g = candles_greg[-1]["timestamp"] + 300.0
+    res_greg = evaluate_scalper_entry(
+        candles_greg, _strong_flow_pair(1.12), time_in_slot_min=5.0,
+        decision_timestamp=t_g, ohlcv_provenance=make_verified_ohlcv_result(candles_greg, last_ok_at=t_g),
+    )
     assert res_greg.eligible is False
     assert res_greg.breakout_telemetry is not None
     assert res_greg.breakout_telemetry["score"] >= 75
@@ -328,7 +382,11 @@ def test_breakout_ignition_allows_1_6x_vol_9_5_pct_coil_and_1_0x_buy_accel_and_c
     candles_no_res = _make_breakout_candles(
         count=18, breakout_close=1.077, breakout_high=1.078, breakout_low=1.06, breakout_vol=3000.0
     )
-    res_no_res = evaluate_scalper_entry(candles_no_res, _strong_flow_pair(1.077), time_in_slot_min=5.0)
+    t_nr = candles_no_res[-1]["timestamp"] + 300.0
+    res_no_res = evaluate_scalper_entry(
+        candles_no_res, _strong_flow_pair(1.077), time_in_slot_min=5.0,
+        decision_timestamp=t_nr, ohlcv_provenance=make_verified_ohlcv_result(candles_no_res, last_ok_at=t_nr),
+    )
     assert res_no_res.eligible is False
     assert res_no_res.breakout_telemetry is not None
     assert res_no_res.breakout_telemetry["score"] == 75

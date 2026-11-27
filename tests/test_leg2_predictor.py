@@ -75,7 +75,7 @@ def test_leg2_predictor_dead_cat_and_low_volume_bounce():
 @pytest.mark.asyncio
 async def test_safety_gate_caches_pass_for_retained_watchlist_slots(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "safety_cache.duckdb"), starting_sol=0.7)
-    cfg = AgentConfig(_env_file=None, JUPITER_API_KEY="test-key")
+    cfg = AgentConfig(_env_file=None, JUPITER_API_KEY="test-key", SAFETY_CACHE_TTL_SECONDS=300.0)
     now_iso = datetime.now(timezone.utc).isoformat()
 
     db.upsert_watchlist_entry(
@@ -180,7 +180,7 @@ async def test_alpha_leg2_fast_track_entries_and_telemetry(tmp_path, caplog):
             {
                 "focus_state": FocusState.SCANNING.value,
                 "sol_balance": 0.7,
-                "safe_candidates": [strong_cand],
+                "safe_candidates": [{**strong_cand, "_ohlcv_5m_result": __import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(valid_candles, last_ok_at=now_dt.timestamp())}],
             },
             config=cfg,
             db=db,
@@ -224,7 +224,7 @@ async def test_alpha_leg2_fast_track_entries_and_telemetry(tmp_path, caplog):
         {
             "focus_state": FocusState.SCANNING.value,
             "sol_balance": 0.7,
-            "safe_candidates": [cand_75_simple],
+            "safe_candidates": [{**cand_75_simple, "_ohlcv_5m_result": __import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(valid_candles, last_ok_at=now_dt.timestamp())}],
         },
         config=cfg,
         db=db,

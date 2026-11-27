@@ -43,7 +43,16 @@ def _make_monitor_client(
     lamports = int(round(sol_quote * LAMPORTS_PER_SOL))
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if "/swap/v2/order" in str(request.url):
+        url = str(request.url)
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+        if "rugcheck.xyz" in url:
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": "MintGrad11111111111111111111111111111111111", "audit": {"isSus": False}}])
+        if "/ultra/v1/shield" in url:
+            return httpx.Response(200, json={"warnings": {request.url.params.get("mints", ""): []}})
+        if "/swap/v2/order" in url:
             return httpx.Response(200, json={"outAmount": str(lamports), "transaction": None})
         if "/tokens/v1/solana/" in str(request.url):
             req_mint = str(request.url).rsplit("/", 1)[-1].split(",")[0]
@@ -94,7 +103,7 @@ def _base_in_position(entry_sol: float = 0.5) -> dict[str, Any]:
 @pytest.mark.asyncio
 async def test_hard_stop_minus_10_pct_exits_to_scanning_with_cooldown(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "hard_stop.duckdb"), starting_sol=0.7)
-    cfg = AgentConfig(_env_file=None)
+    cfg = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
     dec = StubDecisionClient({})
     state = {
         "focus_state": FocusState.IN_POSITION.value,
@@ -122,7 +131,7 @@ async def test_hard_stop_minus_10_pct_exits_to_scanning_with_cooldown(tmp_path):
 @pytest.mark.asyncio
 async def test_breakeven_shield_arms_at_plus_8_and_exits_at_plus_2(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "breakeven.duckdb"), starting_sol=0.7)
-    cfg = AgentConfig(_env_file=None)
+    cfg = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
     dec = StubDecisionClient({})
     state = {
         "focus_state": FocusState.IN_POSITION.value,
@@ -155,7 +164,7 @@ async def test_breakeven_shield_arms_at_plus_8_and_exits_at_plus_2(tmp_path):
 @pytest.mark.asyncio
 async def test_trailing_tp_plus_12_minus_6_transitions_to_watching_and_leg2_reentry(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "trail_leg2.duckdb"), starting_sol=0.7)
-    cfg = AgentConfig(_env_file=None, PAPER_TX_FEE_SOL=0.0)
+    cfg = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0, PAPER_TX_FEE_SOL=0.0)
     leg2_approve = StubDecisionClient(
         {
             "leg_2_momentum": {"type": "score", "score": 4.1, "confidence": 0.90},
@@ -216,7 +225,7 @@ async def test_trailing_tp_plus_12_minus_6_transitions_to_watching_and_leg2_reen
 @pytest.mark.asyncio
 async def test_exodus_bleed_and_timeout_abandonment(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "abandon.duckdb"), starting_sol=0.7)
-    cfg = AgentConfig(_env_file=None)
+    cfg = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
     dec = StubDecisionClient({})
 
     # 1. Exodus in IN_POSITION (5m sells >= 65% after warm-up & 2 confirmation ticks)
@@ -308,7 +317,7 @@ async def test_langgraph_end_to_end_and_telemetry_api(tmp_path):
     clear_geckoterminal_cache()
     clear_ohlcv_cache()
     db = AgentDatabase(db_path=str(tmp_path / "e2e.duckdb"), starting_sol=0.7)
-    cfg = AgentConfig(_env_file=None, HUNTING_LANE="graduations", OHLCV_PACING_DELAY_SECONDS=0.0, PAPER_TX_FEE_SOL=0.0)
+    cfg = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0, HUNTING_LANE="graduations", OHLCV_PACING_DELAY_SECONDS=0.0, PAPER_TX_FEE_SOL=0.0)
     # Pre-seed MintGrad in active_watchlist soaked for 5m so the Scalper Entry Engine allows entry
     db.upsert_watchlist_entry(
         mint="MintGrad11111111111111111111111111111111111",
@@ -360,6 +369,8 @@ async def test_langgraph_end_to_end_and_telemetry_api(tmp_path):
             )
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": "MintGrad11111111111111111111111111111111111", "audit": {"isSus": False}}])
         if "/ultra/v1/shield" in url:
             return httpx.Response(200, json={"warnings": {"MintGrad11111111111111111111111111111111111": []}})
         if "/swap/v2/order" in url:
@@ -444,7 +455,7 @@ async def test_langgraph_end_to_end_and_telemetry_api(tmp_path):
 @pytest.mark.asyncio
 async def test_reentry_anti_chase_aborts_if_price_rips_during_decision_1(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "anti_chase.duckdb"), starting_sol=0.7)
-    cfg = AgentConfig(_env_file=None, MAX_REENTRY_CHASE_PCT=0.08)
+    cfg = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0, MAX_REENTRY_CHASE_PCT=0.08)
     leg2_approve = StubDecisionClient(
         {
             "leg_2_momentum": {"type": "score", "score": 4.2, "confidence": 0.90},
@@ -471,7 +482,16 @@ async def test_reentry_anti_chase_aborts_if_price_rips_during_decision_1(tmp_pat
     quote_calls = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if "/swap/v2/order" in str(request.url):
+        url = str(request.url)
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+        if "rugcheck.xyz" in url:
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": "MintGrad11111111111111111111111111111111111", "audit": {"isSus": False}}])
+        if "/ultra/v1/shield" in url:
+            return httpx.Response(200, json={"warnings": {request.url.params.get("mints", ""): []}})
+        if "/swap/v2/order" in url:
             quote_calls["n"] += 1
             sol_val = 0.5099 if quote_calls["n"] == 1 else 0.6018
             return httpx.Response(200, json={"outAmount": str(int(round(sol_val * 1_000_000_000))), "transaction": None})
@@ -512,7 +532,7 @@ async def test_reentry_anti_chase_aborts_if_price_rips_during_decision_1(tmp_pat
 @pytest.mark.asyncio
 async def test_max_reentries_per_mint_puts_mint_on_cooldown_after_second_reentry(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "max_reentries.duckdb"), starting_sol=0.7)
-    cfg = AgentConfig(_env_file=None, MAX_REENTRIES_PER_MINT=2)
+    cfg = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0, MAX_REENTRIES_PER_MINT=2)
     dec = StubDecisionClient({})
     mint = "MintExhaust11111111111111111111111111111111"
 
@@ -568,7 +588,7 @@ async def test_two_step_partial_tp_scale_out_and_runner_trail_and_breakeven(tmp_
     """Verify Step 1 (50% scale-out at +15%) and Step 2 (runner -10% trailing stop & +2% breakeven floor)."""
     db = AgentDatabase(db_path=str(tmp_path / "partial_tp.duckdb"), starting_sol=0.7)
     cfg = AgentConfig(
-        _env_file=None,
+        _env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
         PARTIAL_TP_TRIGGER_PCT=15.0,
         PARTIAL_TP_SELL_FRACTION=0.50,
         RUNNER_TRAIL_PULLBACK_PCT=10.0,
@@ -596,6 +616,14 @@ async def test_two_step_partial_tp_scale_out_and_runner_trail_and_breakeven(tmp_
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+        if "rugcheck.xyz" in url:
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": "MintGrad11111111111111111111111111111111111", "audit": {"isSus": False}}])
+        if "/ultra/v1/shield" in url:
+            return httpx.Response(200, json={"warnings": {request.url.params.get("mints", ""): []}})
         if "/swap/v2/order" in url:
             amt = int(request.url.params.get("amount") or 1_000_000)
             out_sol = amt * unit_sol_price["val"]

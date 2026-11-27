@@ -1,0 +1,1390 @@
+diff --git a/config.py b/config.py
+index cd8233f..f2a27d7 100644
+--- a/config.py
++++ b/config.py
+@@ -187,6 +187,12 @@ class AgentConfig(BaseSettings):
+     GECKOTERMINAL_CACHE_SECONDS: float = Field(default=60.0, gt=0.0)
+     RUGCHECK_BASE_URL: str = "https://api.rugcheck.xyz"
+     JUPITER_BASE_URL: str = "https://api.jup.ag"
++    # Phase E4C: Live RPC balance & reservation headroom (values deferred pending telemetry calibration)
++    SOLANA_RPC_URL: str = ""
++    LIVE_MIN_SOL_RESERVE: float = Field(default=0.05, ge=0.0)
++    LIVE_FEE_RESERVATION_BUFFER_SOL: float = Field(default=0.01, ge=0.0)
++    BALANCE_DIVERGENCE_WARN_SOL: float = Field(default=0.02, ge=0.0)
++    LIVE_RPC_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0.0)
+ 
+     # Loop, Persistence & Telemetry
+     MONITOR_POLL_SECONDS: float = Field(default=5.0, gt=0.0)
+@@ -199,10 +205,20 @@ class AgentConfig(BaseSettings):
+ 
+     @model_validator(mode="after")
+     def validate_live_keys(self) -> "AgentConfig":
+-        if self.EXECUTION_MODE == "live" and not self.SOLANA_PRIVATE_KEY_BS58.strip():
+-            raise ValueError(
+-                "SOLANA_PRIVATE_KEY_BS58 is required when EXECUTION_MODE='live'."
+-            )
++        if self.EXECUTION_MODE == "live":
++            if not self.SOLANA_PRIVATE_KEY_BS58.strip():
++                raise ValueError(
++                    "SOLANA_PRIVATE_KEY_BS58 is required when EXECUTION_MODE='live'."
++                )
++            rpc_url = self.SOLANA_RPC_URL.strip()
++            if not rpc_url or not (rpc_url.startswith("http://") or rpc_url.startswith("https://")):
++                raise ValueError(
++                    "SOLANA_RPC_URL (http:// or https://) is required when EXECUTION_MODE='live'."
++                )
++        elif self.SOLANA_RPC_URL.strip():
++            rpc_url = self.SOLANA_RPC_URL.strip()
++            if not (rpc_url.startswith("http://") or rpc_url.startswith("https://")):
++                raise ValueError("SOLANA_RPC_URL must start with http:// or https://.")
+         if self.WHALE_PARTIAL_TP_TRIGGER_PCT is None:
+             self.WHALE_PARTIAL_TP_TRIGGER_PCT = float(self.PARTIAL_TP_TRIGGER_PCT)
+         if self.WHALE_PARTIAL_TP_SELL_FRACTION is None:
+diff --git a/executor_node.py b/executor_node.py
+index fe0b700..7af40e2 100644
+--- a/executor_node.py
++++ b/executor_node.py
+@@ -15,7 +15,12 @@ from solders.transaction import VersionedTransaction
+ from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
+ from db import AgentDatabase, utc_now, utc_now_iso
+ from state import ActivePosition, AgentGraphState, FocusState, PendingOrder, is_valid_pool_address
+-from state_ledger import acquire_exit_guard, clear_sell_guard, finalize_exit_guard
++from state_ledger import (
++    acquire_exit_guard,
++    clear_sell_guard,
++    finalize_exit_guard,
++    mark_buy_reservation_broadcast_unresolved,
++)
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -44,6 +49,36 @@ def sign_jupiter_transaction(tx_base64: str, private_key_bs58: str) -> str:
+     return base64.b64encode(bytes(signed_tx)).decode("ascii")
+ 
+ 
++async def fetch_live_wallet_sol_balance(
++    pubkey: str,
++    *,
++    config: AgentConfig,
++    client: httpx.AsyncClient,
++) -> float:
++    """Query Solana JSON-RPC getBalance(confirmed) outside db._lock and return spendable wallet SOL."""
++    rpc_url = config.SOLANA_RPC_URL.strip()
++    if not rpc_url or not (rpc_url.startswith("http://") or rpc_url.startswith("https://")):
++        raise RuntimeError("SOLANA_RPC_URL is missing or malformed for live balance verification")
++    payload = {
++        "jsonrpc": "2.0",
++        "id": 1,
++        "method": "getBalance",
++        "params": [pubkey, {"commitment": "confirmed"}],
++    }
++    resp = await client.post(rpc_url, json=payload, timeout=config.LIVE_RPC_TIMEOUT_SECONDS)
++    resp.raise_for_status()
++    data = resp.json()
++    if not isinstance(data, dict) or data.get("error") is not None:
++        raise RuntimeError(f"Solana RPC getBalance error: {data.get('error') if isinstance(data, dict) else data}")
++    result = data.get("result")
++    if not isinstance(result, dict):
++        raise RuntimeError("Solana RPC getBalance missing result object")
++    lamports = result.get("value")
++    if isinstance(lamports, bool) or not isinstance(lamports, int) or lamports < 0:
++        raise RuntimeError(f"Solana RPC getBalance invalid lamports value: {lamports!r}")
++    return lamports / LAMPORTS_PER_SOL
++
++
+ async def fetch_jupiter_order(
+     *,
+     input_mint: str,
+@@ -126,57 +161,94 @@ async def executor_node(
+     if config.EXECUTION_MODE == "paper":
+         tx_fee_opt: Optional[float] = float(config.PAPER_TX_FEE_SOL)
+         tx_fee_status = "PAPER_ASSUMED"
++        reserve_fee_sol = float(config.PAPER_TX_FEE_SOL)
+     else:
+         tx_fee_opt = None
+         tx_fee_status = "UNKNOWN"
++        # Reservation headroom only (base fee + priority fee + possible ATA rent); never persisted as observed fee
++        reserve_fee_sol = float(config.LIVE_FEE_RESERVATION_BUFFER_SOL)
++
++    taker: Optional[str] = None
++    if config.EXECUTION_MODE == "live":
++        keypair = Keypair.from_base58_string(config.SOLANA_PRIVATE_KEY_BS58)
++        taker = str(keypair.pubkey())
++
+     lane_tag = "whale" if is_whale_slot else "chart"
+     reservation_id: Optional[str] = None
++    owns_client = http_client is None
++    client = http_client or httpx.AsyncClient()
+     if is_buy:
+-        if is_whale_slot:
+-            if not config.WHALE_STRATEGY_ENABLED:
+-                logger.warning("[Executor] Strategy gate blocked whale_slot BUY of %s: WHALE_STRATEGY_ENABLED=False", order.symbol)
++        try:
++            if is_whale_slot:
++                if not config.WHALE_STRATEGY_ENABLED:
++                    logger.warning("[Executor] Strategy gate blocked whale_slot BUY of %s: WHALE_STRATEGY_ENABLED=False", order.symbol)
++                    return {"pending_order": None}
++            elif not config.is_chart_strategy_enabled(order.strategy, allow_legacy_scalper_when_all_enabled=True):
++                logger.warning(
++                    "[Executor] Strategy allowlist blocked chart_slot BUY of %s: strategy=%s not in CHART_ENABLED_STRATEGIES (%s)",
++                    order.symbol, order.strategy, ",".join(sorted(config.chart_enabled_strategies())),
++                )
+                 return {"pending_order": None}
+-        elif not config.is_chart_strategy_enabled(order.strategy, allow_legacy_scalper_when_all_enabled=True):
+-            logger.warning(
+-                "[Executor] Strategy allowlist blocked chart_slot BUY of %s: strategy=%s not in CHART_ENABLED_STRATEGIES (%s)",
+-                order.symbol, order.strategy, ",".join(sorted(config.chart_enabled_strategies())),
++            elif str(order.strategy or "").upper() == "BREAKOUT_IGNITION" and not is_valid_pool_address(order.pair_address, mint=order.mint):
++                rej_msg = "BLOCKED: MISSING_OR_INVALID_POOL_IDENTITY (pair_address absent or invalid at executor)"
++                logger.warning("[Executor] Pool identity guard blocked BREAKOUT_IGNITION BUY of %s: %s", order.symbol, rej_msg)
++                db.log_action(
++                    mode=config.EXECUTION_MODE, action="DECISION_1", symbol=order.symbol, asset_id=order.mint,
++                    strategy="BREAKOUT_IGNITION", reason=rej_msg,
++                    pair_address=None, dex_id=order.dex_id,
++                )
++                return {"pending_order": None}
++            active_pos_for_reentry = state.get("active_position") or st_live.get("active_position")
++            is_reentry_same_mint = (
++                not is_whale_slot and order.reason == "LEG_2_REENTRY"
++                and isinstance(active_pos_for_reentry, dict) and active_pos_for_reentry.get("mint") == order.mint
++                and state.get("focus_state") == FocusState.WATCHING_REENTRY.value
+             )
+-            return {"pending_order": None}
+-        elif str(order.strategy or "").upper() == "BREAKOUT_IGNITION" and not is_valid_pool_address(order.pair_address, mint=order.mint):
+-            rej_msg = "BLOCKED: MISSING_OR_INVALID_POOL_IDENTITY (pair_address absent or invalid at executor)"
+-            logger.warning("[Executor] Pool identity guard blocked BREAKOUT_IGNITION BUY of %s: %s", order.symbol, rej_msg)
+-            db.log_action(
+-                mode=config.EXECUTION_MODE, action="DECISION_1", symbol=order.symbol, asset_id=order.mint,
+-                strategy="BREAKOUT_IGNITION", reason=rej_msg,
+-                pair_address=None, dex_id=order.dex_id,
++            # Also block if caller passed in-memory open mints not yet persisted
++            caller_open = {
++                str(p["mint"]) for p in (state.get("chart_positions") or []) + (state.get("whale_positions") or []) + [state.get("active_position"), state.get("whale_position")]
++                if isinstance(p, dict) and p.get("mint")
++            }
++            if order.mint in caller_open and not is_reentry_same_mint:
++                logger.warning("[Executor] Duplicate mint guard blocked %s BUY of %s", f"{lane_tag}_slot", order.symbol)
++                return {"pending_order": None}
++
++            # Live mode: fetch actual wallet SOL balance via RPC strictly OUTSIDE db._lock; fail closed on any error
++            live_wallet_sol: Optional[float] = None
++            if config.EXECUTION_MODE == "live":
++                assert taker is not None
++                try:
++                    live_wallet_sol = await fetch_live_wallet_sol_balance(taker, config=config, client=client)
++                except Exception as exc:
++                    logger.warning(
++                        "[Executor] BLOCKED: LIVE_RPC_BALANCE_UNAVAILABLE for %s BUY of %s: %s",
++                        f"{lane_tag}_slot", order.symbol, exc,
++                    )
++                    return {"pending_order": None}
++
++            req_sol = order.amount_atomic / LAMPORTS_PER_SOL
++            lane_cap = config.MAX_WHALE_POSITIONS if is_whale_slot else config.MAX_CHART_POSITIONS
++            fb_sol_state = float(state["sol_balance"]) if "sol_balance" in state and state["sol_balance"] is not None else None
++            reservation_id, rej_reason = db.reserve_buy_slot(
++                lane=lane_tag, mint=order.mint, required_sol=req_sol,
++                tx_fee_sol=reserve_fee_sol,
++                max_lane_positions=lane_cap, max_open_positions=config.MAX_OPEN_POSITIONS,
++                is_reentry_same_mint=is_reentry_same_mint, fallback_state_sol=fb_sol_state,
++                daily_max_loss_pct=config.DAILY_MAX_LOSS_PCT,
++                live_wallet_sol=live_wallet_sol,
++                live_min_sol_reserve=float(config.LIVE_MIN_SOL_RESERVE) if config.EXECUTION_MODE == "live" else 0.0,
++                balance_divergence_warn_sol=float(config.BALANCE_DIVERGENCE_WARN_SOL) if config.EXECUTION_MODE == "live" else None,
+             )
+-            return {"pending_order": None}
+-        active_pos_for_reentry = state.get("active_position") or st_live.get("active_position")
+-        is_reentry_same_mint = (
+-            not is_whale_slot and order.reason == "LEG_2_REENTRY"
+-            and isinstance(active_pos_for_reentry, dict) and active_pos_for_reentry.get("mint") == order.mint
+-            and state.get("focus_state") == FocusState.WATCHING_REENTRY.value
+-        )
+-        # Also block if caller passed in-memory open mints not yet persisted
+-        caller_open = {
+-            str(p["mint"]) for p in (state.get("chart_positions") or []) + (state.get("whale_positions") or []) + [state.get("active_position"), state.get("whale_position")]
+-            if isinstance(p, dict) and p.get("mint")
+-        }
+-        if order.mint in caller_open and not is_reentry_same_mint:
+-            logger.warning("[Executor] Duplicate mint guard blocked %s BUY of %s", f"{lane_tag}_slot", order.symbol)
+-            return {"pending_order": None}
+-        req_sol = order.amount_atomic / LAMPORTS_PER_SOL
+-        lane_cap = config.MAX_WHALE_POSITIONS if is_whale_slot else config.MAX_CHART_POSITIONS
+-        fb_sol_state = float(state["sol_balance"]) if "sol_balance" in state and state["sol_balance"] is not None else None
+-        reservation_id, rej_reason = db.reserve_buy_slot(
+-            lane=lane_tag, mint=order.mint, required_sol=req_sol,
+-            tx_fee_sol=float(tx_fee_opt) if tx_fee_opt is not None else 0.0,
+-            max_lane_positions=lane_cap, max_open_positions=config.MAX_OPEN_POSITIONS,
+-            is_reentry_same_mint=is_reentry_same_mint, fallback_state_sol=fb_sol_state,
+-        )
+-        if rej_reason is not None:
+-            logger.warning("[Executor] Pre-trade reservation blocked %s BUY of %s: %s", f"{lane_tag}_slot", order.symbol, rej_reason)
+-            return {"pending_order": None}
++            if rej_reason is not None:
++                logger.warning("[Executor] Pre-trade reservation blocked %s BUY of %s: %s", f"{lane_tag}_slot", order.symbol, rej_reason)
++                return {"pending_order": None}
++        except BaseException:
++            if owns_client:
++                await client.aclose()
++            raise
++        finally:
++            if reservation_id is None and owns_client:
++                await client.aclose()
+ 
+     is_exit = not is_buy
+     live_lane_for_fb = whale_positions if is_whale_slot else chart_positions
+@@ -208,6 +280,8 @@ async def executor_node(
+         )
+         if is_dup:
+             logger.warning("[Executor] Duplicate/already-closed %s skipped for %s (%s)", side_up, order.symbol, order.reason)
++            if owns_client:
++                await client.aclose()
+             return {
+                 "focus_state": st_live["focus_state"], "sol_balance": float(st_live["sol_balance"]),
+                 "daily_pnl_sol": float(st_live["daily_pnl_sol"]), "active_position": st_live["active_position"],
+@@ -218,14 +292,9 @@ async def executor_node(
+ 
+     input_mint = SOL_MINT if is_buy else order.mint
+     output_mint = order.mint if is_buy else SOL_MINT
++    broadcast_attempted = False
++    settled_buy = False
+ 
+-    taker: Optional[str] = None
+-    if config.EXECUTION_MODE == "live":
+-        keypair = Keypair.from_base58_string(config.SOLANA_PRIVATE_KEY_BS58)
+-        taker = str(keypair.pubkey())
+-
+-    owns_client = http_client is None
+-    client = http_client or httpx.AsyncClient()
+     try:
+         try:
+             order_resp = await fetch_jupiter_order(
+@@ -251,6 +320,7 @@ async def executor_node(
+             if not tx_b64:
+                 raise RuntimeError("Jupiter /swap/v2/order returned no transaction in live mode")
+             signed_b64 = sign_jupiter_transaction(tx_b64, config.SOLANA_PRIVATE_KEY_BS58)
++            broadcast_attempted = True
+             exec_resp = await execute_jupiter_signed_order(
+                 signed_tx_base64=signed_b64, request_id=request_id, config=config, client=client,
+             )
+@@ -259,9 +329,13 @@ async def executor_node(
+                 out_amount = int(exec_resp["outputAmountResult"])
+         else:
+             tx_signature = f"paper-{order.side.lower()}-{order.mint[:8]}"
+-    except BaseException:
++    except BaseException as exc:
+         if reservation_id:
+-            db.release_buy_reservation(reservation_id)
++            if broadcast_attempted:
++                # Never release a live reservation after broadcast may have occurred (E4C conservative lock; E4D adds durable reconciliation)
++                mark_buy_reservation_broadcast_unresolved(db, reservation_id, reason=f"{type(exc).__name__}: {exc}")
++            else:
++                db.release_buy_reservation(reservation_id)
+         finalize_exit_guard(db, sell_key, committed=False)
+         raise
+     finally:
+@@ -277,42 +351,51 @@ async def executor_node(
+     rationale_out = order.rationale or state.get("last_decision_rationale")
+ 
+     if is_buy:
+-        spent_sol = order.amount_atomic / LAMPORTS_PER_SOL
+-        sol_delta = -(spent_sol + tx_fee_opt) if tx_fee_opt is not None else -spent_sol
+-        pnl_delta = -tx_fee_opt if tx_fee_opt is not None else 0.0
+-        pos_strategy = order.strategy or "SCALPER"
+-        prev_reentries = (
+-            int(existing_pos_dict.get("reentry_count") or 0)
+-            if isinstance(existing_pos_dict, dict) and existing_pos_dict.get("mint") == order.mint
+-            else 0
+-        )
+-        next_reentry_count = (prev_reentries + 1) if order.reason == "LEG_2_REENTRY" else 0
+-        pos = ActivePosition(
+-            mint=order.mint, symbol=order.symbol, entry_sol=spent_sol, token_amount=out_amount,
+-            pair_address=order.pair_address, dex_id=order.dex_id,
+-            strategy=pos_strategy, triggering_wallets=list(order.triggering_wallets),
+-            whale_shadow_exit_flag=False, opened_at=utc_now_iso(),
+-            entry_liquidity_usd=order.entry_liquidity_usd, entry_mc_usd=order.entry_mc_usd,
+-            whale_sol_flow=order.whale_sol_flow, breakout_telemetry=order.breakout_telemetry,
+-            current_sol_value=spent_sol, peak_sol_value=spent_sol,
+-            partial_tp_taken=False, initial_entry_sol=spent_sol,
+-            remaining_cost_basis_sol=spent_sol, realized_partial_pnl_sol=0.0,
+-            entry_fee_sol=tx_fee_opt,
+-            accumulated_fees_sol=round(tx_fee_opt, 6) if tx_fee_opt is not None else 0.0,
+-            fee_accounting_status=tx_fee_status,
+-            breakeven_armed=False, trail_armed=False, retrace_low_sol=None, run_peak_sol=None,
+-            watch_started_at=None, reference_token_amount=out_amount,
+-            reentry_count=next_reentry_count, last_liquidity_usd=order.entry_liquidity_usd,
+-        )
+-        new_pos_dict = pos.model_dump()
+-        db.remove_from_watchlist(order.mint)
+-        settled = db.apply_trade_settlement(
+-            lane=lane_tag, side="BUY", mint=order.mint, opened_at=pos.opened_at, new_pos_dict=new_pos_dict,
+-            sol_delta=sol_delta, pnl_delta=pnl_delta, focus_state=next_state,
+-            last_decision_rationale=rationale_out, reservation_id=reservation_id,
+-            fallback_base_sol=fb_base_sol, fallback_base_pnl=fb_base_pnl,
+-        )
+-        sol_balance, daily_pnl_sol = settled["sol_balance"], settled["daily_pnl_sol"]
++        try:
++            spent_sol = order.amount_atomic / LAMPORTS_PER_SOL
++            sol_delta = -(spent_sol + tx_fee_opt) if tx_fee_opt is not None else -spent_sol
++            pnl_delta = -tx_fee_opt if tx_fee_opt is not None else 0.0
++            pos_strategy = order.strategy or "SCALPER"
++            prev_reentries = (
++                int(existing_pos_dict.get("reentry_count") or 0)
++                if isinstance(existing_pos_dict, dict) and existing_pos_dict.get("mint") == order.mint
++                else 0
++            )
++            next_reentry_count = (prev_reentries + 1) if order.reason == "LEG_2_REENTRY" else 0
++            pos = ActivePosition(
++                mint=order.mint, symbol=order.symbol, entry_sol=spent_sol, token_amount=out_amount,
++                pair_address=order.pair_address, dex_id=order.dex_id,
++                strategy=pos_strategy, triggering_wallets=list(order.triggering_wallets),
++                whale_shadow_exit_flag=False, opened_at=utc_now_iso(),
++                entry_liquidity_usd=order.entry_liquidity_usd, entry_mc_usd=order.entry_mc_usd,
++                whale_sol_flow=order.whale_sol_flow, breakout_telemetry=order.breakout_telemetry,
++                current_sol_value=spent_sol, peak_sol_value=spent_sol,
++                partial_tp_taken=False, initial_entry_sol=spent_sol,
++                remaining_cost_basis_sol=spent_sol, realized_partial_pnl_sol=0.0,
++                entry_fee_sol=tx_fee_opt,
++                accumulated_fees_sol=round(tx_fee_opt, 6) if tx_fee_opt is not None else 0.0,
++                fee_accounting_status=tx_fee_status,
++                breakeven_armed=False, trail_armed=False, retrace_low_sol=None, run_peak_sol=None,
++                watch_started_at=None, reference_token_amount=out_amount,
++                reentry_count=next_reentry_count, last_liquidity_usd=order.entry_liquidity_usd,
++            )
++            new_pos_dict = pos.model_dump()
++            db.remove_from_watchlist(order.mint)
++            settled = db.apply_trade_settlement(
++                lane=lane_tag, side="BUY", mint=order.mint, opened_at=pos.opened_at, new_pos_dict=new_pos_dict,
++                sol_delta=sol_delta, pnl_delta=pnl_delta, focus_state=next_state,
++                last_decision_rationale=rationale_out, reservation_id=reservation_id,
++                fallback_base_sol=fb_base_sol, fallback_base_pnl=fb_base_pnl,
++            )
++            settled_buy = True
++            sol_balance, daily_pnl_sol = settled["sol_balance"], settled["daily_pnl_sol"]
++        except BaseException as exc:
++            if reservation_id and not settled_buy:
++                if broadcast_attempted:
++                    mark_buy_reservation_broadcast_unresolved(db, reservation_id, reason=f"post-broadcast settlement error: {type(exc).__name__}: {exc}")
++                else:
++                    db.release_buy_reservation(reservation_id)
++            raise
+ 
+         db.log_trade(
+             mode=config.EXECUTION_MODE, side="BUY", mint=order.mint, symbol=order.symbol,
+diff --git a/state_ledger.py b/state_ledger.py
+index cf5190e..746888d 100644
+--- a/state_ledger.py
++++ b/state_ledger.py
+@@ -2,18 +2,28 @@
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import json
++import logging
++import math
++import threading
+ import time
+ import uuid
++import weakref
+ from datetime import datetime, timezone
+ from typing import Any, Optional
+ 
+ from state import FocusState
+ 
++logger = logging.getLogger(__name__)
++
+ RESERVATION_TTL_SEC = 60.0
+ SELL_GUARD_TTL_SEC = 60.0
+ SELL_GUARD_MAX = 64
+ 
++RESERVATION_STATE_ACTIVE = "ACTIVE"
++RESERVATION_STATE_BROADCAST_UNRESOLVED = "BROADCAST_UNRESOLVED"
++
+ # Guarded by db._lock: db_path -> list of {id, lane, mint, sol_amount, created_ts}
+ _inflight_buy_reservations: dict[str, list[dict[str, Any]]] = {}
+ # Shared SELL & PARTIAL_SELL idempotency guard: (db_path, lane, mint, opened_at, side_up)
+@@ -108,15 +118,81 @@ def _utc_now_iso() -> str:
+     return _utc_now().isoformat()
+ 
+ 
++def _is_reservation_owner_active(rec: dict[str, Any]) -> bool:
++    """Return True only when the reservation's owning asyncio.Task is still alive and not done."""
++    task_ref = rec.get("owner_task_ref")
++    if task_ref is None:
++        return False
++    task = task_ref()
++    return task is not None and not task.done()
++
++
++def get_inflight_buy_reservations(db_path: str) -> list[dict[str, Any]]:
++    """Return a shallow copy of current in-flight BUY reservations for inspection/tests."""
++    out: list[dict[str, Any]] = []
++    for r in _inflight_buy_reservations.get(str(db_path), []):
++        item = {k: v for k, v in r.items() if k != "owner_task_ref"}
++        item["owner_active"] = _is_reservation_owner_active(r)
++        out.append(item)
++    return out
++
++
++def _resolve_owner_task() -> tuple[Optional[weakref.ReferenceType[Any]], str]:
++    try:
++        curr_task = asyncio.current_task()
++        if curr_task is not None:
++            return weakref.ref(curr_task), f"task-{id(curr_task)}"
++    except RuntimeError:
++        pass
++    return None, f"thread-{threading.get_ident()}"
++
++
+ def _prune_reservations_locked(db_path: str, now_ts: float) -> list[dict[str, Any]]:
+-    active = [
+-        r for r in _inflight_buy_reservations.get(db_path, [])
+-        if (now_ts - float(r.get("created_ts") or 0.0)) < RESERVATION_TTL_SEC
+-    ]
++    active: list[dict[str, Any]] = []
++    for r in _inflight_buy_reservations.get(db_path, []):
++        state = str(r.get("state") or RESERVATION_STATE_ACTIVE)
++        # Never prune a potentially broadcast / unresolved live reservation (conservative E4C lock until E4D)
++        if state == RESERVATION_STATE_BROADCAST_UNRESOLVED:
++            active.append(r)
++            continue
++        # Task-owned ACTIVE reservation: keep while owning task is alive & not done; prune abandoned done tasks
++        if r.get("owner_task_ref") is not None:
++            if _is_reservation_owner_active(r):
++                active.append(r)
++            continue
++        # Non-task synchronous caller fallback: honor RESERVATION_TTL_SEC
++        if (now_ts - float(r.get("created_ts") or 0.0)) < RESERVATION_TTL_SEC:
++            active.append(r)
+     _inflight_buy_reservations[db_path] = active
+     return active
+ 
+ 
++def mark_buy_reservation_broadcast_unresolved(
++    db: Any,
++    reservation_id: Optional[str],
++    *,
++    reason: str = "",
++) -> None:
++    """Transition an in-flight BUY reservation to BROADCAST_UNRESOLVED so it remains locked until E4D reconciliation.
++
++    Note (E4C scope): This lock is in-process only; durable restart recovery belongs to E4D.
++    """
++    if not reservation_id:
++        return
++    with db._lock:
++        key = str(db.db_path)
++        for r in _inflight_buy_reservations.get(key, []):
++            if r.get("id") == reservation_id:
++                r["state"] = RESERVATION_STATE_BROADCAST_UNRESOLVED
++                r["unresolved_reason"] = reason
++                r["unresolved_at_ts"] = time.monotonic()
++                logger.warning(
++                    "[Ledger] Reservation %s (%s) transitioned to BROADCAST_UNRESOLVED (locked; reason=%s)",
++                    reservation_id, r.get("mint"), reason or "ambiguous live broadcast outcome",
++                )
++                break
++
++
+ def rollover_daily_if_needed_locked(conn: Any) -> tuple[float, float, float, str]:
+     """Ensure UTC midnight rollover is applied atomically inside db._lock.
+ 
+@@ -193,13 +269,42 @@ def reserve_buy_slot(
+     max_open_positions: int,
+     is_reentry_same_mint: bool = False,
+     fallback_state_sol: Optional[float] = None,
++    daily_max_loss_pct: Optional[float] = None,
++    live_wallet_sol: Optional[float] = None,
++    live_min_sol_reserve: float = 0.0,
++    balance_divergence_warn_sol: Optional[float] = None,
++    now_dt: Optional[datetime] = None,
++    owner_task_id: Optional[str] = None,
+ ) -> tuple[Optional[str], Optional[str]]:
+-    """Atomically verify duplicate-mint, lane/global slot caps, and free SOL (including in-flight buys).
++    """Atomically verify cooldown, daily-loss, duplicate-mint, lane/global caps, and fee-aware free SOL.
+ 
+     Returns (reservation_id, rejection_reason). If rejection_reason is not None, BUY must abort.
++    Note (E4C scope): Reservations are in-process only; durable post-broadcast recovery belongs to E4D.
+     """
+     with db._lock:
+-        sol_bal, _, daily_pnl, _ = rollover_daily_if_needed_locked(db._conn)
++        sol_bal, daily_start, daily_pnl, _ = rollover_daily_if_needed_locked(db._conn)
++
++        # Atomic cooldown check under db._lock
++        check_now = now_dt or _utc_now()
++        cd_row = db._conn.execute(
++            "SELECT expires_at FROM cooldowns WHERE mint = ?", [mint]
++        ).fetchone()
++        if cd_row and cd_row[0]:
++            try:
++                exp_dt = datetime.fromisoformat(str(cd_row[0]))
++                if exp_dt.tzinfo is None:
++                    exp_dt = exp_dt.replace(tzinfo=timezone.utc)
++                if exp_dt > check_now:
++                    return None, f"ON_COOLDOWN ({mint} until {exp_dt.isoformat()})"
++            except ValueError:
++                pass
++
++        # Atomic daily max loss circuit-breaker check under db._lock
++        if daily_max_loss_pct is not None and daily_start > 0.0:
++            max_loss_sol = daily_start * float(daily_max_loss_pct)
++            if daily_pnl <= -max_loss_sol + 1e-12:
++                return None, f"DAILY_MAX_LOSS_HIT (daily_pnl={daily_pnl:.4f} <= -{max_loss_sol:.4f})"
++
+         row = db._conn.execute(
+             "SELECT active_position_json, whale_position_json, chart_positions_json, whale_positions_json FROM agent_state WHERE id = 1"
+         ).fetchone()
+@@ -237,19 +342,45 @@ def reserve_buy_slot(
+         if (live_lane_cnt + res_lane_cnt) >= max_lane_positions or total_cnt >= max_open_positions:
+             return None, f"LANE_CAPACITY (lane={live_lane_cnt + res_lane_cnt}/{max_lane_positions}, total={total_cnt}/{max_open_positions})"
+ 
++        fee_headroom = max(0.0, float(tx_fee_sol or 0.0))
++        total_required = float(required_sol) + fee_headroom
+         reserved_sol = sum(float(r["sol_amount"]) for r in active_res)
+-        avail_sol = sol_bal - reserved_sol
+-        if avail_sol + 1e-9 < required_sol:
+-            return None, f"INSUFFICIENT_SOL (avail={avail_sol:.4f} < req={required_sol:.4f})"
++        duck_avail_sol = sol_bal - reserved_sol
++
++        if live_wallet_sol is not None:
++            if not math.isfinite(live_wallet_sol) or live_wallet_sol < 0.0:
++                return None, "INVALID_LIVE_WALLET_BALANCE"
++            if (
++                balance_divergence_warn_sol is not None
++                and abs(float(live_wallet_sol) - sol_bal) > float(balance_divergence_warn_sol)
++            ):
++                logger.warning(
++                    "[Ledger] BALANCE_DIVERGENCE mint=%s wallet_sol=%.6f duckdb_sol=%.6f diff=%.6f (threshold=%.6f; capping spend without modifying historical PnL)",
++                    mint, float(live_wallet_sol), sol_bal, float(live_wallet_sol) - sol_bal, float(balance_divergence_warn_sol),
++                )
++            wallet_avail_sol = float(live_wallet_sol) - max(0.0, float(live_min_sol_reserve)) - reserved_sol
++            effective_avail = min(duck_avail_sol, wallet_avail_sol)
++            if effective_avail + 1e-9 < total_required:
++                return None, (
++                    f"INSUFFICIENT_SOL (effective_avail={effective_avail:.4f}, "
++                    f"duck_avail={duck_avail_sol:.4f}, wallet_avail={wallet_avail_sol:.4f} "
++                    f"< req_with_fee={total_required:.4f})"
++                )
++        elif duck_avail_sol + 1e-9 < total_required:
++            return None, f"INSUFFICIENT_SOL (avail={duck_avail_sol:.4f} < req_with_fee={total_required:.4f})"
+ 
+         res_id = uuid.uuid4().hex
++        task_ref, default_tid = _resolve_owner_task()
+         active_res.append(
+             {
+                 "id": res_id,
+                 "lane": lane,
+                 "mint": mint,
+-                "sol_amount": float(required_sol + tx_fee_sol),
++                "sol_amount": total_required,
+                 "created_ts": time.monotonic(),
++                "state": RESERVATION_STATE_ACTIVE,
++                "owner_task_ref": task_ref,
++                "owner_task_id": owner_task_id or default_tid,
+             }
+         )
+         return res_id, None
+@@ -283,100 +414,112 @@ def apply_trade_settlement(
+ ) -> dict[str, Any]:
+     """Atomically apply SOL/PnL deltas and upsert/remove the target position by (mint, opened_at) under db._lock."""
+     with db._lock:
++        db._conn.execute("BEGIN TRANSACTION")
++        try:
++            sol_bal, _, daily_pnl, _ = rollover_daily_if_needed_locked(db._conn)
++            row = db._conn.execute(
++                "SELECT focus_state, active_position_json, whale_position_json, chart_positions_json, whale_positions_json FROM agent_state WHERE id = 1"
++            ).fetchone()
++            curr_focus = str(row[0])
++            act_p = json.loads(row[1]) if row[1] else None
++            wh_p = json.loads(row[2]) if row[2] else None
++            chart_list: list[dict[str, Any]] = json.loads(row[3]) if row[3] else []
++            whale_list: list[dict[str, Any]] = json.loads(row[4]) if row[4] else []
++
++            # Pristine-DB unit test compatibility when test jumps straight to SELL/PARTIAL_SELL without a prior BUY or save_state
++            if (
++                side.upper() != "BUY"
++                and fallback_base_sol is not None
++                and abs(sol_bal - float(db.starting_sol)) < 1e-9
++                and abs(daily_pnl) < 1e-9
++            ):
++                trade_cnt = int(db._conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] or 0)
++                if trade_cnt == 0:
++                    sol_bal = float(fallback_base_sol)
++                    daily_pnl = float(fallback_base_pnl or 0.0)
++
++            new_sol = round(max(0.0, sol_bal + float(sol_delta)), 6)
++            new_pnl = round(daily_pnl + float(pnl_delta), 6)
++
++            target_ref = {"mint": mint, "opened_at": opened_at or ""}
++            side_up = side.upper()
++            is_keep = side_up in ("BUY", "PARTIAL_SELL") and new_pos_dict is not None and int(new_pos_dict.get("token_amount") or 0) > 0
++
++            if lane == "whale":
++                kept = [p for p in whale_list if isinstance(p, dict) and not _pos_identity_match(p, target_ref)]
++                if is_keep and new_pos_dict is not None:
++                    kept.append(new_pos_dict)
++                kept = _merge_monotonic_shadow_flags(kept, whale_list)
++                legacy_wh = new_pos_dict if is_keep else (kept[0] if kept else None)
++                any_shadow = any(bool(p.get("whale_shadow_exit_flag", False)) for p in kept)
++                sets = [
++                    "whale_positions_json = ?", "whale_position_json = ?",
++                    "sol_balance = ?", "daily_pnl_sol = ?",
++                    "whale_shadow_exit_requested = ?", "updated_at = ?",
++                ]
++                params: list[Any] = [
++                    json.dumps(kept), json.dumps(legacy_wh) if legacy_wh is not None else None,
++                    new_sol, new_pnl, any_shadow, _utc_now_iso(),
++                ]
++                if last_decision_rationale is not None:
++                    sets.append("last_decision_rationale = ?")
++                    params.append(last_decision_rationale)
++                db._conn.execute(f"UPDATE agent_state SET {', '.join(sets)} WHERE id = 1", params)
++                result_payload = {
++                    "focus_state": curr_focus, "sol_balance": new_sol, "daily_pnl_sol": new_pnl,
++                    "active_position": act_p, "chart_positions": chart_list,
++                    "whale_position": legacy_wh, "whale_positions": kept,
++                }
++            else:
++                kept_c = [p for p in chart_list if isinstance(p, dict) and not _pos_identity_match(p, target_ref)]
++                if is_keep and new_pos_dict is not None:
++                    kept_c.append(new_pos_dict)
++                kept_c = _merge_monotonic_shadow_flags(kept_c, chart_list)
++
++                next_focus = focus_state or curr_focus
++                if new_pos_dict is not None and next_focus == FocusState.WATCHING_REENTRY.value:
++                    legacy_act = new_pos_dict
++                elif is_keep and new_pos_dict is not None:
++                    legacy_act = new_pos_dict
++                    next_focus = FocusState.IN_POSITION.value
++                elif kept_c:
++                    legacy_act = kept_c[0]
++                    next_focus = FocusState.IN_POSITION.value
++                else:
++                    legacy_act = new_pos_dict
++                    if legacy_act is None and next_focus != FocusState.WATCHING_REENTRY.value:
++                        next_focus = FocusState.SCANNING.value
++
++                sets_c = [
++                    "chart_positions_json = ?", "active_position_json = ?",
++                    "focus_state = ?", "sol_balance = ?", "daily_pnl_sol = ?", "updated_at = ?",
++                ]
++                params_c: list[Any] = [
++                    json.dumps(kept_c), json.dumps(legacy_act) if legacy_act is not None else None,
++                    next_focus, new_sol, new_pnl, _utc_now_iso(),
++                ]
++                if last_decision_rationale is not None:
++                    sets_c.append("last_decision_rationale = ?")
++                    params_c.append(last_decision_rationale)
++                db._conn.execute(f"UPDATE agent_state SET {', '.join(sets_c)} WHERE id = 1", params_c)
++                result_payload = {
++                    "focus_state": next_focus, "sol_balance": new_sol, "daily_pnl_sol": new_pnl,
++                    "active_position": legacy_act, "chart_positions": kept_c,
++                    "whale_position": wh_p, "whale_positions": whale_list,
++                }
++
++            db._conn.execute("COMMIT")
++        except BaseException:
++            try:
++                db._conn.execute("ROLLBACK")
++            except Exception:
++                pass
++            raise
++
++        # Release BUY reservation ONLY after DuckDB transaction commits, while still holding db._lock
+         if reservation_id:
+             release_buy_reservation(db, reservation_id)
+-
+-        sol_bal, _, daily_pnl, _ = rollover_daily_if_needed_locked(db._conn)
+-        row = db._conn.execute(
+-            "SELECT focus_state, active_position_json, whale_position_json, chart_positions_json, whale_positions_json FROM agent_state WHERE id = 1"
+-        ).fetchone()
+-        curr_focus = str(row[0])
+-        act_p = json.loads(row[1]) if row[1] else None
+-        wh_p = json.loads(row[2]) if row[2] else None
+-        chart_list: list[dict[str, Any]] = json.loads(row[3]) if row[3] else []
+-        whale_list: list[dict[str, Any]] = json.loads(row[4]) if row[4] else []
+-
+-        # Pristine-DB unit test compatibility when test jumps straight to SELL/PARTIAL_SELL without a prior BUY or save_state
+-        if (
+-            side.upper() != "BUY"
+-            and fallback_base_sol is not None
+-            and abs(sol_bal - float(db.starting_sol)) < 1e-9
+-            and abs(daily_pnl) < 1e-9
+-        ):
+-            trade_cnt = int(db._conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] or 0)
+-            if trade_cnt == 0:
+-                sol_bal = float(fallback_base_sol)
+-                daily_pnl = float(fallback_base_pnl or 0.0)
+-
+-        new_sol = round(max(0.0, sol_bal + float(sol_delta)), 6)
+-        new_pnl = round(daily_pnl + float(pnl_delta), 6)
+-
+-        target_ref = {"mint": mint, "opened_at": opened_at or ""}
+-        side_up = side.upper()
+-        is_keep = side_up in ("BUY", "PARTIAL_SELL") and new_pos_dict is not None and int(new_pos_dict.get("token_amount") or 0) > 0
+-
+-        if lane == "whale":
+-            kept = [p for p in whale_list if isinstance(p, dict) and not _pos_identity_match(p, target_ref)]
+-            if is_keep and new_pos_dict is not None:
+-                kept.append(new_pos_dict)
+-            kept = _merge_monotonic_shadow_flags(kept, whale_list)
+-            legacy_wh = new_pos_dict if is_keep else (kept[0] if kept else None)
+-            any_shadow = any(bool(p.get("whale_shadow_exit_flag", False)) for p in kept)
+-            sets = [
+-                "whale_positions_json = ?", "whale_position_json = ?",
+-                "sol_balance = ?", "daily_pnl_sol = ?",
+-                "whale_shadow_exit_requested = ?", "updated_at = ?",
+-            ]
+-            params: list[Any] = [
+-                json.dumps(kept), json.dumps(legacy_wh) if legacy_wh is not None else None,
+-                new_sol, new_pnl, any_shadow, _utc_now_iso(),
+-            ]
+-            if last_decision_rationale is not None:
+-                sets.append("last_decision_rationale = ?")
+-                params.append(last_decision_rationale)
+-            db._conn.execute(f"UPDATE agent_state SET {', '.join(sets)} WHERE id = 1", params)
+-            return {
+-                "focus_state": curr_focus, "sol_balance": new_sol, "daily_pnl_sol": new_pnl,
+-                "active_position": act_p, "chart_positions": chart_list,
+-                "whale_position": legacy_wh, "whale_positions": kept,
+-            }
+-
+-        kept_c = [p for p in chart_list if isinstance(p, dict) and not _pos_identity_match(p, target_ref)]
+-        if is_keep and new_pos_dict is not None:
+-            kept_c.append(new_pos_dict)
+-        kept_c = _merge_monotonic_shadow_flags(kept_c, chart_list)
+-
+-        next_focus = focus_state or curr_focus
+-        if new_pos_dict is not None and next_focus == FocusState.WATCHING_REENTRY.value:
+-            legacy_act = new_pos_dict
+-        elif is_keep and new_pos_dict is not None:
+-            legacy_act = new_pos_dict
+-            next_focus = FocusState.IN_POSITION.value
+-        elif kept_c:
+-            legacy_act = kept_c[0]
+-            next_focus = FocusState.IN_POSITION.value
+-        else:
+-            legacy_act = new_pos_dict
+-            if legacy_act is None and next_focus != FocusState.WATCHING_REENTRY.value:
+-                next_focus = FocusState.SCANNING.value
+-
+-        sets_c = [
+-            "chart_positions_json = ?", "active_position_json = ?",
+-            "focus_state = ?", "sol_balance = ?", "daily_pnl_sol = ?", "updated_at = ?",
+-        ]
+-        params_c: list[Any] = [
+-            json.dumps(kept_c), json.dumps(legacy_act) if legacy_act is not None else None,
+-            next_focus, new_sol, new_pnl, _utc_now_iso(),
+-        ]
+-        if last_decision_rationale is not None:
+-            sets_c.append("last_decision_rationale = ?")
+-            params_c.append(last_decision_rationale)
+-        db._conn.execute(f"UPDATE agent_state SET {', '.join(sets_c)} WHERE id = 1", params_c)
+-        return {
+-            "focus_state": next_focus, "sol_balance": new_sol, "daily_pnl_sol": new_pnl,
+-            "active_position": legacy_act, "chart_positions": kept_c,
+-            "whale_position": wh_p, "whale_positions": whale_list,
+-        }
++        return result_payload
+ 
+ 
+ def update_lane_positions_only(
+diff --git a/tests/test_alpha_and_executor.py b/tests/test_alpha_and_executor.py
+index 647421a..beb6c75 100644
+--- a/tests/test_alpha_and_executor.py
++++ b/tests/test_alpha_and_executor.py
+@@ -167,6 +167,7 @@ async def test_executor_live_mode_passes_taker_signs_and_executes(tmp_path):
+         EXECUTION_MODE="live",
+         JUPITER_API_KEY="jup-live-key",
+         SOLANA_PRIVATE_KEY_BS58=str(kp),
++        SOLANA_RPC_URL="https://rpc.example.test",
+     )
+ 
+     # Build a valid unsigned VersionedTransaction for the mock Jupiter response
+@@ -178,6 +179,8 @@ async def test_executor_live_mode_passes_taker_signs_and_executes(tmp_path):
+     calls: list[str] = []
+ 
+     def handler(request: httpx.Request) -> httpx.Response:
++        if str(request.url).startswith("https://rpc.example.test"):
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 700_000_000}})
+         calls.append(f"{request.method} {request.url.path}")
+         if request.url.path == "/swap/v2/order":
+             assert request.url.params.get("taker") == str(kp.pubkey())
+diff --git a/tests/test_e2b_fee_accounting.py b/tests/test_e2b_fee_accounting.py
+index 0fd456f..5bf16aa 100644
+--- a/tests/test_e2b_fee_accounting.py
++++ b/tests/test_e2b_fee_accounting.py
+@@ -217,6 +217,7 @@ async def test_e2b_live_unknown_fee_remains_null_and_historical_migration_preser
+     kp = Keypair()
+     cfg_live = AgentConfig(
+         _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
++        SOLANA_RPC_URL="https://rpc.example.test",
+     )
+ 
+     from solders.message import MessageV0
+@@ -226,6 +227,8 @@ async def test_e2b_live_unknown_fee_remains_null_and_historical_migration_preser
+     unsigned_tx = base64.b64encode(bytes(VersionedTransaction(msg, [kp]))).decode("ascii")
+ 
+     def live_handler(request: httpx.Request) -> httpx.Response:
++        if str(request.url).startswith("https://rpc.example.test"):
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
+         if "/swap/v2/order" in str(request.url):
+             return httpx.Response(200, json={"outAmount": "1000000", "transaction": unsigned_tx, "requestId": "req-1"})
+         return httpx.Response(200, json={"signature": "LiveSig111", "outputAmountResult": "1000000"})
+@@ -521,6 +524,7 @@ async def test_e2b_c2_live_unknown_fees_no_zero_substitution(tmp_path, monkeypat
+     cfg = AgentConfig(
+         _env_file=None, EXECUTION_MODE="live",
+         SOLANA_PRIVATE_KEY_BS58=str(kp), JUPITER_API_KEY="k", PAPER_TX_FEE_SOL=0.001,
++        SOLANA_RPC_URL="https://rpc.example.test",
+     )
+ 
+     monkeypatch.setattr("executor_node.sign_jupiter_transaction", lambda tx, k: "signed-b64")
+@@ -533,6 +537,8 @@ async def test_e2b_c2_live_unknown_fees_no_zero_substitution(tmp_path, monkeypat
+     sell_calls = {"n": 0}
+ 
+     def handler(request: httpx.Request) -> httpx.Response:
++        if str(request.url).startswith("https://rpc.example.test"):
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 3_000_000_000}})
+         if request.url.params.get("inputMint") == SOL_MINT:
+             return httpx.Response(200, json={"outAmount": "1000000", "transaction": "tx-buy", "requestId": "rb"})
+         sell_calls["n"] += 1
+diff --git a/tests/test_e4c_reservation_risk.py b/tests/test_e4c_reservation_risk.py
+new file mode 100644
+index 0000000..bcef3bb
+--- /dev/null
++++ b/tests/test_e4c_reservation_risk.py
+@@ -0,0 +1,534 @@
++"""Phase E4C Tests: Reservation, Spendable Balance & Risk Guard Integrity."""
++
++from __future__ import annotations
++
++import asyncio
++import base64
++import logging
++import time
++from datetime import datetime, timedelta, timezone
++from typing import Any
++
++import httpx
++import pytest
++from solders.hash import Hash
++from solders.keypair import Keypair
++from solders.message import MessageV0
++from solders.transaction import VersionedTransaction
++
++from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
++from db import AgentDatabase
++from executor_node import clear_sell_idempotency_guard, executor_node
++from state import FocusState, PendingOrder
++from state_ledger import (
++    RESERVATION_STATE_ACTIVE,
++    RESERVATION_STATE_BROADCAST_UNRESOLVED,
++    RESERVATION_TTL_SEC,
++    _inflight_buy_reservations,
++    clear_buy_reservations,
++    get_inflight_buy_reservations,
++)
++
++POOL_A = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi"
++POOL_B = "7qbRF6YsyGuLUVs6Y1q64bdVrfe4ZcUUz1JRdoVNUJnm"
++MINT_A = "p2Yicb86aZig616Eav2VWG9vuXR5mEqhtzshZYBxzsV"
++MINT_B = "So11111111111111111111111111111111111111113"
++RPC_URL = "https://rpc.e4c.test"
++
++
++def _mk_buy_order(
++    mint: str = MINT_A,
++    symbol: str = "E4C",
++    pair_address: str = POOL_A,
++    amount_sol: float = 0.50,
++    strategy: str = "BREAKOUT_IGNITION",
++) -> dict[str, Any]:
++    return PendingOrder(
++        side="BUY",
++        mint=mint,
++        symbol=symbol,
++        pair_address=pair_address,
++        dex_id="pumpswap",
++        amount_atomic=int(round(amount_sol * LAMPORTS_PER_SOL)),
++        reason="DECISION_1_ENTRY",
++        target_state_after_fill=FocusState.IN_POSITION,
++        entry_liquidity_usd=80_000.0,
++        entry_mc_usd=500_000.0,
++        strategy=strategy,
++    ).model_dump()
++
++
++def _mk_unsigned_tx(kp: Keypair) -> str:
++    msg = MessageV0.try_compile(kp.pubkey(), [], [], Hash.default())
++    return base64.b64encode(bytes(VersionedTransaction(msg, [kp]))).decode("ascii")
++
++
++def test_e4c_config_validates_live_rpc_url():
++    """Live mode requires a valid http(s):// SOLANA_RPC_URL; malformed URL fails validation."""
++    kp = Keypair()
++    with pytest.raises(ValueError, match="SOLANA_RPC_URL"):
++        AgentConfig(_env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp), SOLANA_RPC_URL="")
++    with pytest.raises(ValueError, match="SOLANA_RPC_URL"):
++        AgentConfig(_env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp), SOLANA_RPC_URL="wss://bad.url")
++    with pytest.raises(ValueError, match="SOLANA_RPC_URL"):
++        AgentConfig(_env_file=None, EXECUTION_MODE="paper", SOLANA_RPC_URL="ftp://bad.url")
++
++    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp), SOLANA_RPC_URL=RPC_URL)
++    assert cfg.SOLANA_RPC_URL == RPC_URL
++    assert cfg.LIVE_MIN_SOL_RESERVE >= 0.0
++    assert cfg.LIVE_FEE_RESERVATION_BUFFER_SOL >= 0.0
++
++
++def test_e4c_paper_fee_aware_reservation_enforces_required_plus_fee(tmp_path):
++    """Paper reservation rejects when avail_sol < required_sol + PAPER_TX_FEE_SOL and reserves full sum."""
++    clear_buy_reservations()
++    db = AgentDatabase(db_path=str(tmp_path / "e4c_paper_fee.duckdb"), starting_sol=0.5005)
++    res_id, rej = db.reserve_buy_slot(
++        lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.001,
++        max_lane_positions=3, max_open_positions=6,
++    )
++    assert res_id is None
++    assert rej is not None and "INSUFFICIENT_SOL" in rej
++
++    db2 = AgentDatabase(db_path=str(tmp_path / "e4c_paper_fee_ok.duckdb"), starting_sol=0.501)
++    res_ok, rej_ok = db2.reserve_buy_slot(
++        lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.001,
++        max_lane_positions=3, max_open_positions=6,
++    )
++    assert res_ok is not None and rej_ok is None
++    inflight = get_inflight_buy_reservations(str(db2.db_path))
++    assert len(inflight) == 1
++    assert inflight[0]["sol_amount"] == pytest.approx(0.501)
++    assert inflight[0]["state"] == RESERVATION_STATE_ACTIVE
++    assert inflight[0]["owner_task_id"]
++    db.close()
++    db2.close()
++
++
++@pytest.mark.asyncio
++async def test_e4c_live_rpc_balance_success_insufficient_timeout_and_error(tmp_path):
++    """Live BUY verifies RPC getBalance, enforces reserve+buffer, never stores buffer as fee, fails closed on timeout/error."""
++    clear_buy_reservations()
++    clear_sell_idempotency_guard()
++    kp = Keypair()
++    unsigned_tx = _mk_unsigned_tx(kp)
++    cfg = AgentConfig(
++        _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
++        SOLANA_RPC_URL=RPC_URL, LIVE_MIN_SOL_RESERVE=0.05, LIVE_FEE_RESERVATION_BUFFER_SOL=0.01,
++    )
++
++    # 1. Success: wallet has 0.56 SOL -> 0.56 - 0.05 reserve = 0.51 >= 0.50 + 0.01 buffer
++    db = AgentDatabase(db_path=str(tmp_path / "e4c_live_ok.duckdb"), starting_sol=1.0)
++    rpc_mode = {"mode": "ok", "lamports": int(0.56 * LAMPORTS_PER_SOL)}
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        if str(request.url).startswith(RPC_URL):
++            if rpc_mode["mode"] == "timeout":
++                raise httpx.ReadTimeout("RPC timed out")
++            if rpc_mode["mode"] == "rpc_error":
++                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "unhealthy"}})
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": rpc_mode["lamports"]}})
++        if "/swap/v2/order" in str(request.url):
++            return httpx.Response(200, json={"outAmount": "1000000", "transaction": unsigned_tx, "requestId": "r1"})
++        return httpx.Response(200, json={"signature": "SigOk111", "outputAmountResult": "1000000"})
++
++    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
++        # Insufficient wallet funds (0.555 - 0.05 = 0.505 < 0.51) -> blocked before Jupiter quote
++        rpc_mode["lamports"] = int(0.555 * LAMPORTS_PER_SOL)
++        out_insuff = await executor_node(
++            {"focus_state": FocusState.SCANNING.value, "sol_balance": 1.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order()},
++            config=cfg, db=db, http_client=client,
++        )
++        assert out_insuff == {"pending_order": None}
++        assert get_inflight_buy_reservations(str(db.db_path)) == []
++
++        # RPC timeout -> fail closed
++        rpc_mode["mode"] = "timeout"
++        out_to = await executor_node(
++            {"focus_state": FocusState.SCANNING.value, "sol_balance": 1.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order()},
++            config=cfg, db=db, http_client=client,
++        )
++        assert out_to == {"pending_order": None}
++
++        # RPC error -> fail closed
++        rpc_mode["mode"] = "rpc_error"
++        out_err = await executor_node(
++            {"focus_state": FocusState.SCANNING.value, "sol_balance": 1.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order()},
++            config=cfg, db=db, http_client=client,
++        )
++        assert out_err == {"pending_order": None}
++
++        # Valid sufficient balance (0.56 SOL) -> succeeds and NEVER persists fee buffer as observed fee
++        rpc_mode["mode"] = "ok"
++        rpc_mode["lamports"] = int(0.56 * LAMPORTS_PER_SOL)
++        out_ok = await executor_node(
++            {"focus_state": FocusState.SCANNING.value, "sol_balance": 1.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order()},
++            config=cfg, db=db, http_client=client,
++        )
++        assert len(out_ok["chart_positions"]) == 1
++        pos = out_ok["chart_positions"][0]
++        assert pos["entry_fee_sol"] is None
++        assert pos["fee_accounting_status"] == "UNKNOWN"
++        assert out_ok["last_execution"]["tx_fee_sol"] is None
++        assert out_ok["last_execution"]["fee_status"] == "UNKNOWN"
++        assert get_inflight_buy_reservations(str(db.db_path)) == []
++    db.close()
++
++
++def test_e4c_balance_divergence_warning_and_no_double_counting_inflight_reservations(tmp_path, caplog):
++    """Divergence logs BALANCE_DIVERGENCE without altering PnL; in-flight reservations are counted exactly once."""
++    clear_buy_reservations()
++    db = AgentDatabase(db_path=str(tmp_path / "e4c_div.duckdb"), starting_sol=1.50)
++
++    # Wallet has 1.20 SOL vs DuckDB 1.50 SOL (diff=-0.30 > 0.02 warn)
++    with caplog.at_level(logging.WARNING):
++        res1, rej1 = db.reserve_buy_slot(
++            lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.01,
++            max_lane_positions=3, max_open_positions=6,
++            live_wallet_sol=1.20, live_min_sol_reserve=0.05, balance_divergence_warn_sol=0.02,
++        )
++    assert res1 is not None and rej1 is None
++    assert "BALANCE_DIVERGENCE" in caplog.text
++    assert db.get_state()["daily_pnl_sol"] == pytest.approx(0.0)  # historical PnL untouched
++
++    # Second reservation sees wallet_avail = 1.20 - 0.05 - 0.51 = 0.64 >= 0.51 (no double counting of 0.51!)
++    res2, rej2 = db.reserve_buy_slot(
++        lane="chart", mint=MINT_B, required_sol=0.50, tx_fee_sol=0.01,
++        max_lane_positions=3, max_open_positions=6,
++        live_wallet_sol=1.20, live_min_sol_reserve=0.05, balance_divergence_warn_sol=0.02,
++    )
++    assert res2 is not None and rej2 is None
++
++    # Third reservation sees wallet_avail = 1.20 - 0.05 - 1.02 = 0.13 < 0.51 -> rejected
++    res3, rej3 = db.reserve_buy_slot(
++        lane="chart", mint="MintC11111111111111111111111111111111111111", required_sol=0.50, tx_fee_sol=0.01,
++        max_lane_positions=3, max_open_positions=6,
++        live_wallet_sol=1.20, live_min_sol_reserve=0.05, balance_divergence_warn_sol=0.02,
++    )
++    assert res3 is None and rej3 is not None and "INSUFFICIENT_SOL" in rej3
++    db.close()
++
++
++def test_e4c_atomic_cooldown_and_daily_max_loss_guards(tmp_path):
++    """reserve_buy_slot enforces cooldowns and DAILY_MAX_LOSS_PCT atomically under db._lock."""
++    clear_buy_reservations()
++    db = AgentDatabase(db_path=str(tmp_path / "e4c_risk.duckdb"), starting_sol=2.0)
++    now = datetime(2026, 11, 27, 15, 0, 0, tzinfo=timezone.utc)
++
++    # 1. Active cooldown blocks reservation
++    db.set_cooldown(MINT_A, hours=1.0, reason="HARD_STOP_LOSS", now=now)
++    r_cd, rej_cd = db.reserve_buy_slot(
++        lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.001,
++        max_lane_positions=3, max_open_positions=6, daily_max_loss_pct=0.20, now_dt=now + timedelta(minutes=10),
++    )
++    assert r_cd is None and rej_cd is not None and "ON_COOLDOWN" in rej_cd
++
++    # Expired cooldown allows reservation
++    r_exp, rej_exp = db.reserve_buy_slot(
++        lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.001,
++        max_lane_positions=3, max_open_positions=6, daily_max_loss_pct=0.20, now_dt=now + timedelta(hours=2),
++    )
++    assert r_exp is not None and rej_exp is None
++    db.release_buy_reservation(r_exp)
++
++    # 2. DAILY_MAX_LOSS_PCT breach (-0.40 on 2.0 start = -20%) blocks reservation
++    db.save_lane_positions(lane="chart", positions=[], sol_balance=1.60, daily_pnl_sol=-0.40)
++    r_dl, rej_dl = db.reserve_buy_slot(
++        lane="chart", mint=MINT_B, required_sol=0.50, tx_fee_sol=0.001,
++        max_lane_positions=3, max_open_positions=6, daily_max_loss_pct=0.20, now_dt=now,
++    )
++    assert r_dl is None and rej_dl is not None and "DAILY_MAX_LOSS_HIT" in rej_dl
++    db.close()
++
++
++@pytest.mark.asyncio
++async def test_e4c_active_coroutine_survives_ttl_and_done_task_prunes_abandoned_reservation(tmp_path):
++    """Active asyncio.Task survives TTL; once that task completes without releasing, abandoned pre-broadcast reservation is pruned."""
++    clear_buy_reservations()
++    db = AgentDatabase(db_path=str(tmp_path / "e4c_ttl.duckdb"), starting_sol=2.0)
++
++    reserved_ev = asyncio.Event()
++    finish_ev = asyncio.Event()
++
++    async def _worker() -> str:
++        res1, rej1 = db.reserve_buy_slot(
++            lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.001,
++            max_lane_positions=1, max_open_positions=6,
++        )
++        assert res1 is not None and rej1 is None
++        reserved_ev.set()
++        await finish_ev.wait()
++        return res1  # Intentionally exits without releasing to simulate abandoned pre-broadcast task
++
++    task = asyncio.create_task(_worker())
++    await reserved_ev.wait()
++
++    # Simulate > RESERVATION_TTL_SEC elapsed while owning task is still active
++    _inflight_buy_reservations[str(db.db_path)][0]["created_ts"] = time.monotonic() - (RESERVATION_TTL_SEC + 30.0)
++    inflight_now = get_inflight_buy_reservations(str(db.db_path))
++    assert inflight_now[0]["owner_active"] is True
++    assert inflight_now[0]["state"] == RESERVATION_STATE_ACTIVE
++
++    # Concurrent attempt must NOT prune active task's reservation
++    res2, rej2 = db.reserve_buy_slot(
++        lane="chart", mint=MINT_B, required_sol=0.50, tx_fee_sol=0.001,
++        max_lane_positions=1, max_open_positions=6,
++    )
++    assert res2 is None and rej2 is not None and "LANE_CAPACITY" in rej2
++
++    # Complete owning task without releasing -> abandoned ACTIVE reservation must be pruned on next reserve
++    finish_ev.set()
++    await task
++    res3, rej3 = db.reserve_buy_slot(
++        lane="chart", mint=MINT_B, required_sol=0.50, tx_fee_sol=0.001,
++        max_lane_positions=1, max_open_positions=6,
++    )
++    assert res3 is not None and rej3 is None
++    db.release_buy_reservation(res3)
++    assert get_inflight_buy_reservations(str(db.db_path)) == []
++    db.close()
++
++
++@pytest.mark.asyncio
++async def test_e4c_prebroadcast_cancellation_and_post_quote_exception_release_reservation(tmp_path):
++    """Pre-broadcast CancelledError and post-quote/pre-broadcast exceptions release reservation cleanly."""
++    clear_buy_reservations()
++    clear_sell_idempotency_guard()
++    kp = Keypair()
++    db = AgentDatabase(db_path=str(tmp_path / "e4c_cancel.duckdb"), starting_sol=2.0)
++    cfg = AgentConfig(
++        _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp), SOLANA_RPC_URL=RPC_URL,
++    )
++
++    # 1. Pre-broadcast CancelledError during quote fetch releases reservation
++    async def _cancel_transport(request: httpx.Request) -> httpx.Response:
++        if str(request.url).startswith(RPC_URL):
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
++        await asyncio.sleep(5.0)
++        return httpx.Response(200, json={"outAmount": "1000000"})
++
++    async with httpx.AsyncClient(transport=httpx.MockTransport(_cancel_transport)) as client:
++        t = asyncio.create_task(
++            executor_node(
++                {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order()},
++                config=cfg, db=db, http_client=client,
++            )
++        )
++        await asyncio.sleep(0.05)
++        t.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await t
++    assert get_inflight_buy_reservations(str(db.db_path)) == []
++
++    # 2. Exception after quote retrieval but before broadcast (missing tx in live mode) releases reservation
++    def _no_tx_handler(request: httpx.Request) -> httpx.Response:
++        if str(request.url).startswith(RPC_URL):
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
++        return httpx.Response(200, json={"outAmount": "1000000", "transaction": None, "requestId": "req-no-tx"})
++
++    async with httpx.AsyncClient(transport=httpx.MockTransport(_no_tx_handler)) as client:
++        with pytest.raises(RuntimeError, match="no transaction"):
++            await executor_node(
++                {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order()},
++                config=cfg, db=db, http_client=client,
++            )
++    assert get_inflight_buy_reservations(str(db.db_path)) == []
++    db.close()
++
++
++@pytest.mark.asyncio
++async def test_e4c_potentially_broadcast_live_timeout_remains_locked_past_task_end_and_ttl(tmp_path):
++    """Live timeout during /swap/v2/execute transitions reservation to BROADCAST_UNRESOLVED and stays locked."""
++    clear_buy_reservations()
++    clear_sell_idempotency_guard()
++    kp = Keypair()
++    unsigned_tx = _mk_unsigned_tx(kp)
++    db = AgentDatabase(db_path=str(tmp_path / "e4c_unres.duckdb"), starting_sol=2.0)
++    cfg = AgentConfig(
++        _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
++        SOLANA_RPC_URL=RPC_URL, MAX_CHART_POSITIONS=3,
++    )
++
++    def _timeout_exec_handler(request: httpx.Request) -> httpx.Response:
++        if str(request.url).startswith(RPC_URL):
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
++        if "/swap/v2/order" in str(request.url):
++            return httpx.Response(200, json={"outAmount": "1000000", "transaction": unsigned_tx, "requestId": "req-to"})
++        raise httpx.ReadTimeout("execute timed out after broadcast")
++
++    async with httpx.AsyncClient(transport=httpx.MockTransport(_timeout_exec_handler)) as client:
++        task = asyncio.create_task(
++            executor_node(
++                {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order(mint=MINT_A)},
++                config=cfg, db=db, http_client=client,
++            )
++        )
++        with pytest.raises(httpx.ReadTimeout):
++            await task
++
++    # Even though task is done AND TTL has elapsed, BROADCAST_UNRESOLVED reservation must stay locked!
++    _inflight_buy_reservations[str(db.db_path)][0]["created_ts"] = time.monotonic() - (RESERVATION_TTL_SEC + 120.0)
++    inflight = get_inflight_buy_reservations(str(db.db_path))
++    assert len(inflight) == 1
++    assert inflight[0]["state"] == RESERVATION_STATE_BROADCAST_UNRESOLVED
++    assert inflight[0]["owner_active"] is False
++
++    # Duplicate BUY on MINT_A must be blocked!
++    res_dup, rej_dup = db.reserve_buy_slot(
++        lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.01,
++        max_lane_positions=3, max_open_positions=6,
++    )
++    assert res_dup is None and rej_dup is not None and "DUPLICATE_MINT" in rej_dup
++    db.close()
++
++
++@pytest.mark.asyncio
++async def test_e4c_concurrent_buys_rpc_outside_lock_and_release_on_prebroadcast_abort(tmp_path):
++    """Concurrent BUYs serialize atomically; RPC getBalance executes outside db._lock; abort releases reservation."""
++    clear_buy_reservations()
++    clear_sell_idempotency_guard()
++    kp = Keypair()
++    unsigned_tx = _mk_unsigned_tx(kp)
++    db = AgentDatabase(db_path=str(tmp_path / "e4c_conc.duckdb"), starting_sol=2.0)
++    cfg = AgentConfig(
++        _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
++        SOLANA_RPC_URL=RPC_URL, MAX_CHART_POSITIONS=1,
++    )
++
++    lock_was_free_during_rpc: list[bool] = []
++    fail_quote = {"flag": False}
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        if str(request.url).startswith(RPC_URL):
++            # Verify db._lock is NOT held during the RPC call (check from another thread to defeat RLock re-entrancy)
++            import threading
++
++            other_thread_acquired: list[bool] = []
++
++            def _probe() -> None:
++                got = db._lock.acquire(blocking=False)
++                if got:
++                    db._lock.release()
++                other_thread_acquired.append(got)
++
++            t = threading.Thread(target=_probe)
++            t.start()
++            t.join()
++            lock_was_free_during_rpc.append(other_thread_acquired[0])
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
++        if "/swap/v2/order" in str(request.url):
++            if fail_quote["flag"]:
++                return httpx.Response(500, json={"error": "quote down"})
++            return httpx.Response(200, json={"outAmount": "1000000", "transaction": unsigned_tx, "requestId": "r-conc"})
++        return httpx.Response(200, json={"signature": "SigConc111", "outputAmountResult": "1000000"})
++
++    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
++        # 1. Pre-broadcast quote failure releases reservation cleanly
++        fail_quote["flag"] = True
++        with pytest.raises(httpx.HTTPStatusError):
++            await executor_node(
++                {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order()},
++                config=cfg, db=db, http_client=client,
++            )
++        assert get_inflight_buy_reservations(str(db.db_path)) == []
++        assert all(lock_was_free_during_rpc)
++
++        # 2. Two concurrent BUYs with MAX_CHART_POSITIONS=1 -> exactly one succeeds
++        fail_quote["flag"] = False
++        r1, r2 = await asyncio.gather(
++            executor_node(
++                {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order(mint=MINT_A, symbol="A", pair_address=POOL_A)},
++                config=cfg, db=db, http_client=client,
++            ),
++            executor_node(
++                {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order(mint=MINT_B, symbol="B", pair_address=POOL_B)},
++                config=cfg, db=db, http_client=client,
++            ),
++        )
++        assert len(db.get_state()["chart_positions"]) == 1
++        assert get_inflight_buy_reservations(str(db.db_path)) == []
++        assert (r1 == {"pending_order": None}) ^ (r2 == {"pending_order": None})
++    db.close()
++
++
++@pytest.mark.asyncio
++async def test_e4c_post_broadcast_settlement_failure_retains_reservation_and_rolls_back_db(tmp_path, monkeypatch):
++    """Post-broadcast DuckDB settlement failure rolls back DB, keeps reservation, marks BROADCAST_UNRESOLVED, and blocks duplicate BUY."""
++    clear_buy_reservations()
++    clear_sell_idempotency_guard()
++    kp = Keypair()
++    unsigned_tx = _mk_unsigned_tx(kp)
++    db = AgentDatabase(db_path=str(tmp_path / "e4c_settle_fail.duckdb"), starting_sol=2.0)
++    cfg = AgentConfig(
++        _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
++        SOLANA_RPC_URL=RPC_URL, MAX_CHART_POSITIONS=3,
++    )
++
++    # 1. Direct apply_trade_settlement failure: reservation stays present and DB rolls back cleanly
++    res_id, rej = db.reserve_buy_slot(
++        lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.01,
++        max_lane_positions=3, max_open_positions=6,
++    )
++    assert res_id is not None and rej is None
++
++    import state_ledger
++    orig_merge = state_ledger._merge_monotonic_shadow_flags
++
++    def _boom_merge(*args, **kwargs):
++        raise RuntimeError("simulated DuckDB settlement failure")
++
++    monkeypatch.setattr(state_ledger, "_merge_monotonic_shadow_flags", _boom_merge)
++    with pytest.raises(RuntimeError, match="simulated DuckDB settlement failure"):
++        state_ledger.apply_trade_settlement(
++            db, lane="chart", side="BUY", mint=MINT_A, opened_at="2026-11-27T16:00:00+00:00",
++            new_pos_dict={"mint": MINT_A, "symbol": "E4C", "token_amount": 1_000_000},
++            sol_delta=-0.50, pnl_delta=0.0, focus_state=FocusState.IN_POSITION.value,
++            reservation_id=res_id,
++        )
++    # Reservation MUST still be present after failed settlement; DB MUST be rolled back
++    assert len(get_inflight_buy_reservations(str(db.db_path))) == 1
++    assert db.get_state()["sol_balance"] == pytest.approx(2.0)
++    assert db.get_state()["chart_positions"] == []
++    db.release_buy_reservation(res_id)
++
++    # 2. End-to-end live executor_node post-broadcast settlement failure -> transitions to BROADCAST_UNRESOLVED
++    def _ok_handler(request: httpx.Request) -> httpx.Response:
++        if str(request.url).startswith(RPC_URL):
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
++        if "/swap/v2/order" in str(request.url):
++            return httpx.Response(200, json={"outAmount": "1000000", "transaction": unsigned_tx, "requestId": "req-sf"})
++        return httpx.Response(200, json={"signature": "SigSettleFail111", "outputAmountResult": "1000000"})
++
++    async with httpx.AsyncClient(transport=httpx.MockTransport(_ok_handler)) as client:
++        with pytest.raises(RuntimeError, match="simulated DuckDB settlement failure"):
++            await executor_node(
++                {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order(mint=MINT_A)},
++                config=cfg, db=db, http_client=client,
++            )
++
++    inflight = get_inflight_buy_reservations(str(db.db_path))
++    assert len(inflight) == 1
++    assert inflight[0]["state"] == RESERVATION_STATE_BROADCAST_UNRESOLVED
++    assert db.get_state()["sol_balance"] == pytest.approx(2.0)
++    assert db.get_state()["chart_positions"] == []
++
++    # Subsequent duplicate BUY on MINT_A must remain blocked
++    res_dup, rej_dup = db.reserve_buy_slot(
++        lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.01,
++        max_lane_positions=3, max_open_positions=6,
++    )
++    assert res_dup is None and rej_dup is not None and "DUPLICATE_MINT" in rej_dup
++
++    # 3. Restore settlement & verify a successful BUY on MINT_B releases its reservation cleanly
++    monkeypatch.setattr(state_ledger, "_merge_monotonic_shadow_flags", orig_merge)
++    async with httpx.AsyncClient(transport=httpx.MockTransport(_ok_handler)) as client:
++        out_ok = await executor_node(
++            {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order(mint=MINT_B, symbol="B", pair_address=POOL_B)},
++            config=cfg, db=db, http_client=client,
++        )
++    assert len(out_ok["chart_positions"]) == 1
++    assert out_ok["chart_positions"][0]["mint"] == MINT_B
++    # Only MINT_A's BROADCAST_UNRESOLVED reservation remains; MINT_B's reservation was released on success
++    remaining = get_inflight_buy_reservations(str(db.db_path))
++    assert len(remaining) == 1 and remaining[0]["mint"] == MINT_A
++    db.close()

@@ -26,6 +26,12 @@ from whale_lane import run_whale_lane_tick
 def _jup_order_handler(out_tokens: int = 1_000_000, out_lamports: int = int(0.55 * LAMPORTS_PER_SOL)):
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+        if "rugcheck.xyz" in url:
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/ultra/v1/shield" in url:
+            return httpx.Response(200, json={"warnings": {request.url.params.get("mints", ""): []}})
         if "/swap/v2/order" in url:
             if f"inputMint={SOL_MINT}" in url:
                 return httpx.Response(200, json={"outAmount": str(out_tokens), "priceImpactPct": "-0.35", "transaction": None})
@@ -42,7 +48,7 @@ async def test_concurrent_balance_pnl_and_slot_reservation_gather(tmp_path):
     clear_sell_guard()
     db = AgentDatabase(db_path=str(tmp_path / "soak_concurrent.duckdb"), starting_sol=1.20)
     cfg = AgentConfig(
-        _env_file=None, EXECUTION_MODE="paper", TRADE_SIZE_SOL=0.50, WHALE_POSITION_SOL=0.25,
+        _env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0, EXECUTION_MODE="paper", TRADE_SIZE_SOL=0.50, WHALE_POSITION_SOL=0.25,
         PAPER_TX_FEE_SOL=0.001, MAX_CHART_POSITIONS=2, MAX_WHALE_POSITIONS=2, MAX_OPEN_POSITIONS=3,
     )
 
@@ -107,7 +113,7 @@ async def test_whale_multi_slot_preservation_mid_tick_shadow_exit_and_webhook_1_
     clear_helius_roster_cache()
 
     db = AgentDatabase(db_path=str(tmp_path / "soak_whale_3slot.duckdb"), starting_sol=1.50)
-    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", WHALE_POSITION_SOL=0.25, PAPER_TX_FEE_SOL=0.001)
+    cfg = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0, EXECUTION_MODE="paper", WHALE_POSITION_SOL=0.25, PAPER_TX_FEE_SOL=0.001)
     now_dt = datetime(2026, 11, 24, 15, 0, 0, tzinfo=timezone.utc)
 
     def _mk_w(idx: int) -> dict[str, Any]:
@@ -173,7 +179,7 @@ async def test_chart_slots_2_and_3_full_exit_engine_and_sequential_priority(tmp_
     clear_sell_guard()
 
     db = AgentDatabase(db_path=str(tmp_path / "soak_chart_3slot.duckdb"), starting_sol=2.0)
-    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", TRADE_SIZE_SOL=0.50, PAPER_TX_FEE_SOL=0.001)
+    cfg = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0, EXECUTION_MODE="paper", TRADE_SIZE_SOL=0.50, PAPER_TX_FEE_SOL=0.001)
     now_dt = datetime(2026, 11, 24, 16, 0, 0, tzinfo=timezone.utc)
 
     def _mk_c(idx: int) -> dict[str, Any]:
@@ -229,7 +235,7 @@ async def test_sell_and_partial_sell_idempotency_under_concurrency(tmp_path):
     clear_sell_guard()
 
     db = AgentDatabase(db_path=str(tmp_path / "soak_idempotency.duckdb"), starting_sol=1.0)
-    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", TRADE_SIZE_SOL=0.50, PAPER_TX_FEE_SOL=0.001)
+    cfg = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0, EXECUTION_MODE="paper", TRADE_SIZE_SOL=0.50, PAPER_TX_FEE_SOL=0.001)
     opened_iso = "2026-11-24T16:30:00+00:00"
     pos = ActivePosition(
         mint="MintIdem", symbol="IDEM", entry_sol=0.50, token_amount=1_000_000,
@@ -288,7 +294,7 @@ async def test_watching_reentry_abandon_preserves_open_chart_positions(tmp_path)
     """5. Abandon WATCHING_REENTRY while another Chart position is open (token_amount > 0) and verify preservation."""
     clear_price_backoff()
     db = AgentDatabase(db_path=str(tmp_path / "soak_watch_preserve.duckdb"), starting_sol=1.0)
-    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", TRADE_SIZE_SOL=0.50)
+    cfg = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0, EXECUTION_MODE="paper", TRADE_SIZE_SOL=0.50)
     now_dt = datetime.now(timezone.utc)
 
     open_chart = ActivePosition(
@@ -336,7 +342,7 @@ async def test_signal_and_telemetry_completeness_mc_usd_exact_quote_and_live_mom
     clear_sell_guard()
 
     db = AgentDatabase(db_path=str(tmp_path / "soak_telemetry.duckdb"), starting_sol=1.50)
-    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", TRADE_SIZE_SOL=0.50, PAPER_TX_FEE_SOL=0.001)
+    cfg = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0, EXECUTION_MODE="paper", TRADE_SIZE_SOL=0.50, PAPER_TX_FEE_SOL=0.001)
     now_dt = datetime(2026, 11, 24, 17, 0, 0, tzinfo=timezone.utc)
     soaked_added = (now_dt - timedelta(minutes=6)).isoformat()
 
@@ -365,7 +371,16 @@ async def test_signal_and_telemetry_completeness_mc_usd_exact_quote_and_live_mom
     out_t1 = await alpha_node({"focus_state": FocusState.SCANNING.value, "sol_balance": 1.50, "safe_candidates": [cand_t1]}, config=cfg, db=db, decision_client=dec_client, now=now_dt)  # type: ignore[arg-type]
     assert dec_client.decide_calls == 1 and out_t1["pending_order"] is None
 
-    cand_t2 = {**cand_t1, "market_cap_usd": 485_000.0, "volume_5m_usd": 18_000.0, "price_change_5m_pct": 8.5, "buys_5m": 34, "sells_5m": 10, "candles_5m": make_sweep_reclaim_candles()}
+    cand_t2 = {
+        **cand_t1,
+        "market_cap_usd": 485_000.0,
+        "volume_5m_usd": 18_000.0,
+        "price_change_5m_pct": 8.5,
+        "buys_5m": 34,
+        "sells_5m": 10,
+        "candles_5m": make_sweep_reclaim_candles(),
+        "_ohlcv_5m_result": __import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(make_sweep_reclaim_candles(), last_ok_at=(now_dt + timedelta(seconds=30)).timestamp()),
+    }
     out_t2 = await alpha_node({"focus_state": FocusState.SCANNING.value, "sol_balance": 1.50, "safe_candidates": [cand_t2]}, config=cfg, db=db, decision_client=dec_client, now=now_dt + timedelta(seconds=30))  # type: ignore[arg-type]
     assert dec_client.decide_calls == 1 and out_t2["pending_order"] is not None
     assert out_t2["pending_order"]["side"] == "BUY" and out_t2["pending_order"]["entry_mc_usd"] == 485_000.0

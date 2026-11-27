@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import time
 from typing import Any, Optional, Sequence
 
 from pydantic import BaseModel
@@ -66,26 +68,135 @@ def compute_vwap(candles: Sequence[dict[str, float]]) -> float:
     return sum((c["high"] + c["low"] + c["close"]) / 3.0 for c in candles) / len(candles)
 
 
+def validate_decision_timestamp(decision_timestamp: Optional[float]) -> tuple[Optional[float], Optional[str]]:
+    """Validate an explicit decision_timestamp or default fail-closed to current UTC time."""
+    if decision_timestamp is None:
+        return time.time(), None
+    if isinstance(decision_timestamp, bool) or not isinstance(decision_timestamp, (int, float)):
+        return None, "invalid decision_timestamp"
+    ts = float(decision_timestamp)
+    if not math.isfinite(ts) or ts <= 0.0:
+        return None, "invalid decision_timestamp"
+    return ts, None
+
+
+def _parse_candle_timestamp(raw_ts: Any) -> Optional[float]:
+    """Parse a Unix epoch timestamp (seconds or >=1e12 ms -> seconds); return None if invalid."""
+    if raw_ts is None or isinstance(raw_ts, bool) or not isinstance(raw_ts, (int, float)):
+        return None
+    ts = float(raw_ts)
+    if not math.isfinite(ts) or ts <= 0.0:
+        return None
+    if ts >= 1e12:
+        ts /= 1000.0
+    return ts
+
+
+def _parse_valid_candle(raw: Any) -> Optional[dict[str, float]]:
+    """Parse a dict or [ts, o, h, l, c, v] sequence into a validated candle dict, else None."""
+    if isinstance(raw, dict):
+        if "timestamp" not in raw:
+            return None
+        ts = _parse_candle_timestamp(raw.get("timestamp"))
+        if ts is None:
+            return None
+        raw_o, raw_h, raw_l, raw_c = raw.get("open"), raw.get("high"), raw.get("low"), raw.get("close")
+        raw_v = raw.get("volume", 0.0)
+    elif isinstance(raw, (list, tuple)) and len(raw) >= 5:
+        ts = _parse_candle_timestamp(raw[0])
+        if ts is None:
+            return None
+        raw_o, raw_h, raw_l, raw_c = raw[1], raw[2], raw[3], raw[4]
+        raw_v = raw[5] if len(raw) > 5 else 0.0
+    else:
+        return None
+
+    ohlc: list[float] = []
+    for val in (raw_o, raw_h, raw_l, raw_c):
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            return None
+        fval = float(val)
+        if not math.isfinite(fval) or fval <= 0.0:
+            return None
+        ohlc.append(fval)
+    o, h, l, c = ohlc
+    if h < l or h < max(o, c) or l > min(o, c):
+        return None
+
+    if isinstance(raw_v, bool) or not isinstance(raw_v, (int, float)):
+        return None
+    v = float(raw_v)
+    if not math.isfinite(v) or v < 0.0:
+        return None
+
+    return {"timestamp": ts, "open": o, "high": h, "low": l, "close": c, "volume": v}
+
+
+def normalize_and_filter_candles(
+    raw_candles: Sequence[Any],
+    *,
+    bar_minutes: int,
+    decision_timestamp: Optional[float] = None,
+) -> tuple[list[dict[str, float]], Optional[str], dict[str, Any]]:
+    """Normalize, deduplicate, sort, and filter candles to closed bars with diagnostic gap telemetry."""
+    ref_ts, err = validate_decision_timestamp(decision_timestamp)
+    if err is not None or ref_ts is None:
+        return [], err or "invalid decision_timestamp", {}
+
+    if not isinstance(raw_candles, Sequence) or isinstance(raw_candles, (str, bytes, bytearray)):
+        return [], None, {"recent_gap_count": 0, "max_recent_gap_seconds": 0.0}
+
+    dedup: dict[float, dict[str, float]] = {}
+    for row in raw_candles:
+        parsed = _parse_valid_candle(row)
+        if parsed is not None:
+            dedup[parsed["timestamp"]] = parsed
+
+    sorted_candles = sorted(dedup.values(), key=lambda x: x["timestamp"])
+    bar_seconds = float(max(1, bar_minutes) * 60)
+    closed = [c for c in sorted_candles if c["timestamp"] + bar_seconds <= ref_ts]
+
+    recent = closed[-6:]
+    gap_count = 0
+    max_gap = 0.0
+    for i in range(1, len(recent)):
+        delta = recent[i]["timestamp"] - recent[i - 1]["timestamp"]
+        if delta > bar_seconds:
+            gap_count += 1
+            if delta > max_gap:
+                max_gap = delta
+
+    return closed, None, {"recent_gap_count": gap_count, "max_recent_gap_seconds": max_gap}
+
+
 def _aggregate_to_15m(candles: Sequence[dict[str, float]], bar_minutes: int) -> list[dict[str, float]]:
-    """Aggregate 5m (3 bars) or 1m (15 bars) candles into 15m OHLCV bars."""
-    group_size = max(1, 15 // max(1, bar_minutes))
-    bars: list[dict[str, float]] = []
-    # Align from the newest candle backward so the latest 15m bar is complete/current
-    n = len(candles)
-    remainder = n % group_size
-    start = remainder if remainder > 0 and n >= group_size * 2 else 0
-    for i in range(start, n, group_size):
-        chunk = candles[i : i + group_size]
-        if not chunk:
+    """Aggregate contiguous closed 5m (3 bars) or 1m (15 bars) candles into wall-clock 15m bars."""
+    step = max(1, bar_minutes) * 60
+    group_size = max(1, 900 // step)
+    buckets: dict[int, dict[int, dict[str, float]]] = {}
+    for c in candles:
+        ts_val = c["timestamp"]
+        ts_int = int(round(ts_val))
+        if abs(ts_val - ts_int) > 1e-6:
             continue
+        bucket_ts = (ts_int // 900) * 900
+        buckets.setdefault(bucket_ts, {})[ts_int] = c
+
+    bars: list[dict[str, float]] = []
+    for bucket_ts in sorted(buckets.keys()):
+        expected = [bucket_ts + k * step for k in range(group_size)]
+        bucket_map = buckets[bucket_ts]
+        if not all(t in bucket_map for t in expected):
+            continue
+        chunk = [bucket_map[t] for t in expected]
         bars.append(
             {
-                "timestamp": chunk[0]["timestamp"],
+                "timestamp": float(bucket_ts),
                 "open": chunk[0]["open"],
-                "high": max(c["high"] for c in chunk),
-                "low": min(c["low"] for c in chunk),
+                "high": max(x["high"] for x in chunk),
+                "low": min(x["low"] for x in chunk),
                 "close": chunk[-1]["close"],
-                "volume": sum(c.get("volume", 0.0) for c in chunk),
+                "volume": sum(x.get("volume", 0.0) for x in chunk),
             }
         )
     return bars
@@ -132,11 +243,30 @@ def detect_breakout_ignition(
     min_vol_ratio: Optional[float] = None,
     max_coil_range_pct: Optional[float] = None,
     min_score: Optional[int] = None,
+    decision_timestamp: Optional[float] = None,
 ) -> BreakoutIgnitionResult:
-    """Detect BREAKOUT_IGNITION on 5m (>=12 bars) or 1m fallback (>=15 bars) with 0-100 telemetry."""
+    """Detect BREAKOUT_IGNITION on closed 5m (>=12 bars) or 1m fallback (>=15 bars) with 0-100 telemetry."""
     tf = "5m" if bar_minutes == 5 else "1m"
     tf_label = "5m" if bar_minutes == 5 else "1m_fallback"
     min_bars = 12 if bar_minutes == 5 else 15
+    candles, err_reason, _gap_diag = normalize_and_filter_candles(
+        candles, bar_minutes=bar_minutes, decision_timestamp=decision_timestamp
+    )
+    if err_reason is not None:
+        return BreakoutIgnitionResult(
+            detected=False,
+            timeframe=tf,
+            rejection_reason=err_reason,
+            telemetry=BreakoutTelemetry(
+                score=0,
+                state="FORMING",
+                timeframe=tf_label,
+                vol_ratio=0.0,
+                ema_ext_pct=0.0,
+                passed_gates=[],
+                failed_gates=["INVALID_DECISION_TS"],
+            ),
+        )
     if len(candles) < min_bars:
         fail_msg = f"BARS({len(candles)}<{min_bars})"
         return BreakoutIgnitionResult(

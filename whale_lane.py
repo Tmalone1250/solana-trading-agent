@@ -22,10 +22,12 @@ from db import AgentDatabase, utc_now
 from executor_node import executor_node
 from jupiter_token_client import enrich_mints
 from ohlcv_client import (
+    OhlcvFetchResult,
     cache_breakout_telemetry,
-    fetch_ohlcv_1m_batch,
-    fetch_ohlcv_batch,
-    get_cached_breakout_telemetry,
+    fetch_ohlcv_1m_batch_with_provenance,
+    fetch_ohlcv_batch_with_provenance,
+    get_cached_breakout_telemetry_with_meta,
+    select_ohlcv_interval_provenance,
     should_fetch_1m_fallback,
 )
 from safety_gate_node import check_token_safety
@@ -348,17 +350,31 @@ async def run_whale_lane_tick(
         )
         # Fetch 5m OHLCV (+ 1m fallback ONLY when 5m succeeded 200 OK with < 12 bars) using shared cache
         pair_addrs = [str(p.get("pairAddress") or "") for p in pairs_by_mint.values() if p.get("pairAddress")]
-        ohlcv_5m = await fetch_ohlcv_batch(pair_addrs, config, client, now_ts=now_dt.timestamp()) if pair_addrs else {}
+        ohlcv_5m = (
+            await fetch_ohlcv_batch_with_provenance(pair_addrs, config, client, now_ts=now_dt.timestamp())
+            if pair_addrs
+            else {}
+        )
         short_addrs = [
-            a for a in pair_addrs
-            if should_fetch_1m_fallback(a, ohlcv_5m.get(a) or [], now_ts=now_dt.timestamp())
+            a
+            for a in pair_addrs
+            if should_fetch_1m_fallback(
+                a,
+                (ohlcv_5m[a].candles if a in ohlcv_5m else []),
+                now_ts=now_dt.timestamp(),
+            )
         ]
-        ohlcv_1m = await fetch_ohlcv_1m_batch(short_addrs, config, client, now_ts=now_dt.timestamp()) if short_addrs else {}
+        ohlcv_1m = (
+            await fetch_ohlcv_1m_batch_with_provenance(short_addrs, config, client, now_ts=now_dt.timestamp())
+            if short_addrs
+            else {}
+        )
 
         open_mints = db.get_all_open_mints()
         for trig in triggers:
             mint = trig["mint"]
-            cached_bt = get_cached_breakout_telemetry(mint, now_ts=now_dt.timestamp())
+            cached_bt_meta = get_cached_breakout_telemetry_with_meta(mint, now_ts=now_dt.timestamp())
+            cached_bt = dict(cached_bt_meta.telemetry) if cached_bt_meta is not None else None
             if db.is_on_cooldown(mint, now=now_dt):
                 db.upsert_whale_decision(mint, "SKIPPED", "COOLDOWN", updated_at=now_dt.isoformat(), breakout_telemetry=cached_bt)
                 continue
@@ -375,13 +391,68 @@ async def run_whale_lane_tick(
             p_addr = str(pair.get("pairAddress") or "")
 
             # Compute shared breakout_telemetry (5m or 1m_fallback) or preserve cached meter during backoff
-            c5 = pair.get("candles_5m") if isinstance(pair.get("candles_5m"), list) else ohlcv_5m.get(p_addr, [])
-            c1 = pair.get("candles_1m") if isinstance(pair.get("candles_1m"), list) else ohlcv_1m.get(p_addr, [])
-            has_ohlcv = bool(c5 or c1)
-            sc_res = evaluate_scalper_entry(c5, pair, time_in_slot_min=5.0, config=config, candles_1m=c1)
+            unavail = OhlcvFetchResult(
+                candles=[], source="unavailable", fetched_at=None, last_ok_at=None, last_status=None
+            )
+            if isinstance(pair.get("candles_5m"), list):
+                raw_5m_prov = pair.get("_ohlcv_5m_result")
+                res_5m = (
+                    raw_5m_prov
+                    if isinstance(raw_5m_prov, OhlcvFetchResult)
+                    else OhlcvFetchResult(
+                        candles=list(pair["candles_5m"]),
+                        source="pre_attached_unknown",
+                        fetched_at=None,
+                        last_ok_at=None,
+                        last_status=None,
+                    )
+                )
+            else:
+                res_5m = ohlcv_5m.get(p_addr, unavail)
+
+            if isinstance(pair.get("candles_1m"), list):
+                raw_1m_prov = pair.get("_ohlcv_1m_result")
+                res_1m = (
+                    raw_1m_prov
+                    if isinstance(raw_1m_prov, OhlcvFetchResult)
+                    else OhlcvFetchResult(
+                        candles=list(pair["candles_1m"]),
+                        source="pre_attached_unknown",
+                        fetched_at=None,
+                        last_ok_at=None,
+                        last_status=None,
+                    )
+                )
+            else:
+                res_1m = ohlcv_1m.get(p_addr, unavail)
+
+            c5 = res_5m.candles
+            c1 = res_1m.candles
+            active_prov, prov_ok, _ = select_ohlcv_interval_provenance(
+                res_5m,
+                res_1m,
+                decision_timestamp=now_dt.timestamp(),
+                max_cache_age_seconds=float(config.OHLCV_CACHE_SECONDS),
+            )
+            has_ohlcv = bool((c5 or c1) and prov_ok)
+            sc_res = evaluate_scalper_entry(
+                c5,
+                pair,
+                time_in_slot_min=5.0,
+                config=config,
+                candles_1m=c1,
+                decision_timestamp=now_dt.timestamp(),
+                ohlcv_provenance=active_prov,
+            )
             bt = sc_res.breakout_telemetry if (has_ohlcv and sc_res.breakout_telemetry) else (cached_bt or sc_res.breakout_telemetry or {})
             if has_ohlcv and sc_res.breakout_telemetry:
-                cache_breakout_telemetry(mint, sc_res.breakout_telemetry, now_ts=now_dt.timestamp())
+                cache_breakout_telemetry(
+                    mint,
+                    sc_res.breakout_telemetry,
+                    ohlcv_source=active_prov.source,
+                    ohlcv_last_ok_at=active_prov.last_ok_at,
+                    now_ts=now_dt.timestamp(),
+                )
             bt_score = int(bt.get("score") or 0)
             bt_state = str(bt.get("state") or "FORMING")
             bt_failed_str = "; ".join(bt.get("failed_gates") or []) if bt else ""
@@ -405,8 +476,7 @@ async def run_whale_lane_tick(
                 db.upsert_whale_decision(mint, "SKIPPED", mc_reason, updated_at=now_dt.isoformat(), breakout_telemetry=bt)
                 continue
 
-            # Whale Breakout Gate (applied when OHLCV bars were evaluated; rejects EXTENDED or low score)
-            has_ohlcv = bool(c5 or c1)
+            # Whale Breakout Gate (applied ONLY when live/verified OHLCV bars were evaluated; rejects EXTENDED or low score)
             if has_ohlcv and config.WHALE_BLOCK_EXTENDED and bt_state == "EXTENDED":
                 rej = f"BREAKOUT_EXTENDED ({bt_failed_str})" if bt_failed_str else "BREAKOUT_EXTENDED"
                 db.upsert_whale_decision(mint, "SKIPPED", rej, updated_at=now_dt.isoformat(), breakout_telemetry=bt)

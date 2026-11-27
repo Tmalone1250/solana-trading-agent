@@ -25,7 +25,7 @@ from whale_lane import evaluate_whale_exit_order, run_whale_lane_tick
 async def test_concurrent_chart_and_whale_slots_and_duplicate_mint_guard(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "two_slots.duckdb"), starting_sol=1.5)
     cfg = AgentConfig(
-        _env_file=None,
+        _env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
         WHALE_STRATEGY_ENABLED=True,
         WHALE_POSITION_SOL=0.25,
         WHALE_MIN_UNIQUE_WALLETS=2,
@@ -84,6 +84,8 @@ async def test_concurrent_chart_and_whale_slots_and_duplicate_mint_guard(tmp_pat
             )
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", whale_mint), "audit": {"isSus": False}}])
         if "/ultra/v1/shield" in url:
             return httpx.Response(200, json={"warnings": {whale_mint: []}})
         if "/swap/v2/order" in url:
@@ -139,7 +141,7 @@ async def test_concurrent_chart_and_whale_slots_and_duplicate_mint_guard(tmp_pat
 async def test_whale_hardening_liq_40k_time_stop_env_and_be_shield_5_1(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "hardening.duckdb"), starting_sol=1.0)
     cfg = AgentConfig(
-        _env_file=None,
+        _env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
         WHALE_MIN_UNIQUE_WALLETS=2,
         WHALE_MIN_LIQ_USD=40_000.0,
         WHALE_BREAKEVEN_ARM_PCT=5.0,
@@ -189,7 +191,7 @@ async def test_whale_hardening_liq_40k_time_stop_env_and_be_shield_5_1(tmp_path)
     assert ord2.reason == "WHALE_BREAKEVEN_SHIELD"
 
     # 3. Custom WHALE_TIME_STOP_SECONDS from config (e.g., 180s) respected dynamically
-    cfg_180 = AgentConfig(_env_file=None, WHALE_TIME_STOP_SECONDS=180)
+    cfg_180 = AgentConfig(_env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0, WHALE_TIME_STOP_SECONDS=180)
     pos_t = ActivePosition(
         mint="MintTime180", symbol="TIME", entry_sol=0.25, token_amount=1_000_000,
         strategy="WHALE_SCALP", opened_at=(now_dt - timedelta(seconds=185)).isoformat(),
@@ -207,7 +209,7 @@ async def test_strict_webhook_roster_filter_and_decision_1_blocked_logging(tmp_p
     roster_wallet = "4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk"  # Jijo
     non_roster_wallet = "EqiFgyNw6kgrmYstWyrP8VjKhka7XEmKTZzHSmwpr1Zb"  # Previously malformed "ban"
     cfg = AgentConfig(
-        _env_file=None,
+        _env_file=None, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
         ENABLE_HELIUS_WHALE_WEBHOOK=True,
         HELIUS_AUTH_HEADER="Bearer secret-tok",
         HELIUS_TRACKED_WALLETS=roster_wallet,

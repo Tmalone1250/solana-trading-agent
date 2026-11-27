@@ -1,0 +1,601 @@
+diff --git a/action_export.py b/action_export.py
+index 5eb4e16..a06b4f8 100644
+--- a/action_export.py
++++ b/action_export.py
+@@ -54,6 +54,10 @@ ACTION_LOG_COLUMNS: list[str] = [
+     # E1 pool identity continuity columns
+     "pair_address",
+     "dex_id",
++    # E4B execution pool route observability columns
++    "router",
++    "route_pool_keys",
++    "pool_route_status",
+ ]
+ 
+ ACTION_LOG_MIGRATIONS: list[tuple[str, str]] = [
+@@ -86,6 +90,9 @@ ACTION_LOG_MIGRATIONS: list[tuple[str, str]] = [
+     ("position_mae_pct", "DOUBLE"),
+     ("pair_address", "VARCHAR"),
+     ("dex_id", "VARCHAR"),
++    ("router", "VARCHAR"),
++    ("route_pool_keys", "VARCHAR"),
++    ("pool_route_status", "VARCHAR"),
+ ]
+ 
+ EXPORT_TYPE_ACTIONS: dict[str, Optional[list[str]]] = {
+diff --git a/config.py b/config.py
+index 0761eda..47d31ff 100644
+--- a/config.py
++++ b/config.py
+@@ -204,6 +204,8 @@ class AgentConfig(BaseSettings):
+     MAX_ENTRY_PRICE_IMPACT_PCT: float | None = Field(default=None, ge=0.0)
+     MIN_BLOCK_HEIGHT_HEADROOM: int | None = Field(default=None, ge=0)
+     MIN_RFQ_EXPIRY_HEADROOM_SECONDS: float | None = Field(default=None, ge=0.0)
++    # Phase E4B: Execution pool integrity (live unconditionally fail-closed; paper opt-in)
++    REQUIRE_PINNED_POOL_ROUTE_IN_PAPER: bool = False
+ 
+     # Loop, Persistence & Telemetry
+     MONITOR_POLL_SECONDS: float = Field(default=5.0, gt=0.0)
+diff --git a/db.py b/db.py
+index 0d50dc1..fa5d942 100644
+--- a/db.py
++++ b/db.py
+@@ -1695,6 +1695,9 @@ class AgentDatabase:
+         position_mae_pct: Optional[float] = None,
+         pair_address: Optional[str] = None,
+         dex_id: Optional[str] = None,
++        router: Optional[str] = None,
++        route_pool_keys: Optional[str] = None,
++        pool_route_status: Optional[str] = None,
+     ) -> None:
+         """Append a structured board action row to DuckDB action_log."""
+         ts = timestamp_utc or utc_now_iso()
+@@ -1733,6 +1736,7 @@ class AgentDatabase:
+                     jupiter_price_impact_raw, monitor_sol_value, price_source,
+                     position_mfe_pct, position_mae_pct,
+                     clean_pair, clean_dex,
++                    router, route_pool_keys, pool_route_status,
+                 ],
+             )
+ 
+diff --git a/executor_node.py b/executor_node.py
+index 59ffb19..67539d4 100644
+--- a/executor_node.py
++++ b/executor_node.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import base64
++import json
+ import logging
+ import math
+ import re
+@@ -373,6 +374,84 @@ async def _validate_e4a_quote_receipt(
+             )
+ 
+ 
++def _evaluate_e4b_route_pool(
++    order: PendingOrder,
++    order_resp: dict[str, Any],
++) -> tuple[Optional[str], list[str], str, Optional[str]]:
++    """Evaluate Jupiter routePlan against pinned pair_address per E4B router-specific contract.
++
++    Returns (router_norm, route_pool_keys, pool_route_status, block_reason).
++    """
++    raw_router = order_resp.get("router")
++    router_norm = raw_router.strip().lower() if isinstance(raw_router, str) and raw_router.strip() else None
++
++    route_plan = order_resp.get("routePlan")
++    route_pool_keys: list[str] = []
++    if isinstance(route_plan, list):
++        for hop in route_plan:
++            if isinstance(hop, dict) and isinstance(hop.get("swapInfo"), dict):
++                ak = hop["swapInfo"].get("ammKey")
++                if isinstance(ak, str) and ak.strip():
++                    route_pool_keys.append(ak.strip())
++
++    if router_norm != "metis":
++        return (
++            router_norm,
++            route_pool_keys,
++            "UNVERIFIABLE_ROUTER",
++            f"BLOCKED: ROUTE_POOL_UNVERIFIABLE (router={raw_router!r})",
++        )
++
++    if not isinstance(route_plan, list) or len(route_plan) == 0:
++        return (
++            router_norm,
++            route_pool_keys,
++            "MISSING_ROUTE_PLAN",
++            "BLOCKED: ROUTE_POOL_UNVERIFIABLE (missing or empty routePlan)",
++        )
++
++    pinned_pair = str(order.pair_address or "").strip()
++    qualifying_hops = 0
++    for hop in route_plan:
++        if not isinstance(hop, dict) or not isinstance(hop.get("swapInfo"), dict):
++            return (
++                router_norm,
++                route_pool_keys,
++                "MISSING_ROUTE_PLAN",
++                "BLOCKED: ROUTE_POOL_UNVERIFIABLE (malformed routePlan hop)",
++            )
++        swap_info = hop["swapInfo"]
++        in_mint = swap_info.get("inputMint")
++        out_mint = swap_info.get("outputMint")
++        if in_mint == order.mint or out_mint == order.mint:
++            qualifying_hops += 1
++            amm_key = swap_info.get("ammKey")
++            if not isinstance(amm_key, str) or not amm_key.strip():
++                return (
++                    router_norm,
++                    route_pool_keys,
++                    "MISSING_ROUTE_PLAN",
++                    "BLOCKED: ROUTE_POOL_UNVERIFIABLE (missing swapInfo.ammKey on target-mint hop)",
++                )
++            if amm_key.strip() != pinned_pair:
++                return (
++                    router_norm,
++                    route_pool_keys,
++                    "POOL_MISMATCH",
++                    f"BLOCKED: ROUTE_POOL_MISMATCH (expected={pinned_pair}, got={amm_key.strip()})",
++                )
++
++    if qualifying_hops == 0:
++        return (
++            router_norm,
++            route_pool_keys,
++            "MISSING_ROUTE_PLAN",
++            "BLOCKED: ROUTE_POOL_UNVERIFIABLE (no target-mint hop in routePlan)",
++        )
++
++    return (router_norm, route_pool_keys, "VERIFIED_PINNED_POOL", None)
++
++
+ async def fetch_live_wallet_sol_balance(
+     pubkey: str,
+     *,
+@@ -632,6 +711,9 @@ async def executor_node(
+     settled_buy = False
+     intent_id: Optional[str] = None
+     buy_opened_at = utc_now_iso() if is_buy else None
++    e4b_router: Optional[str] = None
++    e4b_pool_keys: list[str] = []
++    e4b_pool_status: Optional[str] = None
+ 
+     try:
+         try:
+@@ -652,10 +734,19 @@ async def executor_node(
+             else:
+                 raise
+         out_amount = _parse_strict_int(order_resp.get("outAmount"), "OUT_AMOUNT", min_value=1)
++        # Phase E4B: Evaluate execution pool route telemetry before E4A checks so telemetry is always logged
++        e4b_block: Optional[str] = None
++        if is_buy and (order.strategy or "").strip().upper() == "BREAKOUT_IGNITION":
++            e4b_router, e4b_pool_keys, e4b_pool_status, e4b_block = _evaluate_e4b_route_pool(order, order_resp)
+         # Checkpoint 1: Quote receipt validation (out_amount > 0 in all modes, plus E4A drift/impact/slippage/expiry)
+         await _validate_e4a_quote_receipt(
+             order, order_resp, out_amount, config, quote_received_at=quote_received_at, client=client,
+         )
++        # Phase E4B: Enforce execution pool integrity (live unconditionally fail-closed; paper opt-in)
++        if e4b_block is not None and (
++            config.EXECUTION_MODE == "live" or config.REQUIRE_PINNED_POOL_ROUTE_IN_PAPER
++        ):
++            raise E4AValidationError(e4b_block)
+         tx_signature: Optional[str] = None
+         if config.EXECUTION_MODE == "live":
+             tx_b64 = order_resp.get("transaction")
+@@ -765,6 +856,9 @@ async def executor_node(
+             symbol=order.symbol, asset_id=order.mint,
+             strategy=order.strategy or "SCALPER", reason=str(exc),
+             pair_address=order.pair_address, dex_id=order.dex_id,
++            router=e4b_router,
++            route_pool_keys=json.dumps(e4b_pool_keys) if e4b_pool_status is not None else None,
++            pool_route_status=e4b_pool_status,
+         )
+         return {"pending_order": None}
+     except BaseException as exc:
+@@ -894,6 +988,9 @@ async def executor_node(
+             breakout_failed_gates="; ".join(bt.get("failed_gates") or []) if bt else None,
+             jupiter_price_impact_raw=raw_price_impact,
+             pair_address=pos.pair_address, dex_id=pos.dex_id,
++            router=e4b_router,
++            route_pool_keys=json.dumps(e4b_pool_keys) if e4b_pool_status is not None else None,
++            pool_route_status=e4b_pool_status,
+         )
+         logger.info("[%s] BUY %s: %.4f SOL -> %d tokens (reason=%s)", config.EXECUTION_MODE.upper(), order.symbol, spent_sol, out_amount, order.reason)
+     elif is_partial_sell:
+@@ -1080,6 +1177,9 @@ async def executor_node(
+         "jupiter_price_impact_raw": raw_price_impact,
+         "tx_fee_sol": tx_fee_opt, "fee_status": tx_fee_status,
+         "fee_accounting_incomplete": tx_fee_opt is None,
++        "router": e4b_router,
++        "route_pool_keys": e4b_pool_keys if e4b_pool_status is not None else None,
++        "pool_route_status": e4b_pool_status,
+     }
+     if is_whale_slot:
+         return {
+diff --git a/tests/test_action_ledger.py b/tests/test_action_ledger.py
+index 993e00f..447fad3 100644
+--- a/tests/test_action_ledger.py
++++ b/tests/test_action_ledger.py
+@@ -220,7 +220,7 @@ async def test_action_ledger_logs_buy_sell_evict_circuit_breaker_and_csv_export(
+ 
+     parsed_all = list(csv.DictReader(io.StringIO(resp_all.text)))
+     assert list(parsed_all[0].keys()) == ACTION_LOG_COLUMNS
+-    assert len(ACTION_LOG_COLUMNS) == 43
++    assert len(ACTION_LOG_COLUMNS) == 46
+     assert len(parsed_all) == 10
+     assert all(r["bot"] == "solana_meme" and r["unit"] == "SOL" for r in parsed_all)
+     # Every row has enriched equity & daily realized SOL populated
+diff --git a/tests/test_e4a_approval_quote_integrity.py b/tests/test_e4a_approval_quote_integrity.py
+index df264c6..048c034 100644
+--- a/tests/test_e4a_approval_quote_integrity.py
++++ b/tests/test_e4a_approval_quote_integrity.py
+@@ -263,6 +263,7 @@ async def test_e4a_drift_worst_case_slippage_impact_rtse_and_expiry_gates(tmp_pa
+         "priceImpact": -0.5,
+         "router": "metis",
+         "lastValidBlockHeight": 1000,
++        "routePlan": [{"swapInfo": {"ammKey": POOL_PINNED, "inputMint": SOL_MINT, "outputMint": MINT_E4A, "label": "PumpSwap"}, "percent": 100}],
+         "transaction": unsigned_tx,
+         "requestId": "req-e4a",
+     }
+@@ -450,21 +451,16 @@ async def test_e4a_corrective_strict_parsing_missing_oat_and_router_allowlist(tm
+             assert out_p == {"pending_order": None}
+             assert get_inflight_buy_reservations(str(db.db_path)) == []
+ 
+-        # Supported routers (dflow, okx with lastValidBlockHeight; jupiterz with expireAt) pass
++        # Supported E4A router timing checks (dflow, okx with lastValidBlockHeight; jupiterz with expireAt) pass
++        now_rt = datetime.now(timezone.utc)
+         for ok_router_patch in (
+             {"router": "dflow", "lastValidBlockHeight": 1000},
+             {"router": "okx", "lastValidBlockHeight": 1000},
+-            {"router": "jupiterz", "expireAt": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()},
++            {"router": "jupiterz", "expireAt": (now_rt + timedelta(seconds=30)).isoformat()},
+         ):
+-            curr_quote["val"] = {**base_quote, **ok_router_patch}
+-            # Use unique mint per successful trade to avoid duplicate open position
+-            order_ok = _mk_e4a_order()
+-            order_ok["mint"] = str(Keypair().pubkey())
+-            out_ok = await executor_node(
+-                {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": order_ok},
+-                config=cfg, db=db, http_client=client,
++            await _validate_e4a_quote_timing_and_expiry(
++                ok_router_patch, cfg, quote_received_at=now_rt, client=client, stage="RECEIPT", is_live=True, now_dt=now_rt,
+             )
+-            assert len(out_ok["chart_positions"]) >= 1
+     db.close()
+ 
+ 
+@@ -515,6 +511,7 @@ async def test_e4a_post_broadcast_output_amount_result_strict_and_unresolved_lif
+                     "priceImpact": -0.5,
+                     "router": "metis",
+                     "lastValidBlockHeight": 1000,
++                    "routePlan": [{"swapInfo": {"ammKey": POOL_PINNED, "inputMint": SOL_MINT, "outputMint": mint_i, "label": "PumpSwap"}, "percent": 100}],
+                     "transaction": unsigned_tx,
+                     "requestId": f"req-unres-{idx}",
+                 })
+@@ -563,6 +560,7 @@ async def test_e4a_post_broadcast_output_amount_result_strict_and_unresolved_lif
+                     "priceImpact": -0.5,
+                     "router": "metis",
+                     "lastValidBlockHeight": 1000,
++                    "routePlan": [{"swapInfo": {"ammKey": POOL_PINNED, "inputMint": SOL_MINT, "outputMint": mint_i, "label": "PumpSwap"}, "percent": 100}],
+                     "transaction": unsigned_tx,
+                     "requestId": f"req-ok-{idx}",
+                 })
+diff --git a/tests/test_e4b_execution_pool_integrity.py b/tests/test_e4b_execution_pool_integrity.py
+new file mode 100644
+index 0000000..62a6335
+--- /dev/null
++++ b/tests/test_e4b_execution_pool_integrity.py
+@@ -0,0 +1,310 @@
++"""Phase E4B regression tests: Execution Pool Integrity (Router-Specific Contract)."""
++
++from __future__ import annotations
++
++import base64
++import json
++from datetime import datetime, timedelta, timezone
++from typing import Any
++
++import httpx
++import pytest
++from solders.hash import Hash
++from solders.keypair import Keypair
++from solders.message import MessageV0
++from solders.system_program import TransferParams, transfer
++from solders.transaction import VersionedTransaction
++
++import executor_node as ex_mod
++from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
++from db import AgentDatabase
++from executor_node import clear_sell_idempotency_guard, executor_node
++from state import FocusState, PendingOrder
++from state_ledger import clear_buy_reservations, get_inflight_buy_reservations
++
++POOL_PINNED = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi"
++POOL_OTHER = "7qbRF6YsyGuLUVs6Y1q64bdVrfe4ZcUUz1JRdoVNUJnm"
++MINT_E4B = "p2Yicb86aZig616Eav2VWG9vuXR5mEqhtzshZYBxzsV"
++USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
++RPC_URL = "https://rpc.e4b.test"
++
++
++def _mk_unsigned_tx(kp: Keypair) -> str:
++    ix = transfer(TransferParams(from_pubkey=kp.pubkey(), to_pubkey=kp.pubkey(), lamports=1))
++    msg = MessageV0.try_compile(kp.pubkey(), [ix], [], Hash.default())
++    return base64.b64encode(bytes(VersionedTransaction(msg, [kp]))).decode("ascii")
++
++
++def _mk_live_e4b_cfg(kp: Keypair, **overrides: Any) -> AgentConfig:
++    defaults: dict[str, Any] = {
++        "_env_file": None,
++        "EXECUTION_MODE": "live",
++        "SOLANA_PRIVATE_KEY_BS58": str(kp),
++        "SOLANA_RPC_URL": RPC_URL,
++        "MAX_BUY_APPROVAL_AGE_SECONDS": 30.0,
++        "MAX_APPROVAL_PRICE_AGE_SECONDS": 30.0,
++        "MAX_ENTRY_PRICE_DRIFT_PCT": 5.0,
++        "MAX_NEGATIVE_ENTRY_DRIFT_PCT": 10.0,
++        "MAX_WORST_CASE_ENTRY_DRIFT_PCT": 7.0,
++        "MAX_QUOTE_AGE_SECONDS": 10.0,
++        "MAX_ACCEPTED_SLIPPAGE_BPS": 300,
++        "MAX_ENTRY_PRICE_IMPACT_PCT": 2.5,
++        "MIN_BLOCK_HEIGHT_HEADROOM": 5,
++        "MIN_RFQ_EXPIRY_HEADROOM_SECONDS": 5.0,
++    }
++    defaults.update(overrides)
++    return AgentConfig(**defaults)
++
++
++def _mk_e4b_order(mint: str = MINT_E4B, **overrides: Any) -> dict[str, Any]:
++    now_iso = datetime.now(timezone.utc).isoformat()
++    defaults: dict[str, Any] = {
++        "side": "BUY",
++        "mint": mint,
++        "symbol": "E4B",
++        "pair_address": POOL_PINNED,
++        "dex_id": "pumpswap",
++        "amount_atomic": int(0.50 * LAMPORTS_PER_SOL),
++        "reason": "DECISION_1_ENTRY",
++        "target_state_after_fill": FocusState.IN_POSITION,
++        "entry_liquidity_usd": 80_000.0,
++        "entry_mc_usd": 500_000.0,
++        "strategy": "BREAKOUT_IGNITION",
++        "approved_at": now_iso,
++        "approval_price_observed_at": now_iso,
++        "approval_pair_address": POOL_PINNED,
++        "approval_price_native": 0.0005,
++        "approval_price_source": "dexscreener_pinned_pool_native",
++        "token_decimals": 6,
++    }
++    defaults.update(overrides)
++    return PendingOrder(**defaults).model_dump()
++
++
++def _mk_hop(in_mint: str, out_mint: str, amm_key: Any, label: str = "PumpSwap") -> dict[str, Any]:
++    swap_info: dict[str, Any] = {
++        "label": label,
++        "inputMint": in_mint,
++        "outputMint": out_mint,
++        "inAmount": "500000000",
++        "outAmount": "1000000000",
++    }
++    if amm_key is not None:
++        swap_info["ammKey"] = amm_key
++    return {"swapInfo": swap_info, "percent": 100}
++
++
++@pytest.mark.asyncio
++async def test_e4b_live_metis_verified_pinned_pool_and_multi_hop_continuity(tmp_path):
++    """Valid Metis route matching pinned pool succeeds and preserves pair_address, dex_id, and PINNED status."""
++    clear_buy_reservations()
++    clear_sell_idempotency_guard()
++    kp = Keypair()
++    unsigned_tx = _mk_unsigned_tx(kp)
++    db = AgentDatabase(db_path=str(tmp_path / "e4b_ok.duckdb"), starting_sol=5.0)
++    cfg = _mk_live_e4b_cfg(kp)
++
++    # Multi-hop: SOL -> USDC (POOL_OTHER) then USDC -> MINT_E4B (POOL_PINNED)
++    # Also label is "Raydium CLMM" to prove swapInfo.label never overwrites pinned dex_id
++    route_plan = [
++        _mk_hop(SOL_MINT, USDC_MINT, POOL_OTHER, label="Orca"),
++        _mk_hop(USDC_MINT, MINT_E4B, POOL_PINNED, label="Raydium CLMM"),
++    ]
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        if str(request.url).startswith(RPC_URL):
++            body = json.loads(request.content.decode("utf-8"))
++            if body["method"] == "getBalance":
++                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
++            if body["method"] == "getBlockHeight":
++                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": 990})
++        if "/swap/v2/order" in str(request.url):
++            return httpx.Response(200, json={
++                "outAmount": "1000000000",
++                "otherAmountThreshold": "980000000",
++                "slippageBps": 200,
++                "priceImpact": -0.5,
++                "router": "metis",
++                "lastValidBlockHeight": 1000,
++                "routePlan": route_plan,
++                "transaction": unsigned_tx,
++                "requestId": "req-e4b-ok",
++            })
++        if "/swap/v2/execute" in str(request.url):
++            return httpx.Response(200, json={"signature": "SigE4BOk111", "outputAmountResult": "1000000000"})
++        return httpx.Response(404)
++
++    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
++        out = await executor_node(
++            {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4b_order()},
++            config=cfg, db=db, http_client=client,
++        )
++
++    assert len(out["chart_positions"]) == 1
++    pos = out["chart_positions"][0]
++    assert pos["pair_address"] == POOL_PINNED
++    assert pos["dex_id"] == "pumpswap"
++    assert pos["pool_identity_status"] == "PINNED"
++    assert out["last_execution"]["router"] == "metis"
++    assert out["last_execution"]["pool_route_status"] == "VERIFIED_PINNED_POOL"
++    assert out["last_execution"]["route_pool_keys"] == [POOL_OTHER, POOL_PINNED]
++
++    rows = db.get_action_log(limit=5, actions=["BUY"])
++    assert len(rows) == 1
++    assert rows[0]["router"] == "metis"
++    assert rows[0]["pool_route_status"] == "VERIFIED_PINNED_POOL"
++    assert json.loads(rows[0]["route_pool_keys"]) == [POOL_OTHER, POOL_PINNED]
++    db.close()
++
++
++@pytest.mark.asyncio
++async def test_e4b_live_rejects_mismatched_missing_and_unverifiable_routes_without_signing(tmp_path, monkeypatch):
++    """Mismatched hops, split-hop mismatch, missing/empty routePlan, missing ammKey, no target hop, jupiterz/dflow/okx, and unknown routers all fail closed before signing."""
++    clear_buy_reservations()
++    clear_sell_idempotency_guard()
++    kp = Keypair()
++    unsigned_tx = _mk_unsigned_tx(kp)
++    db = AgentDatabase(db_path=str(tmp_path / "e4b_rej.duckdb"), starting_sol=5.0)
++    cfg = _mk_live_e4b_cfg(kp)
++
++    base_quote = {
++        "outAmount": "1000000000",
++        "otherAmountThreshold": "980000000",
++        "slippageBps": 200,
++        "priceImpact": -0.5,
++        "router": "metis",
++        "lastValidBlockHeight": 1000,
++        "transaction": unsigned_tx,
++        "requestId": "req-e4b-rej",
++    }
++
++    future_exp = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()
++    bad_cases: list[tuple[dict[str, Any], str]] = [
++        # Mismatched target-mint hop (even with matching label!)
++        ({**base_quote, "routePlan": [_mk_hop(SOL_MINT, MINT_E4B, POOL_OTHER, label="pumpswap")]}, "POOL_MISMATCH"),
++        # Multiple target-mint hops where one matches and one mismatches
++        ({**base_quote, "routePlan": [_mk_hop(SOL_MINT, MINT_E4B, POOL_PINNED), _mk_hop(SOL_MINT, MINT_E4B, POOL_OTHER)]}, "POOL_MISMATCH"),
++        # Missing or empty routePlan
++        ({**base_quote}, "MISSING_ROUTE_PLAN"),
++        ({**base_quote, "routePlan": []}, "MISSING_ROUTE_PLAN"),
++        # Missing ammKey on target-mint hop
++        ({**base_quote, "routePlan": [_mk_hop(SOL_MINT, MINT_E4B, None)]}, "MISSING_ROUTE_PLAN"),
++        # Route plan with no target-mint hop
++        ({**base_quote, "routePlan": [_mk_hop(SOL_MINT, USDC_MINT, POOL_PINNED)]}, "MISSING_ROUTE_PLAN"),
++        # Unverifiable routers
++        ({**base_quote, "router": "jupiterz", "expireAt": future_exp, "routePlan": [_mk_hop(SOL_MINT, MINT_E4B, POOL_PINNED)]}, "UNVERIFIABLE_ROUTER"),
++        ({**base_quote, "router": "dflow", "routePlan": [_mk_hop(SOL_MINT, MINT_E4B, POOL_PINNED)]}, "UNVERIFIABLE_ROUTER"),
++        ({**base_quote, "router": "okx", "routePlan": [_mk_hop(SOL_MINT, MINT_E4B, POOL_PINNED)]}, "UNVERIFIABLE_ROUTER"),
++        # Unknown / missing / malformed routers
++        ({**base_quote, "router": "raydium"}, "UNVERIFIABLE_ROUTER"),
++        ({**base_quote, "router": ""}, "UNVERIFIABLE_ROUTER"),
++        ({k: v for k, v in base_quote.items() if k != "router"}, "UNVERIFIABLE_ROUTER"),
++    ]
++
++    sign_calls = {"n": 0}
++    exec_calls = {"n": 0}
++    orig_derive = ex_mod.derive_and_validate_single_signer_tx
++
++    def spy_derive(*args: Any, **kwargs: Any):
++        sign_calls["n"] += 1
++        return orig_derive(*args, **kwargs)
++
++    monkeypatch.setattr(ex_mod, "derive_and_validate_single_signer_tx", spy_derive)
++    curr_quote = {"val": dict(base_quote)}
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        if str(request.url).startswith(RPC_URL):
++            body = json.loads(request.content.decode("utf-8"))
++            if body["method"] == "getBalance":
++                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
++            if body["method"] == "getBlockHeight":
++                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": 990})
++        if "/swap/v2/order" in str(request.url):
++            return httpx.Response(200, json=curr_quote["val"])
++        if "/swap/v2/execute" in str(request.url):
++            exec_calls["n"] += 1
++            return httpx.Response(200, json={"signature": "ShouldNeverBroadcast"})
++        return httpx.Response(404)
++
++    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
++        for bq, expected_status in bad_cases:
++            curr_quote["val"] = bq
++            out = await executor_node(
++                {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4b_order()},
++                config=cfg, db=db, http_client=client,
++            )
++            assert out == {"pending_order": None}
++            assert sign_calls["n"] == 0
++            assert exec_calls["n"] == 0
++            assert get_inflight_buy_reservations(str(db.db_path)) == []
++            assert db.get_active_locking_intents() == []
++            latest = db.get_action_log(limit=1)[0]
++            assert latest["pool_route_status"] == expected_status
++    db.close()
++
++
++@pytest.mark.asyncio
++async def test_e4b_paper_telemetry_all_statuses_and_opt_in_enforcement(tmp_path):
++    """Paper mode persists router/route_pool_keys/pool_route_status for all 4 statuses; opt-in flag enforces rejection."""
++    clear_buy_reservations()
++    clear_sell_idempotency_guard()
++
++    paper_cases = [
++        ({"outAmount": "1000000000", "router": "metis", "routePlan": [_mk_hop(SOL_MINT, MINT_E4B, POOL_PINNED)], "transaction": None}, "VERIFIED_PINNED_POOL", [POOL_PINNED], True),
++        ({"outAmount": "1000000000", "router": "dflow", "routePlan": [_mk_hop(SOL_MINT, MINT_E4B, POOL_PINNED)], "transaction": None}, "UNVERIFIABLE_ROUTER", [POOL_PINNED], False),
++        ({"outAmount": "1000000000", "router": "metis", "routePlan": [_mk_hop(SOL_MINT, MINT_E4B, POOL_OTHER)], "transaction": None}, "POOL_MISMATCH", [POOL_OTHER], False),
++        ({"outAmount": "1000000000", "router": "metis", "routePlan": [], "transaction": None}, "MISSING_ROUTE_PLAN", [], False),
++    ]
++
++    # 1. Default paper mode (REQUIRE_PINNED_POOL_ROUTE_IN_PAPER=False): all 4 execute & persist telemetry
++    cfg_obs = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.001)
++    assert cfg_obs.REQUIRE_PINNED_POOL_ROUTE_IN_PAPER is False
++
++    for idx, (quote_payload, expected_status, expected_keys, _allowed_enforced) in enumerate(paper_cases):
++        clear_buy_reservations()
++        db = AgentDatabase(db_path=str(tmp_path / f"e4b_paper_obs_{idx}.duckdb"), starting_sol=5.0)
++        mint_i = MINT_E4B
++        order_i = _mk_e4b_order(mint=mint_i)
++
++        def handler_p(_req: httpx.Request, qp: dict[str, Any] = quote_payload) -> httpx.Response:
++            return httpx.Response(200, json=qp)
++
++        async with httpx.AsyncClient(transport=httpx.MockTransport(handler_p)) as client:
++            out = await executor_node(
++                {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": order_i},
++                config=cfg_obs, db=db, http_client=client,
++            )
++        assert len(out["chart_positions"]) == 1
++        assert out["last_execution"]["pool_route_status"] == expected_status
++        assert out["last_execution"]["route_pool_keys"] == expected_keys
++        row = db.get_action_log(limit=1, actions=["BUY"])[0]
++        assert row["pool_route_status"] == expected_status
++        assert json.loads(row["route_pool_keys"]) == expected_keys
++        assert row["router"] == quote_payload["router"]
++        db.close()
++
++    # 2. Paper enforcement enabled (REQUIRE_PINNED_POOL_ROUTE_IN_PAPER=True): non-verified statuses reject cleanly
++    cfg_enf = AgentConfig(
++        _env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.001, REQUIRE_PINNED_POOL_ROUTE_IN_PAPER=True,
++    )
++    for idx, (quote_payload, expected_status, _expected_keys, allowed_enforced) in enumerate(paper_cases):
++        clear_buy_reservations()
++        db = AgentDatabase(db_path=str(tmp_path / f"e4b_paper_enf_{idx}.duckdb"), starting_sol=5.0)
++        order_i = _mk_e4b_order(mint=MINT_E4B)
++
++        def handler_e(_req: httpx.Request, qp: dict[str, Any] = quote_payload) -> httpx.Response:
++            return httpx.Response(200, json=qp)
++
++        async with httpx.AsyncClient(transport=httpx.MockTransport(handler_e)) as client:
++            out = await executor_node(
++                {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": order_i},
++                config=cfg_enf, db=db, http_client=client,
++            )
++        if allowed_enforced:
++            assert len(out["chart_positions"]) == 1
++        else:
++            assert out == {"pending_order": None}
++            assert get_inflight_buy_reservations(str(db.db_path)) == []
++            row = db.get_action_log(limit=1)[0]
++            assert row["pool_route_status"] == expected_status
++        db.close()

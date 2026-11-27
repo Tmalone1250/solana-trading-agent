@@ -16,6 +16,7 @@ from memory_guard import maybe_log_rss_memory
 from outcome_tracker import run_outcome_tracker_loop
 from state import FocusState
 from telemetry_api import create_telemetry_app
+from tx_reconciler import reconcile_unresolved_intents
 from whale_lane import run_whale_lane_tick
 from x_discovery_worker import run_x_discovery_loop
 
@@ -135,6 +136,13 @@ async def main() -> None:
         timeout=15.0,
         limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
     )
+    if config.EXECUTION_MODE == "live" and config.SOLANA_RPC_URL.strip():
+        try:
+            reconciled = await reconcile_unresolved_intents(db, config=config, client=shared_http_client)
+            if reconciled:
+                logger.info("[Startup] Reconciled durable order_intents: %s", reconciled)
+        except Exception as exc:
+            logger.exception("[Startup] Failed reconciling durable order_intents: %s", exc)
     app = create_telemetry_app(config=config, db=db, http_client=shared_http_client)
 
     uv_config = uvicorn.Config(

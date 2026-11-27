@@ -32,7 +32,7 @@ class StubDecisionClient:
 @pytest.mark.asyncio
 async def test_action_ledger_logs_buy_sell_evict_circuit_breaker_and_csv_export(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "action_ledger.duckdb"), starting_sol=0.7)
-    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.0)
+    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.0, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
     now_dt = datetime(2026, 11, 19, 20, 0, 0, tzinfo=timezone.utc)
 
     # 1. Safety Gate EVICT
@@ -73,6 +73,13 @@ async def test_action_ledger_logs_buy_sell_evict_circuit_breaker_and_csv_export(
 
     # 3. Executor BUY + SELL + REENTRY_BUY
     def jup_handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": "MintWin", "audit": {"isSus": False}}])
+        if "rugcheck.xyz" in url:
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/ultra/v1/shield" in url:
+            return httpx.Response(200, json={"warnings": {"MintWin": []}})
         if request.url.params.get("inputMint") == "MintWin":
             return httpx.Response(200, json={"outAmount": "575000000", "transaction": None})
         return httpx.Response(200, json={"outAmount": "1000000", "transaction": None})
@@ -220,7 +227,7 @@ async def test_action_ledger_logs_buy_sell_evict_circuit_breaker_and_csv_export(
 
     parsed_all = list(csv.DictReader(io.StringIO(resp_all.text)))
     assert list(parsed_all[0].keys()) == ACTION_LOG_COLUMNS
-    assert len(ACTION_LOG_COLUMNS) == 43
+    assert len(ACTION_LOG_COLUMNS) == 46
     assert len(parsed_all) == 10
     assert all(r["bot"] == "solana_meme" and r["unit"] == "SOL" for r in parsed_all)
     # Every row has enriched equity & daily realized SOL populated

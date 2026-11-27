@@ -50,7 +50,7 @@ class _StubDecision:
 
 def _make_breakout_candles(count: int = 18) -> list[dict[str, float]]:
     """Construct realistic 5m candles with alternating pullbacks (RSI ~60) + tight coil + breakout."""
-    base_ts = 1_795_700_000.0
+    base_ts = 1_795_680_000.0
     candles: list[dict[str, float]] = []
     prices = [
         0.96, 0.99, 0.97, 1.01, 0.98, 1.02, 0.99, 1.03,
@@ -151,24 +151,27 @@ async def test_e1_pool_identity_full_lifecycle_watchlist_partial_and_final_settl
         CHART_ENABLED_STRATEGIES="BREAKOUT_IGNITION",
         WHALE_STRATEGY_ENABLED=False,
         PAPER_TX_FEE_SOL=0.001,
+        PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
     )
     now_dt = datetime(2026, 11, 26, 12, 0, 0, tzinfo=timezone.utc)
     dex_id = "pumpswap"
 
     # 1. Watchlist persistence preserves (pair_address, dex_id) and refuses silent overwrite
+    c_life = _make_breakout_candles(18)
     cand = {
         "mint": MINT_LIFE,
         "symbol": "PLIFE",
         "pair_address": POOL_PINNED,
         "dex_id": dex_id,
         "added_at": (now_dt - timedelta(minutes=5)).isoformat(),
-        "candles_5m": _make_breakout_candles(18),
+        "candles_5m": c_life,
         **_strong_flow_pair(),
     }
     db.upsert_watchlist_entry(
         mint=MINT_LIFE, symbol="PLIFE", pair_address=POOL_PINNED, dex_id=dex_id,
-        candidate=cand, added_at=cand["added_at"],
+        candidate=cand, added_at=cand["added_at"], safety_passed=True,
     )
+    db.mark_watchlist_safety_passed(MINT_LIFE, True, checked_at=now_dt.isoformat())
     # Upsert again with a competing pool & different DEX -> original watchlist identity must remain intact
     db.upsert_watchlist_entry(
         mint=MINT_LIFE, symbol="PLIFE", pair_address=POOL_COMPETING, dex_id="raydium",
@@ -182,7 +185,12 @@ async def test_e1_pool_identity_full_lifecycle_watchlist_partial_and_final_settl
 
     # 2 & 3 (M-3). Even if refreshed candidate disagrees with pinned watchlist (POOL_COMPETING, raydium),
     # alpha_node preserves atomic watchlist tuple (POOL_PINNED, pumpswap) without mixing DEX IDs.
-    drifted_cand = {**cand, "pair_address": POOL_COMPETING, "dex_id": "raydium"}
+    drifted_cand = {
+        **cand,
+        "pair_address": POOL_COMPETING,
+        "dex_id": "raydium",
+        "_ohlcv_5m_result": __import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(c_life, last_ok_at=now_dt.timestamp()),
+    }
     out_alpha = await alpha_node(
         {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "safe_candidates": [drifted_cand]},
         config=cfg, db=db, decision_client=_StubDecision(_buy_decision_answers()), now=now_dt,  # type: ignore[arg-type]
@@ -195,6 +203,13 @@ async def test_e1_pool_identity_full_lifecycle_watchlist_partial_and_final_settl
 
     # 4, 5, 6, 7 & L-1A. Executor BUY -> ActivePosition -> PARTIAL_SELL -> Final SELL
     def jup_handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": MINT_LIFE, "audit": {"isSus": False}}])
+        if "rugcheck.xyz" in url:
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/ultra/v1/shield" in url:
+            return httpx.Response(200, json={"warnings": {MINT_LIFE: []}})
         if request.url.params.get("inputMint") == SOL_MINT:
             return httpx.Response(200, json={"outAmount": "1000000", "priceImpactPct": "-0.01", "transaction": None})
         if request.url.params.get("amount") == "500000":
@@ -286,12 +301,14 @@ async def test_e1_missing_or_invalid_pair_address_rejects_breakout_ignition(tmp_
     for bad_pair in ("", "   ", "unknown", "!!!!", "https://bad.url", "PoolNotBase58", MINT_NOPOOL):
         clear_narrative_cache()
         assert not is_valid_pool_address(bad_pair, mint=MINT_NOPOOL)
+        c_bad = _make_breakout_candles(18)
         cand = {
             "mint": MINT_NOPOOL,
             "symbol": "NOPOOL",
             "pair_address": bad_pair,
             "added_at": (now_dt - timedelta(minutes=5)).isoformat(),
-            "candles_5m": _make_breakout_candles(18),
+            "candles_5m": c_bad,
+            "_ohlcv_5m_result": __import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(c_bad, last_ok_at=now_dt.timestamp()),
             **_strong_flow_pair(),
         }
         out = await alpha_node(

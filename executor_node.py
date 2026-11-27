@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
+import math
+import re
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -14,8 +18,18 @@ from solders.transaction import VersionedTransaction
 
 from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
 from db import AgentDatabase, utc_now, utc_now_iso
+from jupiter_token_client import _build_headers as _jup_v2_headers
+from jupiter_token_client import _extract_token_list, parse_jupiter_token_v2
+from safety_gate_node import check_token_safety, is_safety_timestamp_fresh
 from state import ActivePosition, AgentGraphState, FocusState, PendingOrder, is_valid_pool_address
-from state_ledger import acquire_exit_guard, clear_sell_guard, finalize_exit_guard
+from state_ledger import (
+    acquire_exit_guard,
+    attach_intent_to_reservation,
+    clear_sell_guard,
+    finalize_exit_guard,
+    mark_buy_reservation_broadcast_unresolved,
+)
+from tx_reconciler import derive_and_validate_single_signer_tx
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +56,542 @@ def sign_jupiter_transaction(tx_base64: str, private_key_bs58: str) -> str:
     tx = VersionedTransaction.from_bytes(raw_tx)
     signed_tx = VersionedTransaction(tx.message, [keypair])
     return base64.b64encode(bytes(signed_tx)).decode("ascii")
+
+
+_ORIG_SIGN_JUPITER_TX = sign_jupiter_transaction
+
+AUTHORITATIVE_APPROVAL_PRICE_SOURCE = "dexscreener_pinned_pool_native"
+
+
+class E4AValidationError(RuntimeError):
+    """Raised when Phase E4A pre-broadcast approval or quote integrity checks fail."""
+
+
+def _parse_strict_int(raw: Any, field_name: str, *, min_value: int = 1) -> int:
+    """Strictly parse integer atomic/integer fields; reject bool, float, fractional, empty, malformed, or out-of-range."""
+    if raw is None or isinstance(raw, (bool, float)):
+        raise E4AValidationError(f"BLOCKED: INVALID_{field_name} ({raw!r})")
+    if isinstance(raw, int):
+        val = raw
+    elif isinstance(raw, str):
+        if not re.fullmatch(r"-?[0-9]+", raw):
+            raise E4AValidationError(f"BLOCKED: INVALID_{field_name} ({raw!r})")
+        val = int(raw)
+    else:
+        raise E4AValidationError(f"BLOCKED: INVALID_{field_name} ({raw!r})")
+    if val < min_value:
+        kind = "NEGATIVE" if val < 0 else "NONPOSITIVE"
+        raise E4AValidationError(f"BLOCKED: {kind}_{field_name} ({val})")
+    return val
+
+
+def _parse_iso_utc(raw: Optional[str]) -> Optional[datetime]:
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+
+def _parse_e4a_price_impact_pct(order_resp: dict[str, Any]) -> Optional[float]:
+    """Parse priceImpact first, falling back to deprecated priceImpactPct only when absent."""
+    if not isinstance(order_resp, dict):
+        return None
+    raw = order_resp.get("priceImpact")
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        raw = order_resp.get("priceImpactPct")
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        val = float(raw)
+    except (ValueError, TypeError):
+        return None
+    if not math.isfinite(val):
+        return None
+    return val
+
+
+def _e4a_is_active(order: PendingOrder, config: AgentConfig) -> bool:
+    """E4A applies to BREAKOUT_IGNITION BUY in live mode (unconditionally) or paper when any E4A threshold is configured."""
+    if order.side.upper() != "BUY":
+        return False
+    if str(order.strategy or "").upper() != "BREAKOUT_IGNITION":
+        return False
+    if config.EXECUTION_MODE == "live":
+        return True
+    return any(
+        getattr(config, attr) is not None
+        for attr in (
+            "MAX_BUY_APPROVAL_AGE_SECONDS",
+            "MAX_APPROVAL_PRICE_AGE_SECONDS",
+            "MAX_ENTRY_PRICE_DRIFT_PCT",
+            "MAX_NEGATIVE_ENTRY_DRIFT_PCT",
+            "MAX_WORST_CASE_ENTRY_DRIFT_PCT",
+            "MAX_QUOTE_AGE_SECONDS",
+            "MAX_ACCEPTED_SLIPPAGE_BPS",
+            "MAX_ENTRY_PRICE_IMPACT_PCT",
+            "MIN_BLOCK_HEIGHT_HEADROOM",
+            "MIN_RFQ_EXPIRY_HEADROOM_SECONDS",
+        )
+    )
+
+
+def _validate_e4a_approval_provenance(
+    order: PendingOrder,
+    config: AgentConfig,
+    *,
+    now_dt: datetime,
+) -> None:
+    """Validate pre-quote approval provenance, token decimals, and freshness."""
+    if not _e4a_is_active(order, config):
+        return
+
+    is_live = config.EXECUTION_MODE == "live"
+    if is_live:
+        required_live = (
+            "MAX_BUY_APPROVAL_AGE_SECONDS",
+            "MAX_APPROVAL_PRICE_AGE_SECONDS",
+            "MAX_ENTRY_PRICE_DRIFT_PCT",
+            "MAX_QUOTE_AGE_SECONDS",
+            "MAX_ACCEPTED_SLIPPAGE_BPS",
+            "MAX_ENTRY_PRICE_IMPACT_PCT",
+        )
+        missing_cfg = [k for k in required_live if getattr(config, k) is None]
+        if missing_cfg:
+            raise E4AValidationError(
+                f"BLOCKED: E4A_LIVE_THRESHOLDS_UNSET ({','.join(missing_cfg)})"
+            )
+
+    # Validate approval provenance whenever live OR any approval/drift threshold is set in paper
+    need_approval_ctx = is_live or any(
+        getattr(config, k) is not None
+        for k in (
+            "MAX_BUY_APPROVAL_AGE_SECONDS",
+            "MAX_APPROVAL_PRICE_AGE_SECONDS",
+            "MAX_ENTRY_PRICE_DRIFT_PCT",
+            "MAX_NEGATIVE_ENTRY_DRIFT_PCT",
+            "MAX_WORST_CASE_ENTRY_DRIFT_PCT",
+        )
+    )
+    if not need_approval_ctx:
+        return
+
+    app_dt = _parse_iso_utc(order.approved_at)
+    if app_dt is None:
+        raise E4AValidationError("BLOCKED: MISSING_OR_INVALID_APPROVED_AT")
+    if config.MAX_BUY_APPROVAL_AGE_SECONDS is not None:
+        app_age = (now_dt - app_dt).total_seconds()
+        if app_age > float(config.MAX_BUY_APPROVAL_AGE_SECONDS) or app_age < -5.0:
+            raise E4AValidationError(
+                f"BLOCKED: STALE_BUY_APPROVAL (age={app_age:.2f}s > {config.MAX_BUY_APPROVAL_AGE_SECONDS}s)"
+            )
+
+    obs_dt = _parse_iso_utc(order.approval_price_observed_at)
+    if obs_dt is None:
+        raise E4AValidationError("BLOCKED: MISSING_OR_INVALID_APPROVAL_PRICE_OBSERVED_AT")
+    if config.MAX_APPROVAL_PRICE_AGE_SECONDS is not None:
+        obs_age = (now_dt - obs_dt).total_seconds()
+        if obs_age > float(config.MAX_APPROVAL_PRICE_AGE_SECONDS) or obs_age < -5.0:
+            raise E4AValidationError(
+                f"BLOCKED: STALE_APPROVAL_PRICE (age={obs_age:.2f}s > {config.MAX_APPROVAL_PRICE_AGE_SECONDS}s)"
+            )
+
+    if order.approval_price_source != AUTHORITATIVE_APPROVAL_PRICE_SOURCE:
+        raise E4AValidationError(
+            f"BLOCKED: INVALID_APPROVAL_PRICE_SOURCE ({order.approval_price_source!r})"
+        )
+    if not order.pair_address or order.approval_pair_address != order.pair_address:
+        raise E4AValidationError(
+            f"BLOCKED: APPROVAL_POOL_MISMATCH (approval={order.approval_pair_address!r} != order={order.pair_address!r})"
+        )
+    pn = order.approval_price_native
+    if pn is None or isinstance(pn, bool) or not math.isfinite(float(pn)) or float(pn) <= 0.0:
+        raise E4AValidationError(f"BLOCKED: INVALID_APPROVAL_PRICE_NATIVE ({pn!r})")
+
+    dec = order.token_decimals
+    if dec is None or isinstance(dec, bool) or not isinstance(dec, int) or not (0 <= dec <= 18):
+        raise E4AValidationError(f"BLOCKED: MISSING_OR_INVALID_TOKEN_DECIMALS ({dec!r})")
+
+
+async def _fetch_rpc_block_height(config: AgentConfig, client: httpx.AsyncClient) -> int:
+    rpc_url = config.SOLANA_RPC_URL.strip()
+    if not rpc_url:
+        raise E4AValidationError("BLOCKED: SOLANA_RPC_URL_MISSING_FOR_BLOCK_HEIGHT")
+    resp = await client.post(
+        rpc_url,
+        json={"jsonrpc": "2.0", "id": 1, "method": "getBlockHeight", "params": [{"commitment": "confirmed"}]},
+        timeout=config.LIVE_RPC_TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict) or data.get("error") is not None:
+        raise E4AValidationError(f"BLOCKED: RPC_BLOCK_HEIGHT_ERROR ({data})")
+    bh = data.get("result")
+    if isinstance(bh, bool) or not isinstance(bh, int) or bh < 0:
+        raise E4AValidationError(f"BLOCKED: INVALID_RPC_BLOCK_HEIGHT ({bh!r})")
+    return bh
+
+
+async def _validate_e4a_quote_timing_and_expiry(
+    order_resp: dict[str, Any],
+    config: AgentConfig,
+    *,
+    quote_received_at: datetime,
+    client: httpx.AsyncClient,
+    stage: str,
+    is_live: bool,
+    now_dt: Optional[datetime] = None,
+) -> None:
+    """Validate quote age and router-specific expiry at receipt, pre-sign, and pre-submit checkpoints."""
+    check_now = now_dt or utc_now()
+    if config.MAX_QUOTE_AGE_SECONDS is not None:
+        q_age = (check_now - quote_received_at).total_seconds()
+        if q_age > float(config.MAX_QUOTE_AGE_SECONDS):
+            raise E4AValidationError(
+                f"BLOCKED: STALE_QUOTE_{stage} (age={q_age:.2f}s > {config.MAX_QUOTE_AGE_SECONDS}s)"
+            )
+
+    raw_router = order_resp.get("router")
+    router = raw_router.strip().lower() if isinstance(raw_router, str) else ""
+    if router in ("metis", "dflow", "okx"):
+        headroom_bh = config.MIN_BLOCK_HEIGHT_HEADROOM
+        if is_live and headroom_bh is None:
+            raise E4AValidationError("BLOCKED: MIN_BLOCK_HEIGHT_HEADROOM_UNSET")
+        if headroom_bh is not None:
+            lvbh = _parse_strict_int(
+                order_resp.get("lastValidBlockHeight"),
+                f"LAST_VALID_BLOCK_HEIGHT_{stage}",
+                min_value=1,
+            )
+            curr_bh = await _fetch_rpc_block_height(config, client)
+            if curr_bh >= lvbh - int(headroom_bh):
+                raise E4AValidationError(
+                    f"BLOCKED: QUOTE_BLOCK_HEIGHT_EXPIRED_{stage} (curr={curr_bh} >= lvbh={lvbh} - {headroom_bh})"
+                )
+    elif router == "jupiterz":
+        headroom = config.MIN_RFQ_EXPIRY_HEADROOM_SECONDS
+        if is_live and headroom is None:
+            raise E4AValidationError("BLOCKED: MIN_RFQ_EXPIRY_HEADROOM_SECONDS_UNSET")
+        if headroom is not None or is_live:
+            exp_dt = _parse_iso_utc(order_resp.get("expireAt"))
+            if exp_dt is None:
+                raise E4AValidationError(f"BLOCKED: MISSING_OR_INVALID_EXPIRE_AT_{stage}")
+            if check_now.timestamp() >= exp_dt.timestamp() - float(headroom or 0.0):
+                raise E4AValidationError(f"BLOCKED: QUOTE_EXPIRED_RFQ_{stage}")
+    elif is_live:
+        raise E4AValidationError(f"BLOCKED: UNSUPPORTED_OR_MISSING_ROUTER_{stage} ({raw_router!r})")
+
+
+async def _validate_e4a_quote_receipt(
+    order: PendingOrder,
+    order_resp: dict[str, Any],
+    out_amount: int,
+    config: AgentConfig,
+    *,
+    quote_received_at: datetime,
+    client: httpx.AsyncClient,
+    now_dt: Optional[datetime] = None,
+) -> None:
+    """Checkpoint 1: Validate out_amount > 0, quote timing/expiry, slippage, priceImpact, and drift."""
+    if out_amount <= 0:
+        raise E4AValidationError(f"BLOCKED: NONPOSITIVE_OUT_AMOUNT ({out_amount})")
+
+    if not _e4a_is_active(order, config):
+        return
+
+    is_live = config.EXECUTION_MODE == "live"
+    await _validate_e4a_quote_timing_and_expiry(
+        order_resp, config, quote_received_at=quote_received_at, client=client,
+        stage="RECEIPT", is_live=is_live, now_dt=now_dt,
+    )
+
+    # Slippage validation (preserve RTSE; validate response slippageBps if present/configured)
+    if config.MAX_ACCEPTED_SLIPPAGE_BPS is not None:
+        raw_slip = order_resp.get("slippageBps")
+        if raw_slip is None:
+            if is_live:
+                raise E4AValidationError("BLOCKED: MISSING_RESPONSE_SLIPPAGE_BPS")
+        else:
+            slip_bps = _parse_strict_int(raw_slip, "RESPONSE_SLIPPAGE_BPS", min_value=0)
+            if slip_bps > int(config.MAX_ACCEPTED_SLIPPAGE_BPS):
+                raise E4AValidationError(
+                    f"BLOCKED: EXCESSIVE_SLIPPAGE_BPS ({slip_bps} > {config.MAX_ACCEPTED_SLIPPAGE_BPS})"
+                )
+
+    # Price impact validation (priceImpact primary, priceImpactPct fallback; missing != 0)
+    if config.MAX_ENTRY_PRICE_IMPACT_PCT is not None:
+        impact_pct = _parse_e4a_price_impact_pct(order_resp)
+        if impact_pct is None:
+            raise E4AValidationError("BLOCKED: MISSING_OR_MALFORMED_PRICE_IMPACT")
+        if abs(impact_pct) > float(config.MAX_ENTRY_PRICE_IMPACT_PCT):
+            raise E4AValidationError(
+                f"BLOCKED: EXCESSIVE_PRICE_IMPACT (|{impact_pct:.4f}| > {config.MAX_ENTRY_PRICE_IMPACT_PCT})"
+            )
+
+    # Entry price drift & worst-case otherAmountThreshold validation
+    if any(
+        getattr(config, k) is not None
+        for k in ("MAX_ENTRY_PRICE_DRIFT_PCT", "MAX_NEGATIVE_ENTRY_DRIFT_PCT", "MAX_WORST_CASE_ENTRY_DRIFT_PCT")
+    ):
+        assert order.approval_price_native is not None and order.token_decimals is not None
+        spent_sol = order.amount_atomic / LAMPORTS_PER_SOL
+        quoted_tokens = out_amount / (10 ** order.token_decimals)
+        if quoted_tokens <= 0.0:
+            raise E4AValidationError("BLOCKED: ZERO_QUOTED_TOKENS")
+        quote_price_native = spent_sol / quoted_tokens
+        entry_drift_pct = ((quote_price_native - order.approval_price_native) / order.approval_price_native) * 100.0
+
+        if config.MAX_ENTRY_PRICE_DRIFT_PCT is not None and entry_drift_pct > float(config.MAX_ENTRY_PRICE_DRIFT_PCT):
+            raise E4AValidationError(
+                f"BLOCKED: EXCESSIVE_ADVERSE_ENTRY_DRIFT ({entry_drift_pct:.4f}% > {config.MAX_ENTRY_PRICE_DRIFT_PCT}%)"
+            )
+        if config.MAX_NEGATIVE_ENTRY_DRIFT_PCT is not None and entry_drift_pct < -float(config.MAX_NEGATIVE_ENTRY_DRIFT_PCT):
+            raise E4AValidationError(
+                f"BLOCKED: EXCESSIVE_NEGATIVE_ENTRY_DRIFT ({entry_drift_pct:.4f}% < -{config.MAX_NEGATIVE_ENTRY_DRIFT_PCT}%)"
+            )
+
+        oat_int = _parse_strict_int(
+            order_resp.get("otherAmountThreshold"),
+            "OTHER_AMOUNT_THRESHOLD",
+            min_value=1,
+        )
+        if oat_int > out_amount:
+            raise E4AValidationError(
+                f"BLOCKED: INCONSISTENT_OTHER_AMOUNT_THRESHOLD ({oat_int} > {out_amount})"
+            )
+        wc_tokens = oat_int / (10 ** order.token_decimals)
+        wc_price_native = spent_sol / wc_tokens
+        wc_drift_pct = ((wc_price_native - order.approval_price_native) / order.approval_price_native) * 100.0
+        wc_limit = (
+            float(config.MAX_WORST_CASE_ENTRY_DRIFT_PCT)
+            if config.MAX_WORST_CASE_ENTRY_DRIFT_PCT is not None
+            else (float(config.MAX_ENTRY_PRICE_DRIFT_PCT) if config.MAX_ENTRY_PRICE_DRIFT_PCT is not None else None)
+        )
+        if wc_limit is not None and wc_drift_pct > wc_limit:
+            raise E4AValidationError(
+                f"BLOCKED: EXCESSIVE_WORST_CASE_DRIFT ({wc_drift_pct:.4f}% > {wc_limit}%)"
+            )
+
+
+def _evaluate_e4b_route_pool(
+    order: PendingOrder,
+    order_resp: dict[str, Any],
+) -> tuple[Optional[str], list[str], str, Optional[str]]:
+    """Evaluate Jupiter routePlan against pinned pair_address per E4B router-specific contract.
+
+    Returns (router_norm, route_pool_keys, pool_route_status, block_reason).
+    """
+    raw_router = order_resp.get("router")
+    router_norm = raw_router.strip().lower() if isinstance(raw_router, str) and raw_router.strip() else None
+
+    route_plan = order_resp.get("routePlan")
+    route_pool_keys: list[str] = []
+    if isinstance(route_plan, list):
+        for hop in route_plan:
+            if isinstance(hop, dict) and isinstance(hop.get("swapInfo"), dict):
+                ak = hop["swapInfo"].get("ammKey")
+                if isinstance(ak, str) and ak.strip():
+                    route_pool_keys.append(ak.strip())
+
+    if router_norm != "metis":
+        return (
+            router_norm,
+            route_pool_keys,
+            "UNVERIFIABLE_ROUTER",
+            f"BLOCKED: ROUTE_POOL_UNVERIFIABLE (router={raw_router!r})",
+        )
+
+    if not isinstance(route_plan, list) or len(route_plan) == 0:
+        return (
+            router_norm,
+            route_pool_keys,
+            "MISSING_ROUTE_PLAN",
+            "BLOCKED: ROUTE_POOL_UNVERIFIABLE (missing or empty routePlan)",
+        )
+
+    pinned_pair = str(order.pair_address or "").strip()
+    qualifying_hops = 0
+    for hop in route_plan:
+        if not isinstance(hop, dict) or not isinstance(hop.get("swapInfo"), dict):
+            return (
+                router_norm,
+                route_pool_keys,
+                "MISSING_ROUTE_PLAN",
+                "BLOCKED: ROUTE_POOL_UNVERIFIABLE (malformed routePlan hop)",
+            )
+        swap_info = hop["swapInfo"]
+        in_mint = swap_info.get("inputMint")
+        out_mint = swap_info.get("outputMint")
+        if in_mint == order.mint or out_mint == order.mint:
+            qualifying_hops += 1
+            amm_key = swap_info.get("ammKey")
+            if not isinstance(amm_key, str) or not amm_key.strip():
+                return (
+                    router_norm,
+                    route_pool_keys,
+                    "MISSING_ROUTE_PLAN",
+                    "BLOCKED: ROUTE_POOL_UNVERIFIABLE (missing swapInfo.ammKey on target-mint hop)",
+                )
+            if amm_key.strip() != pinned_pair:
+                return (
+                    router_norm,
+                    route_pool_keys,
+                    "POOL_MISMATCH",
+                    f"BLOCKED: ROUTE_POOL_MISMATCH (expected={pinned_pair}, got={amm_key.strip()})",
+                )
+
+    if qualifying_hops == 0:
+        return (
+            router_norm,
+            route_pool_keys,
+            "MISSING_ROUTE_PLAN",
+            "BLOCKED: ROUTE_POOL_UNVERIFIABLE (no target-mint hop in routePlan)",
+        )
+
+    return (router_norm, route_pool_keys, "VERIFIED_PINNED_POOL", None)
+
+
+async def _validate_e4e_pre_execution_safety(
+    order: PendingOrder,
+    *,
+    config: AgentConfig,
+    db: AgentDatabase,
+    client: httpx.AsyncClient,
+    now_dt: Optional[datetime] = None,
+) -> None:
+    """Phase E4E: Pre-execution BUY safety freshness boundary (outside db._lock)."""
+    ttl = config.PRE_EXECUTION_SAFETY_TTL_SECONDS
+    is_breakout = (order.strategy or "").strip().upper() == "BREAKOUT_IGNITION"
+    if ttl is None:
+        raise E4AValidationError("BLOCKED: PRE_EXECUTION_SAFETY_TTL_UNSET")
+    if isinstance(ttl, bool) or not math.isfinite(float(ttl)) or float(ttl) <= 0.0:
+        raise E4AValidationError("BLOCKED: INVALID_PRE_EXECUTION_SAFETY_TTL")
+
+    ref_now = now_dt or utc_now()
+    if ref_now.tzinfo is None:
+        ref_now = ref_now.replace(tzinfo=timezone.utc)
+
+    # Read watchlist entry under db._lock (released before any network request)
+    w_row = db.get_watchlist_entry(order.mint)
+    if is_breakout:
+        if w_row is None:
+            raise E4AValidationError("BLOCKED: MISSING_WATCHLIST_ROW_AT_SAFETY")
+        w_pair = str(w_row.get("pair_address") or "").strip()
+        if not w_pair or not is_valid_pool_address(w_pair, mint=order.mint):
+            raise E4AValidationError(f"BLOCKED: INVALID_WATCHLIST_PINNED_POOL ({w_pair!r})")
+        if w_pair != str(order.pair_address or "").strip():
+            raise E4AValidationError(
+                f"BLOCKED: PINNED_POOL_MISMATCH_AT_SAFETY (order={order.pair_address}, watchlist={w_pair})"
+            )
+
+    persisted_fresh = bool(
+        w_row is not None
+        and w_row.get("safety_passed") is True
+        and is_safety_timestamp_fresh(w_row.get("safety_checked_at"), float(ttl), now_dt=ref_now)
+    )
+
+    confirmed_unsafe: list[str] = []
+    # 1. Always run Jupiter Token v2 explicit audit.isSus check (must never be bypassed by fresh persisted safety)
+    try:
+        v2_resp = await client.get(
+            f"{config.JUPITER_TOKENS_V2_BASE_URL}/search",
+            params={"query": order.mint},
+            headers=_jup_v2_headers(config),
+            timeout=10.0,
+        )
+        v2_resp.raise_for_status()
+        v2_payload = v2_resp.json()
+        items = _extract_token_list(v2_payload)
+        if not items and isinstance(v2_payload, dict) and (v2_payload.get("id") or v2_payload.get("address")):
+            items = [v2_payload]
+        matched_item: Optional[dict[str, Any]] = None
+        for item in items:
+            if isinstance(item, dict) and str(item.get("id") or item.get("address") or "").strip() == order.mint:
+                matched_item = item
+                break
+        if matched_item is None:
+            raise E4AValidationError("BLOCKED: PRE_EXECUTION_JUPITER_V2_MISSING_MINT")
+        audit_obj = matched_item.get("audit")
+        if not isinstance(audit_obj, dict) or "isSus" not in audit_obj or not isinstance(audit_obj["isSus"], bool):
+            raise E4AValidationError("BLOCKED: PRE_EXECUTION_JUPITER_V2_MALFORMED_AUDIT")
+        if audit_obj["isSus"] is True:
+            confirmed_unsafe.append("Jupiter Token v2: audit.isSus=True")
+    except E4AValidationError:
+        raise
+    except Exception as exc:
+        raise E4AValidationError(f"BLOCKED: PRE_EXECUTION_JUPITER_V2_UNAVAILABLE ({exc})") from exc
+
+    # 2. Full check_token_safety (RugCheck summary + Jupiter Shield) when persisted report is stale/missing
+    if not persisted_fresh:
+        report = await check_token_safety(order.mint, config, client)
+        if not report.passed:
+            for r in report.reasons:
+                if "unavailable/failed" in r.lower():
+                    if not confirmed_unsafe:
+                        raise E4AValidationError(
+                            f"BLOCKED: PRE_EXECUTION_SAFETY_UNAVAILABLE ({'; '.join(report.reasons)})"
+                        )
+                else:
+                    confirmed_unsafe.append(r)
+
+    if confirmed_unsafe:
+        reason_str = "; ".join(confirmed_unsafe)
+        db.remove_from_watchlist(order.mint)
+        db.set_cooldown_minutes(
+            order.mint,
+            minutes=config.SAFETY_REJECT_COOLDOWN_MINUTES,
+            reason=f"SAFETY_REJECT: {reason_str}",
+            now=ref_now,
+        )
+        db.log_action(
+            mode=config.EXECUTION_MODE,
+            action="EVICT",
+            symbol=order.symbol,
+            asset_id=order.mint,
+            strategy="SAFETY_GATE",
+            reason=f"SAFETY_REJECT: {reason_str}",
+            timestamp_utc=ref_now.isoformat(),
+            pair_address=order.pair_address,
+            dex_id=order.dex_id,
+        )
+        raise E4AValidationError(f"BLOCKED: PRE_EXECUTION_SAFETY_FAILED ({reason_str})")
+
+    if not persisted_fresh and w_row is not None:
+        db.mark_watchlist_safety_passed(order.mint, True, checked_at=ref_now.isoformat())
+
+
+async def fetch_live_wallet_sol_balance(
+    pubkey: str,
+    *,
+    config: AgentConfig,
+    client: httpx.AsyncClient,
+) -> float:
+    """Query Solana JSON-RPC getBalance(confirmed) outside db._lock and return spendable wallet SOL."""
+    rpc_url = config.SOLANA_RPC_URL.strip()
+    if not rpc_url or not (rpc_url.startswith("http://") or rpc_url.startswith("https://")):
+        raise RuntimeError("SOLANA_RPC_URL is missing or malformed for live balance verification")
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getBalance",
+        "params": [pubkey, {"commitment": "confirmed"}],
+    }
+    resp = await client.post(rpc_url, json=payload, timeout=config.LIVE_RPC_TIMEOUT_SECONDS)
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict) or data.get("error") is not None:
+        raise RuntimeError(f"Solana RPC getBalance error: {data.get('error') if isinstance(data, dict) else data}")
+    result = data.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError("Solana RPC getBalance missing result object")
+    lamports = result.get("value")
+    if isinstance(lamports, bool) or not isinstance(lamports, int) or lamports < 0:
+        raise RuntimeError(f"Solana RPC getBalance invalid lamports value: {lamports!r}")
+    return lamports / LAMPORTS_PER_SOL
 
 
 async def fetch_jupiter_order(
@@ -126,57 +676,106 @@ async def executor_node(
     if config.EXECUTION_MODE == "paper":
         tx_fee_opt: Optional[float] = float(config.PAPER_TX_FEE_SOL)
         tx_fee_status = "PAPER_ASSUMED"
+        reserve_fee_sol = float(config.PAPER_TX_FEE_SOL)
     else:
         tx_fee_opt = None
         tx_fee_status = "UNKNOWN"
+        # Reservation headroom only (base fee + priority fee + possible ATA rent); never persisted as observed fee
+        reserve_fee_sol = float(config.LIVE_FEE_RESERVATION_BUFFER_SOL)
+
+    taker: Optional[str] = None
+    if config.EXECUTION_MODE == "live":
+        keypair = Keypair.from_base58_string(config.SOLANA_PRIVATE_KEY_BS58)
+        taker = str(keypair.pubkey())
+
     lane_tag = "whale" if is_whale_slot else "chart"
     reservation_id: Optional[str] = None
+    owns_client = http_client is None
+    client = http_client or httpx.AsyncClient()
     if is_buy:
-        if is_whale_slot:
-            if not config.WHALE_STRATEGY_ENABLED:
-                logger.warning("[Executor] Strategy gate blocked whale_slot BUY of %s: WHALE_STRATEGY_ENABLED=False", order.symbol)
+        try:
+            if is_whale_slot:
+                if not config.WHALE_STRATEGY_ENABLED:
+                    logger.warning("[Executor] Strategy gate blocked whale_slot BUY of %s: WHALE_STRATEGY_ENABLED=False", order.symbol)
+                    return {"pending_order": None}
+            elif not config.is_chart_strategy_enabled(order.strategy, allow_legacy_scalper_when_all_enabled=True):
+                logger.warning(
+                    "[Executor] Strategy allowlist blocked chart_slot BUY of %s: strategy=%s not in CHART_ENABLED_STRATEGIES (%s)",
+                    order.symbol, order.strategy, ",".join(sorted(config.chart_enabled_strategies())),
+                )
                 return {"pending_order": None}
-        elif not config.is_chart_strategy_enabled(order.strategy, allow_legacy_scalper_when_all_enabled=True):
-            logger.warning(
-                "[Executor] Strategy allowlist blocked chart_slot BUY of %s: strategy=%s not in CHART_ENABLED_STRATEGIES (%s)",
-                order.symbol, order.strategy, ",".join(sorted(config.chart_enabled_strategies())),
+            elif str(order.strategy or "").upper() == "BREAKOUT_IGNITION" and not is_valid_pool_address(order.pair_address, mint=order.mint):
+                rej_msg = "BLOCKED: MISSING_OR_INVALID_POOL_IDENTITY (pair_address absent or invalid at executor)"
+                logger.warning("[Executor] Pool identity guard blocked BREAKOUT_IGNITION BUY of %s: %s", order.symbol, rej_msg)
+                db.log_action(
+                    mode=config.EXECUTION_MODE, action="DECISION_1", symbol=order.symbol, asset_id=order.mint,
+                    strategy="BREAKOUT_IGNITION", reason=rej_msg,
+                    pair_address=None, dex_id=order.dex_id,
+                )
+                return {"pending_order": None}
+            active_pos_for_reentry = state.get("active_position") or st_live.get("active_position")
+            is_reentry_same_mint = (
+                not is_whale_slot and order.reason == "LEG_2_REENTRY"
+                and isinstance(active_pos_for_reentry, dict) and active_pos_for_reentry.get("mint") == order.mint
+                and state.get("focus_state") == FocusState.WATCHING_REENTRY.value
             )
-            return {"pending_order": None}
-        elif str(order.strategy or "").upper() == "BREAKOUT_IGNITION" and not is_valid_pool_address(order.pair_address, mint=order.mint):
-            rej_msg = "BLOCKED: MISSING_OR_INVALID_POOL_IDENTITY (pair_address absent or invalid at executor)"
-            logger.warning("[Executor] Pool identity guard blocked BREAKOUT_IGNITION BUY of %s: %s", order.symbol, rej_msg)
-            db.log_action(
-                mode=config.EXECUTION_MODE, action="DECISION_1", symbol=order.symbol, asset_id=order.mint,
-                strategy="BREAKOUT_IGNITION", reason=rej_msg,
-                pair_address=None, dex_id=order.dex_id,
+            # Also block if caller passed in-memory open mints not yet persisted
+            caller_open = {
+                str(p["mint"]) for p in (state.get("chart_positions") or []) + (state.get("whale_positions") or []) + [state.get("active_position"), state.get("whale_position")]
+                if isinstance(p, dict) and p.get("mint")
+            }
+            if order.mint in caller_open and not is_reentry_same_mint:
+                logger.warning("[Executor] Duplicate mint guard blocked %s BUY of %s", f"{lane_tag}_slot", order.symbol)
+                return {"pending_order": None}
+
+            # Phase E4A: Pre-quote approval provenance & threshold validation
+            try:
+                _validate_e4a_approval_provenance(order, config, now_dt=utc_now())
+            except E4AValidationError as exc:
+                logger.warning("[Executor] E4A approval guard blocked %s BUY of %s: %s", f"{lane_tag}_slot", order.symbol, exc)
+                db.log_action(
+                    mode=config.EXECUTION_MODE, action="DECISION_1", symbol=order.symbol, asset_id=order.mint,
+                    strategy=order.strategy or "SCALPER", reason=str(exc),
+                    pair_address=order.pair_address, dex_id=order.dex_id,
+                )
+                return {"pending_order": None}
+
+            # Live mode: fetch actual wallet SOL balance via RPC strictly OUTSIDE db._lock; fail closed on any error
+            live_wallet_sol: Optional[float] = None
+            if config.EXECUTION_MODE == "live":
+                assert taker is not None
+                try:
+                    live_wallet_sol = await fetch_live_wallet_sol_balance(taker, config=config, client=client)
+                except Exception as exc:
+                    logger.warning(
+                        "[Executor] BLOCKED: LIVE_RPC_BALANCE_UNAVAILABLE for %s BUY of %s: %s",
+                        f"{lane_tag}_slot", order.symbol, exc,
+                    )
+                    return {"pending_order": None}
+
+            req_sol = order.amount_atomic / LAMPORTS_PER_SOL
+            lane_cap = config.MAX_WHALE_POSITIONS if is_whale_slot else config.MAX_CHART_POSITIONS
+            fb_sol_state = float(state["sol_balance"]) if "sol_balance" in state and state["sol_balance"] is not None else None
+            reservation_id, rej_reason = db.reserve_buy_slot(
+                lane=lane_tag, mint=order.mint, required_sol=req_sol,
+                tx_fee_sol=reserve_fee_sol,
+                max_lane_positions=lane_cap, max_open_positions=config.MAX_OPEN_POSITIONS,
+                is_reentry_same_mint=is_reentry_same_mint, fallback_state_sol=fb_sol_state,
+                daily_max_loss_pct=config.DAILY_MAX_LOSS_PCT,
+                live_wallet_sol=live_wallet_sol,
+                live_min_sol_reserve=float(config.LIVE_MIN_SOL_RESERVE) if config.EXECUTION_MODE == "live" else 0.0,
+                balance_divergence_warn_sol=float(config.BALANCE_DIVERGENCE_WARN_SOL) if config.EXECUTION_MODE == "live" else None,
             )
-            return {"pending_order": None}
-        active_pos_for_reentry = state.get("active_position") or st_live.get("active_position")
-        is_reentry_same_mint = (
-            not is_whale_slot and order.reason == "LEG_2_REENTRY"
-            and isinstance(active_pos_for_reentry, dict) and active_pos_for_reentry.get("mint") == order.mint
-            and state.get("focus_state") == FocusState.WATCHING_REENTRY.value
-        )
-        # Also block if caller passed in-memory open mints not yet persisted
-        caller_open = {
-            str(p["mint"]) for p in (state.get("chart_positions") or []) + (state.get("whale_positions") or []) + [state.get("active_position"), state.get("whale_position")]
-            if isinstance(p, dict) and p.get("mint")
-        }
-        if order.mint in caller_open and not is_reentry_same_mint:
-            logger.warning("[Executor] Duplicate mint guard blocked %s BUY of %s", f"{lane_tag}_slot", order.symbol)
-            return {"pending_order": None}
-        req_sol = order.amount_atomic / LAMPORTS_PER_SOL
-        lane_cap = config.MAX_WHALE_POSITIONS if is_whale_slot else config.MAX_CHART_POSITIONS
-        fb_sol_state = float(state["sol_balance"]) if "sol_balance" in state and state["sol_balance"] is not None else None
-        reservation_id, rej_reason = db.reserve_buy_slot(
-            lane=lane_tag, mint=order.mint, required_sol=req_sol,
-            tx_fee_sol=float(tx_fee_opt) if tx_fee_opt is not None else 0.0,
-            max_lane_positions=lane_cap, max_open_positions=config.MAX_OPEN_POSITIONS,
-            is_reentry_same_mint=is_reentry_same_mint, fallback_state_sol=fb_sol_state,
-        )
-        if rej_reason is not None:
-            logger.warning("[Executor] Pre-trade reservation blocked %s BUY of %s: %s", f"{lane_tag}_slot", order.symbol, rej_reason)
-            return {"pending_order": None}
+            if rej_reason is not None:
+                logger.warning("[Executor] Pre-trade reservation blocked %s BUY of %s: %s", f"{lane_tag}_slot", order.symbol, rej_reason)
+                return {"pending_order": None}
+        except BaseException:
+            if owns_client:
+                await client.aclose()
+            raise
+        finally:
+            if reservation_id is None and owns_client:
+                await client.aclose()
 
     is_exit = not is_buy
     live_lane_for_fb = whale_positions if is_whale_slot else chart_positions
@@ -208,6 +807,8 @@ async def executor_node(
         )
         if is_dup:
             logger.warning("[Executor] Duplicate/already-closed %s skipped for %s (%s)", side_up, order.symbol, order.reason)
+            if owns_client:
+                await client.aclose()
             return {
                 "focus_state": st_live["focus_state"], "sol_balance": float(st_live["sol_balance"]),
                 "daily_pnl_sol": float(st_live["daily_pnl_sol"]), "active_position": st_live["active_position"],
@@ -218,21 +819,23 @@ async def executor_node(
 
     input_mint = SOL_MINT if is_buy else order.mint
     output_mint = order.mint if is_buy else SOL_MINT
+    broadcast_attempted = False
+    settled_buy = False
+    intent_id: Optional[str] = None
+    buy_opened_at = utc_now_iso() if is_buy else None
+    e4b_router: Optional[str] = None
+    e4b_pool_keys: list[str] = []
+    e4b_pool_status: Optional[str] = None
 
-    taker: Optional[str] = None
-    if config.EXECUTION_MODE == "live":
-        keypair = Keypair.from_base58_string(config.SOLANA_PRIVATE_KEY_BS58)
-        taker = str(keypair.pubkey())
-
-    owns_client = http_client is None
-    client = http_client or httpx.AsyncClient()
     try:
+        if is_buy:
+            await _validate_e4e_pre_execution_safety(order, config=config, db=db, client=client)
         try:
             order_resp = await fetch_jupiter_order(
                 input_mint=input_mint, output_mint=output_mint,
                 amount_atomic=order.amount_atomic, config=config, client=client, taker=taker,
             )
-            out_amount = int(order_resp["outAmount"])
+            quote_received_at = utc_now()
         except Exception as exc:
             if not is_buy and config.EXECUTION_MODE != "live":
                 fb_sol = float(existing_for_fallback.get("current_sol_value") or existing_for_fallback.get("entry_sol") or 0.0) if isinstance(existing_for_fallback, dict) else 0.0
@@ -241,27 +844,152 @@ async def executor_node(
                     fb_sol = round(fb_sol * fb_frac, 6)
                 logger.warning("[Executor] Jupiter quote failed on %s %s (%s); falling back to live SOL quote %.4f", order.side, order.symbol, exc, fb_sol)
                 order_resp = {"outAmount": str(max(1, int(round(fb_sol * LAMPORTS_PER_SOL)))), "transaction": None}
-                out_amount = int(order_resp["outAmount"])
+                quote_received_at = utc_now()
             else:
                 raise
+        out_amount = _parse_strict_int(order_resp.get("outAmount"), "OUT_AMOUNT", min_value=1)
+        # Phase E4B: Evaluate execution pool route telemetry before E4A checks so telemetry is always logged
+        e4b_block: Optional[str] = None
+        if is_buy and (order.strategy or "").strip().upper() == "BREAKOUT_IGNITION":
+            e4b_router, e4b_pool_keys, e4b_pool_status, e4b_block = _evaluate_e4b_route_pool(order, order_resp)
+        # Checkpoint 1: Quote receipt validation (out_amount > 0 in all modes, plus E4A drift/impact/slippage/expiry)
+        await _validate_e4a_quote_receipt(
+            order, order_resp, out_amount, config, quote_received_at=quote_received_at, client=client,
+        )
+        # Phase E4B: Enforce execution pool integrity (live unconditionally fail-closed; paper opt-in)
+        if e4b_block is not None and (
+            config.EXECUTION_MODE == "live" or config.REQUIRE_PINNED_POOL_ROUTE_IN_PAPER
+        ):
+            raise E4AValidationError(e4b_block)
         tx_signature: Optional[str] = None
         if config.EXECUTION_MODE == "live":
             tx_b64 = order_resp.get("transaction")
             request_id = str(order_resp.get("requestId") or "")
             if not tx_b64:
                 raise RuntimeError("Jupiter /swap/v2/order returned no transaction in live mode")
-            signed_b64 = sign_jupiter_transaction(tx_b64, config.SOLANA_PRIVATE_KEY_BS58)
+            # Checkpoint 2: Pre-sign quote timing & router expiry
+            if _e4a_is_active(order, config):
+                await _validate_e4a_quote_timing_and_expiry(
+                    order_resp, config, quote_received_at=quote_received_at, client=client,
+                    stage="PRE_SIGN", is_live=True,
+                )
+            pre_sig: Optional[str] = None
+            if sign_jupiter_transaction is _ORIG_SIGN_JUPITER_TX:
+                assert taker is not None
+                signed_b64, pre_sig = derive_and_validate_single_signer_tx(
+                    tx_b64, config.SOLANA_PRIVATE_KEY_BS58, order_resp, taker,
+                )
+            else:
+                signed_b64 = sign_jupiter_transaction(tx_b64, config.SOLANA_PRIVATE_KEY_BS58)
+
+            if is_buy:
+                intent_id = uuid.uuid4().hex
+                lvbh_raw = order_resp.get("lastValidBlockHeight")
+                lvbh_val = _parse_strict_int(lvbh_raw, "LAST_VALID_BLOCK_HEIGHT", min_value=1) if lvbh_raw is not None else None
+                oat_raw = order_resp.get("otherAmountThreshold")
+                oat_val = _parse_strict_int(oat_raw, "OTHER_AMOUNT_THRESHOLD", min_value=1) if oat_raw is not None else None
+                db.create_order_intent(
+                    intent_id=intent_id,
+                    reservation_id=reservation_id,
+                    lane=lane_tag,
+                    mint=order.mint,
+                    symbol=order.symbol,
+                    pair_address=order.pair_address,
+                    dex_id=order.dex_id,
+                    side=order.side,
+                    strategy=order.strategy or "SCALPER",
+                    router=str(order_resp.get("router") or "") or None,
+                    order_mode=str(order_resp.get("mode") or "") or None,
+                    jupiter_request_id=request_id or None,
+                    tx_signature=pre_sig,
+                    last_valid_block_height=lvbh_val,
+                    expire_at=str(order_resp.get("expireAt") or "") or None,
+                    input_mint=input_mint,
+                    output_mint=output_mint,
+                    amount_atomic=order.amount_atomic,
+                    expected_out_amount=out_amount,
+                    other_amount_threshold=oat_val,
+                    token_decimals=order.token_decimals,
+                    taker_pubkey=taker,
+                    reserved_sol=float(order.amount_atomic / LAMPORTS_PER_SOL) + reserve_fee_sol,
+                    status="PREPARED",
+                    order_snapshot={
+                        "opened_at": buy_opened_at,
+                        "reason": order.reason,
+                        "entry_liquidity_usd": order.entry_liquidity_usd,
+                        "entry_mc_usd": order.entry_mc_usd,
+                        "whale_sol_flow": order.whale_sol_flow,
+                        "triggering_wallets": list(order.triggering_wallets),
+                        "breakout_telemetry": order.breakout_telemetry,
+                        "rationale": order.rationale,
+                    },
+                )
+                attach_intent_to_reservation(db, reservation_id, intent_id)
+                # Checkpoint 3: Pre-submit quote timing & router expiry
+                if _e4a_is_active(order, config):
+                    await _validate_e4a_quote_timing_and_expiry(
+                        order_resp, config, quote_received_at=quote_received_at, client=client,
+                        stage="PRE_SUBMIT", is_live=True,
+                    )
+                db.transition_order_intent(
+                    intent_id, new_status="SUBMITTED", expected_statuses=("PREPARED",),
+                )
+
+            broadcast_attempted = True
             exec_resp = await execute_jupiter_signed_order(
                 signed_tx_base64=signed_b64, request_id=request_id, config=config, client=client,
             )
-            tx_signature = str(exec_resp.get("signature") or exec_resp.get("txid") or "")
-            if exec_resp.get("outputAmountResult"):
-                out_amount = int(exec_resp["outputAmountResult"])
+            tx_signature = str(exec_resp.get("signature") or exec_resp.get("txid") or pre_sig or "")
+            raw_out_res = exec_resp.get("outputAmountResult")
+            if raw_out_res is not None:
+                try:
+                    out_amount = _parse_strict_int(raw_out_res, "OUTPUT_AMOUNT_RESULT", min_value=1)
+                except E4AValidationError as exc:
+                    raise RuntimeError(f"Live execution outcome unresolved: {exc}") from exc
+            elif _e4a_is_active(order, config):
+                raise RuntimeError("Live E4A BUY outcome unresolved: missing outputAmountResult")
+            if intent_id and tx_signature:
+                db.transition_order_intent(intent_id, new_status="SUBMITTED", tx_signature=tx_signature)
+            if is_buy and (not tx_signature or out_amount <= 0):
+                raise RuntimeError(
+                    f"Live BUY outcome unresolved: tx_signature={tx_signature!r}, out_amount={out_amount}"
+                )
         else:
             tx_signature = f"paper-{order.side.lower()}-{order.mint[:8]}"
-    except BaseException:
+    except E4AValidationError as exc:
+        if intent_id:
+            db.transition_order_intent(
+                intent_id, new_status="FAILED", error_detail=f"ABORTED_BEFORE_BROADCAST: {exc}",
+            )
         if reservation_id:
             db.release_buy_reservation(reservation_id)
+        finalize_exit_guard(db, sell_key, committed=False)
+        logger.warning("[Executor] E4A quote guard blocked %s %s: %s", order.side, order.symbol, exc)
+        db.log_action(
+            mode=config.EXECUTION_MODE, action="DECISION_1" if is_buy else order.side.upper(),
+            symbol=order.symbol, asset_id=order.mint,
+            strategy=order.strategy or "SCALPER", reason=str(exc),
+            pair_address=order.pair_address, dex_id=order.dex_id,
+            router=e4b_router,
+            route_pool_keys=json.dumps(e4b_pool_keys) if e4b_pool_status is not None else None,
+            pool_route_status=e4b_pool_status,
+        )
+        return {"pending_order": None}
+    except BaseException as exc:
+        if intent_id:
+            if broadcast_attempted:
+                db.transition_order_intent(
+                    intent_id, new_status="UNRESOLVED", error_detail=f"{type(exc).__name__}: {exc}",
+                )
+            else:
+                db.transition_order_intent(
+                    intent_id, new_status="FAILED", error_detail=f"ABORTED_BEFORE_BROADCAST: {type(exc).__name__}: {exc}",
+                )
+        if reservation_id:
+            if broadcast_attempted:
+                mark_buy_reservation_broadcast_unresolved(db, reservation_id, reason=f"{type(exc).__name__}: {exc}")
+            else:
+                db.release_buy_reservation(reservation_id)
         finalize_exit_guard(db, sell_key, committed=False)
         raise
     finally:
@@ -277,42 +1005,75 @@ async def executor_node(
     rationale_out = order.rationale or state.get("last_decision_rationale")
 
     if is_buy:
-        spent_sol = order.amount_atomic / LAMPORTS_PER_SOL
-        sol_delta = -(spent_sol + tx_fee_opt) if tx_fee_opt is not None else -spent_sol
-        pnl_delta = -tx_fee_opt if tx_fee_opt is not None else 0.0
-        pos_strategy = order.strategy or "SCALPER"
-        prev_reentries = (
-            int(existing_pos_dict.get("reentry_count") or 0)
-            if isinstance(existing_pos_dict, dict) and existing_pos_dict.get("mint") == order.mint
-            else 0
-        )
-        next_reentry_count = (prev_reentries + 1) if order.reason == "LEG_2_REENTRY" else 0
-        pos = ActivePosition(
-            mint=order.mint, symbol=order.symbol, entry_sol=spent_sol, token_amount=out_amount,
-            pair_address=order.pair_address, dex_id=order.dex_id,
-            strategy=pos_strategy, triggering_wallets=list(order.triggering_wallets),
-            whale_shadow_exit_flag=False, opened_at=utc_now_iso(),
-            entry_liquidity_usd=order.entry_liquidity_usd, entry_mc_usd=order.entry_mc_usd,
-            whale_sol_flow=order.whale_sol_flow, breakout_telemetry=order.breakout_telemetry,
-            current_sol_value=spent_sol, peak_sol_value=spent_sol,
-            partial_tp_taken=False, initial_entry_sol=spent_sol,
-            remaining_cost_basis_sol=spent_sol, realized_partial_pnl_sol=0.0,
-            entry_fee_sol=tx_fee_opt,
-            accumulated_fees_sol=round(tx_fee_opt, 6) if tx_fee_opt is not None else 0.0,
-            fee_accounting_status=tx_fee_status,
-            breakeven_armed=False, trail_armed=False, retrace_low_sol=None, run_peak_sol=None,
-            watch_started_at=None, reference_token_amount=out_amount,
-            reentry_count=next_reentry_count, last_liquidity_usd=order.entry_liquidity_usd,
-        )
-        new_pos_dict = pos.model_dump()
-        db.remove_from_watchlist(order.mint)
-        settled = db.apply_trade_settlement(
-            lane=lane_tag, side="BUY", mint=order.mint, opened_at=pos.opened_at, new_pos_dict=new_pos_dict,
-            sol_delta=sol_delta, pnl_delta=pnl_delta, focus_state=next_state,
-            last_decision_rationale=rationale_out, reservation_id=reservation_id,
-            fallback_base_sol=fb_base_sol, fallback_base_pnl=fb_base_pnl,
-        )
-        sol_balance, daily_pnl_sol = settled["sol_balance"], settled["daily_pnl_sol"]
+        try:
+            spent_sol = order.amount_atomic / LAMPORTS_PER_SOL
+            sol_delta = -(spent_sol + tx_fee_opt) if tx_fee_opt is not None else -spent_sol
+            pnl_delta = -tx_fee_opt if tx_fee_opt is not None else 0.0
+            pos_strategy = order.strategy or "SCALPER"
+            prev_reentries = (
+                int(existing_pos_dict.get("reentry_count") or 0)
+                if isinstance(existing_pos_dict, dict) and existing_pos_dict.get("mint") == order.mint
+                else 0
+            )
+            next_reentry_count = (prev_reentries + 1) if order.reason == "LEG_2_REENTRY" else 0
+            pos = ActivePosition(
+                mint=order.mint, symbol=order.symbol, entry_sol=spent_sol, token_amount=out_amount,
+                pair_address=order.pair_address, dex_id=order.dex_id,
+                strategy=pos_strategy, triggering_wallets=list(order.triggering_wallets),
+                whale_shadow_exit_flag=False, opened_at=buy_opened_at or utc_now_iso(),
+                entry_liquidity_usd=order.entry_liquidity_usd, entry_mc_usd=order.entry_mc_usd,
+                whale_sol_flow=order.whale_sol_flow, breakout_telemetry=order.breakout_telemetry,
+                current_sol_value=spent_sol, peak_sol_value=spent_sol,
+                partial_tp_taken=False, initial_entry_sol=spent_sol,
+                remaining_cost_basis_sol=spent_sol, realized_partial_pnl_sol=0.0,
+                entry_fee_sol=tx_fee_opt,
+                accumulated_fees_sol=round(tx_fee_opt, 6) if tx_fee_opt is not None else 0.0,
+                fee_accounting_status=tx_fee_status,
+                breakeven_armed=False, trail_armed=False, retrace_low_sol=None, run_peak_sol=None,
+                watch_started_at=None, reference_token_amount=out_amount,
+                reentry_count=next_reentry_count, last_liquidity_usd=order.entry_liquidity_usd,
+            )
+            new_pos_dict = pos.model_dump()
+            db.remove_from_watchlist(order.mint)
+            settled = db.apply_trade_settlement(
+                lane=lane_tag, side="BUY", mint=order.mint, opened_at=pos.opened_at, new_pos_dict=new_pos_dict,
+                sol_delta=sol_delta, pnl_delta=pnl_delta, focus_state=next_state,
+                last_decision_rationale=rationale_out, reservation_id=reservation_id,
+                intent_id=intent_id, intent_final_status="CONFIRMED",
+                fallback_base_sol=fb_base_sol, fallback_base_pnl=fb_base_pnl,
+            )
+            settled_buy = True
+            sol_balance, daily_pnl_sol = settled["sol_balance"], settled["daily_pnl_sol"]
+        except BaseException as exc:
+            if intent_id and not settled_buy:
+                if broadcast_attempted:
+                    snap_retry = {
+                        "opened_at": buy_opened_at,
+                        "reason": order.reason,
+                        "entry_liquidity_usd": order.entry_liquidity_usd,
+                        "entry_mc_usd": order.entry_mc_usd,
+                        "whale_sol_flow": order.whale_sol_flow,
+                        "triggering_wallets": list(order.triggering_wallets),
+                        "breakout_telemetry": order.breakout_telemetry,
+                        "rationale": order.rationale,
+                        "reconciled_out_tokens": out_amount,
+                        "reconciled_entry_sol": order.amount_atomic / LAMPORTS_PER_SOL,
+                    }
+                    db.update_order_intent_snapshot(intent_id, snap_retry)
+                    db.transition_order_intent(
+                        intent_id, new_status="SETTLEMENT_PENDING_PERSISTENCE",
+                        error_detail=f"post-broadcast settlement error: {type(exc).__name__}: {exc}",
+                    )
+                else:
+                    db.transition_order_intent(
+                        intent_id, new_status="FAILED", error_detail=f"pre-broadcast error: {type(exc).__name__}: {exc}",
+                    )
+            if reservation_id and not settled_buy:
+                if broadcast_attempted:
+                    mark_buy_reservation_broadcast_unresolved(db, reservation_id, reason=f"post-broadcast settlement error: {type(exc).__name__}: {exc}")
+                else:
+                    db.release_buy_reservation(reservation_id)
+            raise
 
         db.log_trade(
             mode=config.EXECUTION_MODE, side="BUY", mint=order.mint, symbol=order.symbol,
@@ -341,6 +1102,9 @@ async def executor_node(
             breakout_failed_gates="; ".join(bt.get("failed_gates") or []) if bt else None,
             jupiter_price_impact_raw=raw_price_impact,
             pair_address=pos.pair_address, dex_id=pos.dex_id,
+            router=e4b_router,
+            route_pool_keys=json.dumps(e4b_pool_keys) if e4b_pool_status is not None else None,
+            pool_route_status=e4b_pool_status,
         )
         logger.info("[%s] BUY %s: %.4f SOL -> %d tokens (reason=%s)", config.EXECUTION_MODE.upper(), order.symbol, spent_sol, out_amount, order.reason)
     elif is_partial_sell:
@@ -527,6 +1291,9 @@ async def executor_node(
         "jupiter_price_impact_raw": raw_price_impact,
         "tx_fee_sol": tx_fee_opt, "fee_status": tx_fee_status,
         "fee_accounting_incomplete": tx_fee_opt is None,
+        "router": e4b_router,
+        "route_pool_keys": e4b_pool_keys if e4b_pool_status is not None else None,
+        "pool_route_status": e4b_pool_status,
     }
     if is_whale_slot:
         return {

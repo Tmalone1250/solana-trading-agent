@@ -35,6 +35,7 @@ class MockDecisionClient:
 
 @pytest.mark.asyncio
 async def test_alpha_node_single_batched_decision_1_call(tmp_path):
+    from tests.test_e3b_cache_provenance import make_verified_ohlcv_result
     from tests.test_scalper_entry_engine import make_sweep_reclaim_candles
 
     db = AgentDatabase(db_path=str(tmp_path / "alpha.duckdb"), starting_sol=0.7)
@@ -42,6 +43,7 @@ async def test_alpha_node_single_batched_decision_1_call(tmp_path):
     soaked_added = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
     valid_candles = make_sweep_reclaim_candles()
 
+    now_ts = datetime.now(timezone.utc).timestamp()
     candidates = [
         {
             "mint": "MintVamp11111111111111111111111111111111111",
@@ -51,6 +53,7 @@ async def test_alpha_node_single_batched_decision_1_call(tmp_path):
             "sells_5m": 10,
             "added_at": soaked_added,
             "candles_5m": valid_candles,
+            "_ohlcv_5m_result": make_verified_ohlcv_result(valid_candles, last_ok_at=now_ts),
         },
         {
             "mint": "MintAlpha1111111111111111111111111111111111",
@@ -60,6 +63,7 @@ async def test_alpha_node_single_batched_decision_1_call(tmp_path):
             "sells_5m": 10,
             "added_at": soaked_added,
             "candles_5m": valid_candles,
+            "_ohlcv_5m_result": make_verified_ohlcv_result(valid_candles, last_ok_at=now_ts),
         },
     ]
     mock_answers = {
@@ -106,11 +110,15 @@ async def test_alpha_node_single_batched_decision_1_call(tmp_path):
 @pytest.mark.asyncio
 async def test_executor_paper_mode_omits_taker_and_logs_out_amount(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "exec_paper.duckdb"), starting_sol=0.7)
-    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", JUPITER_API_KEY="jup-secret", PAPER_TX_FEE_SOL=0.0)
+    db.upsert_watchlist_entry(mint="MintAlpha1111111111111111111111111111111111", symbol="ALPHA", pair_address="PoolA", candidate={"mint": "MintAlpha1111111111111111111111111111111111"}, safety_passed=True)
+    db.mark_watchlist_safety_passed("MintAlpha1111111111111111111111111111111111", True, checked_at=datetime.now(timezone.utc).isoformat())
+    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", JUPITER_API_KEY="jup-secret", PAPER_TX_FEE_SOL=0.0, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
 
     seen_params = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if "/tokens/v2/search" in str(request.url):
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
         assert request.url.path == "/swap/v2/order"
         assert request.headers.get("x-api-key") == "jup-secret"
         seen_params.update(dict(request.url.params))
@@ -157,12 +165,16 @@ async def test_executor_paper_mode_omits_taker_and_logs_out_amount(tmp_path):
 @pytest.mark.asyncio
 async def test_executor_live_mode_passes_taker_signs_and_executes(tmp_path):
     db = AgentDatabase(db_path=str(tmp_path / "exec_live.duckdb"), starting_sol=0.7)
+    db.upsert_watchlist_entry(mint="MintLive11111111111111111111111111111111111", symbol="LIVE", pair_address="PoolL", candidate={"mint": "MintLive11111111111111111111111111111111111"}, safety_passed=True)
+    db.mark_watchlist_safety_passed("MintLive11111111111111111111111111111111111", True, checked_at=datetime.now(timezone.utc).isoformat())
     kp = Keypair()
     cfg = AgentConfig(
         _env_file=None,
         EXECUTION_MODE="live",
         JUPITER_API_KEY="jup-live-key",
         SOLANA_PRIVATE_KEY_BS58=str(kp),
+        SOLANA_RPC_URL="https://rpc.example.test",
+        PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0,
     )
 
     # Build a valid unsigned VersionedTransaction for the mock Jupiter response
@@ -174,6 +186,10 @@ async def test_executor_live_mode_passes_taker_signs_and_executes(tmp_path):
     calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if "/tokens/v2/search" in str(request.url):
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+        if str(request.url).startswith("https://rpc.example.test"):
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 700_000_000}})
         calls.append(f"{request.method} {request.url.path}")
         if request.url.path == "/swap/v2/order":
             assert request.url.params.get("taker") == str(kp.pubkey())
