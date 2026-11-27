@@ -169,13 +169,12 @@ async def alpha_node(
         p_addr = str(cand.get("pair_address") or (watchlist_by_mint.get(cand["mint"]) or {}).get("pair_address") or "")
         unavail = OhlcvFetchResult(candles=[], source="unavailable", fetched_at=None, last_ok_at=None, last_status=None)
         if cand.get("candles_5m") is not None:
-            candles_5m = cand["candles_5m"]
             raw_5m_prov = cand.get("_ohlcv_5m_result")
             res_5m = (
                 raw_5m_prov
                 if isinstance(raw_5m_prov, OhlcvFetchResult)
                 else OhlcvFetchResult(
-                    candles=list(candles_5m) if isinstance(candles_5m, list) else [],
+                    candles=list(cand["candles_5m"]) if isinstance(cand["candles_5m"], list) else [],
                     source="pre_attached_unknown",
                     fetched_at=None,
                     last_ok_at=None,
@@ -184,16 +183,14 @@ async def alpha_node(
             )
         else:
             res_5m = ohlcv_by_pair.get(p_addr, unavail)
-            candles_5m = res_5m.candles
 
         if cand.get("candles_1m") is not None:
-            candles_1m = cand["candles_1m"]
             raw_1m_prov = cand.get("_ohlcv_1m_result")
             res_1m = (
                 raw_1m_prov
                 if isinstance(raw_1m_prov, OhlcvFetchResult)
                 else OhlcvFetchResult(
-                    candles=list(candles_1m) if isinstance(candles_1m, list) else [],
+                    candles=list(cand["candles_1m"]) if isinstance(cand["candles_1m"], list) else [],
                     source="pre_attached_unknown",
                     fetched_at=None,
                     last_ok_at=None,
@@ -202,7 +199,6 @@ async def alpha_node(
             )
         else:
             res_1m = ohlcv_1m_by_pair.get(p_addr, unavail)
-            candles_1m = res_1m.candles
 
         active_prov, prov_ok, _ = select_ohlcv_interval_provenance(
             res_5m,
@@ -210,6 +206,8 @@ async def alpha_node(
             decision_timestamp=now_dt.timestamp(),
             max_cache_age_seconds=float(config.OHLCV_CACHE_SECONDS),
         )
+        candles_5m = res_5m.candles
+        candles_1m = res_1m.candles
         sc_entry = evaluate_scalper_entry(
             candles_5m,
             cand,

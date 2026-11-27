@@ -380,3 +380,123 @@ def test_b14_and_b15_telemetry_source_timestamp_and_contradictory_metadata():
     for bad in (c1, c2, c3):
         assert evaluate_ohlcv_provenance(bad, decision_timestamp=t_now)[0] is False
     clear_ohlcv_cache()
+
+
+@pytest.mark.asyncio
+async def test_b16_provenance_payload_binding_blocks_mismatched_5m_1m_alpha_and_whale(tmp_path):
+    clear_ohlcv_cache()
+    bo_5m = _make_breakout_candles(count=18, bar_seconds=300)
+    flat_5m = _make_breakout_candles(
+        count=18, bar_seconds=300, breakout_close=1.06, breakout_high=1.065, breakout_low=1.05, breakout_vol=800.0
+    )
+    t_5m = bo_5m[-1]["timestamp"] + 300.0
+
+    # 1. Direct evaluate_scalper_entry 5m mismatch: valid network_200 / pre_attached_verified for flat_5m + breakout bo_5m
+    prov_net_5m = OhlcvFetchResult(
+        candles=flat_5m, source="network_200", fetched_at=t_5m, last_ok_at=t_5m, last_status=200
+    )
+    res_5m_mis = evaluate_scalper_entry(
+        bo_5m, _strong_flow_pair(1.12), time_in_slot_min=5.0, decision_timestamp=t_5m, ohlcv_provenance=prov_net_5m
+    )
+    assert res_5m_mis.eligible is False
+    assert res_5m_mis.setup_type == "NONE"
+    assert res_5m_mis.rejection_reason == "OHLCV provenance payload mismatch"
+
+    # Matching 5m payload still succeeds
+    res_5m_ok = evaluate_scalper_entry(
+        bo_5m, _strong_flow_pair(1.12), time_in_slot_min=5.0, decision_timestamp=t_5m,
+        ohlcv_provenance=make_verified_ohlcv_result(bo_5m, last_ok_at=t_5m),
+    )
+    assert res_5m_ok.eligible is True and res_5m_ok.setup_type == "BREAKOUT_IGNITION"
+
+    # 2. Direct evaluate_scalper_entry 1m fallback mismatch
+    short_5m = _make_breakout_candles(count=5, bar_seconds=300)
+    bo_1m = _make_breakout_candles(count=20, bar_seconds=60)
+    flat_1m = _make_breakout_candles(
+        count=20, bar_seconds=60, breakout_close=1.06, breakout_high=1.065, breakout_low=1.05, breakout_vol=800.0
+    )
+    t_1m = bo_1m[-1]["timestamp"] + 60.0
+    prov_1m_flat = make_verified_ohlcv_result(flat_1m, last_ok_at=t_1m)
+    res_1m_mis = evaluate_scalper_entry(
+        short_5m, _strong_flow_pair(1.12), time_in_slot_min=5.0, candles_1m=bo_1m,
+        decision_timestamp=t_1m, ohlcv_provenance=prov_1m_flat,
+    )
+    assert res_1m_mis.eligible is False
+    assert res_1m_mis.setup_type == "NONE"
+    assert res_1m_mis.rejection_reason == "OHLCV provenance payload mismatch"
+
+    # Matching 1m fallback payload still succeeds
+    res_1m_ok = evaluate_scalper_entry(
+        short_5m, _strong_flow_pair(1.12), time_in_slot_min=5.0, candles_1m=bo_1m,
+        decision_timestamp=t_1m, ohlcv_provenance=make_verified_ohlcv_result(bo_1m, last_ok_at=t_1m),
+    )
+    assert res_1m_ok.eligible is True and res_1m_ok.setup_type == "BREAKOUT_IGNITION"
+
+    # 3. alpha_node integration: cand["candles_5m"] = bo_5m cannot ride on _ohlcv_5m_result = flat_5m
+    db = AgentDatabase(db_path=str(tmp_path / "b16_alpha.duckdb"), starting_sol=1.0)
+    cfg = AgentConfig(_env_file=None)
+    now_dt = datetime.fromtimestamp(t_5m, tz=timezone.utc)
+    cand = {
+        "mint": "MintBindAlpha111111111111111111111111111111",
+        "symbol": "BIND",
+        "pair_address": "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2",
+        "added_at": (now_dt - timedelta(minutes=5)).isoformat(),
+        "candles_5m": bo_5m,
+        "_ohlcv_5m_result": make_verified_ohlcv_result(flat_5m, last_ok_at=t_5m),
+        **_strong_flow_pair(1.12),
+    }
+    out_alpha = await alpha_node(
+        {"focus_state": FocusState.SCANNING.value, "sol_balance": 1.0, "safe_candidates": [cand]},
+        config=cfg, db=db, decision_client=_StubBuyClient(), now=now_dt,
+    )
+    assert out_alpha["alpha_decisions"][0]["approved"] is False
+    db.close()
+
+    # 4. whale_lane integration: pair["candles_5m"] = bo_5m cannot override _ohlcv_5m_result = flat_5m
+    db_w = AgentDatabase(db_path=str(tmp_path / "b16_whale.duckdb"), starting_sol=2.0)
+    cfg_w = AgentConfig(
+        _env_file=None,
+        EXECUTION_MODE="paper",
+        WHALE_STRATEGY_ENABLED=True,
+        WHALE_MIN_LIQUIDITY_USD=20_000.0,
+        WHALE_MIN_MCAP_USD=50_000.0,
+        WHALE_MAX_MCAP_USD=10_000_000.0,
+        WHALE_MIN_BREAKOUT_SCORE=75,
+        WHALE_BLOCK_EXTENDED=True,
+        ENABLE_JUPITER_DISCOVERY=False,
+        OHLCV_PACING_DELAY_SECONDS=0.0,
+    )
+    mint_w = "MintBindWhale111111111111111111111111111111"
+    db_w.record_whale_event(
+        signature="bw-1", wallet="W1", mint=mint_w, side="BUY", sol_amount=2.0, token_amount=100.0,
+        timestamp_utc=(now_dt - timedelta(seconds=20)).isoformat(),
+    )
+    db_w.record_whale_event(
+        signature="bw-2", wallet="W2", mint=mint_w, side="BUY", sol_amount=2.0, token_amount=100.0,
+        timestamp_utc=(now_dt - timedelta(seconds=10)).isoformat(),
+    )
+    db_w.recompute_whale_signal(mint_w, ttl_minutes=30, now=now_dt)
+
+    # Mock DexScreener returning pair with pre-attached mismatch: candles_5m=bo_5m (IGNITION) vs _ohlcv_5m_result=flat_5m (FORMING, score<75)
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "/tokens/v1/solana/" in url:
+            return httpx.Response(200, json=[{
+                "chainId": "solana", "pairAddress": "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2",
+                "baseToken": {"address": mint_w, "symbol": "WBIND"},
+                "marketCap": 250_000, "liquidity": {"usd": 80_000},
+                "txns": {"m5": {"buys": 32, "sells": 14}, "h1": {"buys": 180, "sells": 120}},
+                "candles_5m": bo_5m,
+            }])
+        if "ohlcv" in url:
+            return httpx.Response(200, json=_gecko_payload(flat_5m))
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await run_whale_lane_tick(config=cfg_w, db=db_w, http_client=client, now=now_dt)
+
+    decs_w = db_w.get_whale_decisions()
+    assert decs_w[mint_w]["breakout_telemetry"].get("state") != "IGNITION"
+    assert decs_w[mint_w]["status"] == "SKIPPED"
+    clear_ohlcv_cache()
+    db_w.close()

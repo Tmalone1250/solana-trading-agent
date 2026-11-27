@@ -212,6 +212,21 @@ def evaluate_scalper_entry(
         if candles_1m
         else ([], None, {})
     )
+    assert ohlcv_provenance is not None  # guaranteed by evaluate_ohlcv_provenance above
+    if len(candles) >= 12:
+        if list(candles_5m) != ohlcv_provenance.candles:
+            return ScalperEntryResult(
+                eligible=False,
+                setup_type="NONE",
+                rejection_reason="OHLCV provenance payload mismatch",
+            )
+    elif len(norm_1m) >= 15:
+        if candles_1m is None or list(candles_1m) != ohlcv_provenance.candles:
+            return ScalperEntryResult(
+                eligible=False,
+                setup_type="NONE",
+                rejection_reason="OHLCV provenance payload mismatch",
+            )
     buys_5m, sells_5m, buy_ratio_5m = _extract_order_flow(pair_data)
     total_5m = buys_5m + sells_5m
 

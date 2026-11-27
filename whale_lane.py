@@ -395,33 +395,39 @@ async def run_whale_lane_tick(
                 candles=[], source="unavailable", fetched_at=None, last_ok_at=None, last_status=None
             )
             if isinstance(pair.get("candles_5m"), list):
-                c5 = pair["candles_5m"]
                 raw_5m_prov = pair.get("_ohlcv_5m_result")
                 res_5m = (
                     raw_5m_prov
                     if isinstance(raw_5m_prov, OhlcvFetchResult)
                     else OhlcvFetchResult(
-                        candles=list(c5), source="pre_attached_unknown", fetched_at=None, last_ok_at=None, last_status=None
+                        candles=list(pair["candles_5m"]),
+                        source="pre_attached_unknown",
+                        fetched_at=None,
+                        last_ok_at=None,
+                        last_status=None,
                     )
                 )
             else:
                 res_5m = ohlcv_5m.get(p_addr, unavail)
-                c5 = res_5m.candles
 
             if isinstance(pair.get("candles_1m"), list):
-                c1 = pair["candles_1m"]
                 raw_1m_prov = pair.get("_ohlcv_1m_result")
                 res_1m = (
                     raw_1m_prov
                     if isinstance(raw_1m_prov, OhlcvFetchResult)
                     else OhlcvFetchResult(
-                        candles=list(c1), source="pre_attached_unknown", fetched_at=None, last_ok_at=None, last_status=None
+                        candles=list(pair["candles_1m"]),
+                        source="pre_attached_unknown",
+                        fetched_at=None,
+                        last_ok_at=None,
+                        last_status=None,
                     )
                 )
             else:
                 res_1m = ohlcv_1m.get(p_addr, unavail)
-                c1 = res_1m.candles
 
+            c5 = res_5m.candles
+            c1 = res_1m.candles
             active_prov, prov_ok, _ = select_ohlcv_interval_provenance(
                 res_5m,
                 res_1m,

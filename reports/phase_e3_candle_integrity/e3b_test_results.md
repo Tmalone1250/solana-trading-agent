@@ -7,21 +7,14 @@
 
 ---
 
-## 1. Focused E3B & E3A Regression Suites
+## 1. Focused E3B, E3A, Breakout, Alpha, Whale, & E1 Suites
 
 Command:
 ```bash
-./venv/bin/pytest tests/test_e3b_cache_provenance.py tests/test_e3a_candle_eligibility.py -q
+./venv/bin/pytest tests/test_e3b_cache_provenance.py tests/test_e3a_candle_eligibility.py tests/test_breakout_ignition.py tests/test_breakout_isolation.py tests/test_scalper_entry_engine.py tests/test_dual_lane_3x3_and_whale_breakout.py tests/test_e1_pool_identity.py tests/test_alpha_and_executor.py tests/test_whale_scalp.py tests/test_whale_control_separation.py -q
 ```
 Result:
-- **`18 passed in 0.83s`** (0 failed, 0 skipped)
-
-Prior focused breakout/entry/E1/dual-lane run:
-```bash
-./venv/bin/pytest tests/test_e3b_cache_provenance.py tests/test_e3a_candle_eligibility.py tests/test_breakout_ignition.py tests/test_breakout_isolation.py tests/test_scalper_entry_engine.py tests/test_dual_lane_3x3_and_whale_breakout.py tests/test_e1_pool_identity.py -q
-```
-Result:
-- **`49 passed in 3.27s`** (0 failed, 0 skipped)
+- **`63 passed in 10.92s`** (0 failed, 0 skipped)
 
 ---
 
@@ -32,7 +25,7 @@ Command:
 ./venv/bin/pytest tests/ -q --tb=line
 ```
 Result:
-- **`160 passed, 3 failed in 34.05s`** (0 skipped)
+- **`161 passed, 3 failed in 34.22s`** (0 skipped)
 
 ### Pre-Existing Baseline Failures (Verified at `a5d829a` and `19104e3`)
 1. `tests/test_insider_scanner.py::test_unconditional_hard_stop_loss_on_leg2_reentry_chart_and_whale_positions_at_minus_11_75_pct` (`test_insider_scanner.py:428`: `assert 0 == 1`)
