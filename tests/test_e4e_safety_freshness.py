@@ -185,7 +185,9 @@ async def test_e4e_watchlist_ttl_reuse_expiry_and_no_refresh_on_failure(tmp_path
         )
         assert out3["safe_candidates"] == []
         assert calls == {"rug": 2, "shield": 2}
-        assert db.get_watchlist_entry(MINT_E4E) is None  # evicted on failed safety
+        # Unavailable API failure must NOT evict or refresh safety_checked_at
+        row3 = db.get_watchlist_entry(MINT_E4E)
+        assert row3 is not None and row3["safety_checked_at"] == t0.isoformat()
     db.close()
 
 
@@ -519,6 +521,100 @@ async def test_e4e_corrective_incomplete_evidence_fails_closed_without_eviction(
 
 
 @pytest.mark.asyncio
+async def test_e4e_safety_gate_unavailable_does_not_evict_while_confirmed_and_mixed_do(tmp_path):
+    """Discovery-side API failure/malformed Shield rejects for cycle without eviction/cooldown/refresh; confirmed and mixed unsafe evict."""
+    clear_safety_cache()
+    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", SAFETY_CACHE_TTL_SECONDS=60.0)
+    t0 = datetime(2026, 11, 27, 16, 0, 0, tzinfo=timezone.utc)
+    t1 = t0 + timedelta(seconds=120)
+
+    # 1. RugCheck HTTP 500 (unavailable only) -> rejected for cycle, NOT evicted, NO cooldown, NO timestamp refresh
+    db1 = AgentDatabase(db_path=str(tmp_path / "sg_rug_500.duckdb"), starting_sol=2.0)
+    db1.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, added_at=t0.isoformat(), safety_passed=True)
+    db1.mark_watchlist_safety_passed(MINT_E4E, True, checked_at=t0.isoformat())
+
+    def h_rug_500(req: httpx.Request) -> httpx.Response:
+        if "rugcheck.xyz" in str(req.url):
+            return httpx.Response(500)
+        return httpx.Response(200, json={"warnings": {MINT_E4E: []}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(h_rug_500)) as client:
+        out1 = await safety_gate_node(
+            {"focus_state": FocusState.SCANNING.value, "raw_candidates": [{"mint": MINT_E4E, "symbol": "E4E"}]},
+            config=cfg, db=db1, http_client=client, now=t1,
+        )
+    assert out1["safe_candidates"] == [] and len(out1["rejected_candidates"]) == 1
+    assert db1.get_watchlist_entry(MINT_E4E)["safety_checked_at"] == t0.isoformat()
+    assert db1.is_on_cooldown(MINT_E4E, now=t1) is False
+    assert db1.get_action_log(limit=5, actions=["EVICT"]) == []
+    db1.close()
+
+    # 2. Malformed / missing-mint Shield response (unavailable only) -> rejected for cycle, NOT evicted, NO cooldown
+    clear_safety_cache()
+    db2 = AgentDatabase(db_path=str(tmp_path / "sg_shield_miss.duckdb"), starting_sol=2.0)
+    db2.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, added_at=t0.isoformat(), safety_passed=False)
+
+    def h_sh_miss(req: httpx.Request) -> httpx.Response:
+        if "rugcheck.xyz" in str(req.url):
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        return httpx.Response(200, json={"warnings": {}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(h_sh_miss)) as client:
+        out2 = await safety_gate_node(
+            {"focus_state": FocusState.SCANNING.value, "raw_candidates": [{"mint": MINT_E4E, "symbol": "E4E"}]},
+            config=cfg, db=db2, http_client=client, now=t1,
+        )
+    assert out2["safe_candidates"] == [] and len(out2["rejected_candidates"]) == 1
+    row2 = db2.get_watchlist_entry(MINT_E4E)
+    assert row2 is not None and row2["safety_checked_at"] is None
+    assert db2.is_on_cooldown(MINT_E4E, now=t1) is False
+    assert db2.get_action_log(limit=5, actions=["EVICT"]) == []
+    db2.close()
+
+    # 3. Confirmed unsafe (RugCheck rugged=True) -> evicted + cooldown + EVICT log
+    clear_safety_cache()
+    db3 = AgentDatabase(db_path=str(tmp_path / "sg_unsafe.duckdb"), starting_sol=2.0)
+    db3.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, added_at=t0.isoformat(), safety_passed=False)
+
+    def h_unsafe(req: httpx.Request) -> httpx.Response:
+        if "rugcheck.xyz" in str(req.url):
+            return httpx.Response(200, json={"rugged": True, "risks": []})
+        return httpx.Response(200, json={"warnings": {MINT_E4E: []}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(h_unsafe)) as client:
+        out3 = await safety_gate_node(
+            {"focus_state": FocusState.SCANNING.value, "raw_candidates": [{"mint": MINT_E4E, "symbol": "E4E"}]},
+            config=cfg, db=db3, http_client=client, now=t1,
+        )
+    assert out3["safe_candidates"] == []
+    assert db3.get_watchlist_entry(MINT_E4E) is None
+    assert db3.is_on_cooldown(MINT_E4E, now=t1) is True
+    assert len(db3.get_action_log(limit=5, actions=["EVICT"])) == 1
+    db3.close()
+
+    # 4. Mixed confirmed-unsafe (Shield HONEYPOT) + unavailable (RugCheck 500) -> evicted + cooldown + EVICT log
+    clear_safety_cache()
+    db4 = AgentDatabase(db_path=str(tmp_path / "sg_mixed.duckdb"), starting_sol=2.0)
+    db4.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, added_at=t0.isoformat(), safety_passed=False)
+
+    def h_mixed(req: httpx.Request) -> httpx.Response:
+        if "rugcheck.xyz" in str(req.url):
+            return httpx.Response(500)
+        return httpx.Response(200, json={"warnings": {MINT_E4E: [{"type": "HONEYPOT", "severity": "critical", "message": "Honeypot"}]}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(h_mixed)) as client:
+        out4 = await safety_gate_node(
+            {"focus_state": FocusState.SCANNING.value, "raw_candidates": [{"mint": MINT_E4E, "symbol": "E4E"}]},
+            config=cfg, db=db4, http_client=client, now=t1,
+        )
+    assert out4["safe_candidates"] == []
+    assert db4.get_watchlist_entry(MINT_E4E) is None
+    assert db4.is_on_cooldown(MINT_E4E, now=t1) is True
+    assert len(db4.get_action_log(limit=5, actions=["EVICT"])) == 1
+    db4.close()
+
+
+@pytest.mark.asyncio
 async def test_e4e_corrective_paper_and_non_breakout_live_require_ttl_and_sell_unaffected(tmp_path):
     """Blocker 3: Unset PRE_EXECUTION_SAFETY_TTL_SECONDS blocks BUY in BOTH paper and live (including SCALPER), leaving SELL unaltered."""
     clear_buy_reservations()
@@ -772,3 +868,97 @@ async def test_e4e_nested_empty_jupiter_shield_rejected_without_eviction(tmp_pat
         assert row is not None and row["safety_checked_at"] is None
         assert db.is_on_cooldown(MINT_E4E) is False
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_e4e_safety_gate_unavailable_does_not_evict_while_confirmed_and_mixed_do(tmp_path):
+    """Discovery-side API failure/malformed Shield rejects for cycle without eviction/cooldown/refresh; confirmed and mixed unsafe evict."""
+    clear_safety_cache()
+    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", SAFETY_CACHE_TTL_SECONDS=60.0)
+    t0 = datetime(2026, 11, 27, 16, 0, 0, tzinfo=timezone.utc)
+    t1 = t0 + timedelta(seconds=120)
+
+    # 1. RugCheck HTTP 500 (unavailable only) -> rejected for cycle, NOT evicted, NO cooldown, NO timestamp refresh
+    db1 = AgentDatabase(db_path=str(tmp_path / "sg_rug_500.duckdb"), starting_sol=2.0)
+    db1.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, added_at=t0.isoformat(), safety_passed=True)
+    db1.mark_watchlist_safety_passed(MINT_E4E, True, checked_at=t0.isoformat())
+
+    def h_rug_500(req: httpx.Request) -> httpx.Response:
+        if "rugcheck.xyz" in str(req.url):
+            return httpx.Response(500)
+        return httpx.Response(200, json={"warnings": {MINT_E4E: []}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(h_rug_500)) as client:
+        out1 = await safety_gate_node(
+            {"focus_state": FocusState.SCANNING.value, "raw_candidates": [{"mint": MINT_E4E, "symbol": "E4E"}]},
+            config=cfg, db=db1, http_client=client, now=t1,
+        )
+    assert out1["safe_candidates"] == [] and len(out1["rejected_candidates"]) == 1
+    assert db1.get_watchlist_entry(MINT_E4E)["safety_checked_at"] == t0.isoformat()
+    assert db1.is_on_cooldown(MINT_E4E, now=t1) is False
+    assert db1.get_action_log(limit=5, actions=["EVICT"]) == []
+    db1.close()
+
+    # 2. Malformed / missing-mint Shield response (unavailable only) -> rejected for cycle, NOT evicted, NO cooldown
+    clear_safety_cache()
+    db2 = AgentDatabase(db_path=str(tmp_path / "sg_shield_miss.duckdb"), starting_sol=2.0)
+    db2.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, added_at=t0.isoformat(), safety_passed=False)
+
+    def h_sh_miss(req: httpx.Request) -> httpx.Response:
+        if "rugcheck.xyz" in str(req.url):
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        return httpx.Response(200, json={"warnings": {}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(h_sh_miss)) as client:
+        out2 = await safety_gate_node(
+            {"focus_state": FocusState.SCANNING.value, "raw_candidates": [{"mint": MINT_E4E, "symbol": "E4E"}]},
+            config=cfg, db=db2, http_client=client, now=t1,
+        )
+    assert out2["safe_candidates"] == [] and len(out2["rejected_candidates"]) == 1
+    row2 = db2.get_watchlist_entry(MINT_E4E)
+    assert row2 is not None and row2["safety_checked_at"] is None
+    assert db2.is_on_cooldown(MINT_E4E, now=t1) is False
+    assert db2.get_action_log(limit=5, actions=["EVICT"]) == []
+    db2.close()
+
+    # 3. Confirmed unsafe (RugCheck rugged=True) -> evicted + cooldown + EVICT log
+    clear_safety_cache()
+    db3 = AgentDatabase(db_path=str(tmp_path / "sg_unsafe.duckdb"), starting_sol=2.0)
+    db3.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, added_at=t0.isoformat(), safety_passed=False)
+
+    def h_unsafe(req: httpx.Request) -> httpx.Response:
+        if "rugcheck.xyz" in str(req.url):
+            return httpx.Response(200, json={"rugged": True, "risks": []})
+        return httpx.Response(200, json={"warnings": {MINT_E4E: []}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(h_unsafe)) as client:
+        out3 = await safety_gate_node(
+            {"focus_state": FocusState.SCANNING.value, "raw_candidates": [{"mint": MINT_E4E, "symbol": "E4E"}]},
+            config=cfg, db=db3, http_client=client, now=t1,
+        )
+    assert out3["safe_candidates"] == []
+    assert db3.get_watchlist_entry(MINT_E4E) is None
+    assert db3.is_on_cooldown(MINT_E4E, now=t1) is True
+    assert len(db3.get_action_log(limit=5, actions=["EVICT"])) == 1
+    db3.close()
+
+    # 4. Mixed confirmed-unsafe (Shield HONEYPOT) + unavailable (RugCheck 500) -> evicted + cooldown + EVICT log
+    clear_safety_cache()
+    db4 = AgentDatabase(db_path=str(tmp_path / "sg_mixed.duckdb"), starting_sol=2.0)
+    db4.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, added_at=t0.isoformat(), safety_passed=False)
+
+    def h_mixed(req: httpx.Request) -> httpx.Response:
+        if "rugcheck.xyz" in str(req.url):
+            return httpx.Response(500)
+        return httpx.Response(200, json={"warnings": {MINT_E4E: [{"type": "HONEYPOT", "severity": "critical", "message": "Honeypot"}]}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(h_mixed)) as client:
+        out4 = await safety_gate_node(
+            {"focus_state": FocusState.SCANNING.value, "raw_candidates": [{"mint": MINT_E4E, "symbol": "E4E"}]},
+            config=cfg, db=db4, http_client=client, now=t1,
+        )
+    assert out4["safe_candidates"] == []
+    assert db4.get_watchlist_entry(MINT_E4E) is None
+    assert db4.is_on_cooldown(MINT_E4E, now=t1) is True
+    assert len(db4.get_action_log(limit=5, actions=["EVICT"])) == 1
+    db4.close()

@@ -515,16 +515,20 @@ async def safety_gate_node(
                 enriched["safety_report"] = report.model_dump()
                 safe.append(enriched)
             else:
+                confirmed_reasons = [r for r in report.reasons if "unavailable/failed" not in r.lower()]
                 reason_str = "; ".join(report.reasons)
-                if db is not None:
-                    db.remove_from_watchlist(mint)
-                    db.set_cooldown_minutes(mint, minutes=config.SAFETY_REJECT_COOLDOWN_MINUTES, reason=f"SAFETY_REJECT: {reason_str}", now=now)
-                    db.log_action(
-                        mode=config.EXECUTION_MODE, action="EVICT", symbol=symbol, asset_id=mint,
-                        strategy="SAFETY_GATE", reason=f"SAFETY_REJECT: {reason_str}",
-                        timestamp_utc=now.isoformat() if now else None,
-                    )
-                logger.info("[SafetyGate] $%s | REJECTED (%s) -> EVICTED (%dm cooldown)", symbol, reason_str, config.SAFETY_REJECT_COOLDOWN_MINUTES)
+                if confirmed_reasons:
+                    if db is not None:
+                        db.remove_from_watchlist(mint)
+                        db.set_cooldown_minutes(mint, minutes=config.SAFETY_REJECT_COOLDOWN_MINUTES, reason=f"SAFETY_REJECT: {reason_str}", now=now)
+                        db.log_action(
+                            mode=config.EXECUTION_MODE, action="EVICT", symbol=symbol, asset_id=mint,
+                            strategy="SAFETY_GATE", reason=f"SAFETY_REJECT: {reason_str}",
+                            timestamp_utc=now.isoformat() if now else None,
+                        )
+                    logger.info("[SafetyGate] $%s | REJECTED (%s) -> EVICTED (%dm cooldown)", symbol, reason_str, config.SAFETY_REJECT_COOLDOWN_MINUTES)
+                else:
+                    logger.warning("[SafetyGate] $%s | REJECTED FOR CYCLE ONLY (safety API unavailable/malformed; not evicted): %s", symbol, reason_str)
                 rejected.append({"mint": mint, "symbol": symbol, "reasons": report.reasons})
     finally:
         if owns_client:

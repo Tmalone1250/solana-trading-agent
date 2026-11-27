@@ -62,3 +62,9 @@
    - `isSus=True` retains eviction/cooldown; missing/malformed Token v2 evidence fails closed without eviction or timestamp refresh.
 2. **Tightened nested Jupiter Shield structure validation (`safety_gate_node.py`):**
    - Added `_validate_shield_token_obj` inside `validate_jupiter_shield_structure` so `{"mints": {mint: {}}}`, `{"mints": {mint: {"shield": {}}}}`, `[{"mint": mint}]`, and `[{"mint": mint, "shield": {}}]` fail closed as `unavailable/failed` without eviction, cooldown, or timestamp refresh, while preserving valid supported formats.
+
+## E4E Corrective Pass 3 (from `dc16be9d8b27f8d3db4ef66db44857b95aae311e`)
+- **Discovery-side safety API failures do not evict candidates (`safety_gate_node.py`):**
+  - In `safety_gate_node()`, failed `check_token_safety()` reports are partitioned into confirmed unsafe findings vs `unavailable/failed` reasons.
+  - Unavailable-only outcomes (e.g., RugCheck HTTP 500, malformed/missing-mint Shield) reject the candidate for the current cycle without removing it from `active_watchlist`, setting cooldown, logging `EVICT`, refreshing `safety_checked_at`, or caching as passing.
+  - Confirmed unsafe findings and mixed (confirmed-unsafe + unavailable) outcomes preserve fail-closed eviction, cooldown, and `EVICT` logging.
