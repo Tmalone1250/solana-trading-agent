@@ -193,6 +193,17 @@ class AgentConfig(BaseSettings):
     LIVE_FEE_RESERVATION_BUFFER_SOL: float = Field(default=0.01, ge=0.0)
     BALANCE_DIVERGENCE_WARN_SOL: float = Field(default=0.02, ge=0.0)
     LIVE_RPC_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0.0)
+    # Phase E4A: Pre-broadcast approval & quote integrity thresholds (deferred to telemetry calibration; None = fail-closed in live)
+    MAX_BUY_APPROVAL_AGE_SECONDS: float | None = Field(default=None, gt=0.0)
+    MAX_APPROVAL_PRICE_AGE_SECONDS: float | None = Field(default=None, gt=0.0)
+    MAX_ENTRY_PRICE_DRIFT_PCT: float | None = Field(default=None, ge=0.0)
+    MAX_NEGATIVE_ENTRY_DRIFT_PCT: float | None = Field(default=None, ge=0.0)
+    MAX_WORST_CASE_ENTRY_DRIFT_PCT: float | None = Field(default=None, ge=0.0)
+    MAX_QUOTE_AGE_SECONDS: float | None = Field(default=None, gt=0.0)
+    MAX_ACCEPTED_SLIPPAGE_BPS: int | None = Field(default=None, ge=0, le=10000)
+    MAX_ENTRY_PRICE_IMPACT_PCT: float | None = Field(default=None, ge=0.0)
+    MIN_BLOCK_HEIGHT_HEADROOM: int | None = Field(default=None, ge=0)
+    MIN_RFQ_EXPIRY_HEADROOM_SECONDS: float | None = Field(default=None, ge=0.0)
 
     # Loop, Persistence & Telemetry
     MONITOR_POLL_SECONDS: float = Field(default=5.0, gt=0.0)

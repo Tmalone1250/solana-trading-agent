@@ -154,6 +154,7 @@ async def alpha_node(
                 await client.aclose()
 
     scalper_results: list[ScalperEntryResult] = []
+    prov_by_mint: dict[str, tuple[OhlcvFetchResult, list[dict[str, Any]], list[dict[str, Any]]]] = {}
     soak_minutes_list: list[float] = []
     for cand in safe_candidates:
         added_at_str = cand.get("added_at") or (watchlist_by_mint.get(cand["mint"]) or {}).get("added_at")
@@ -226,6 +227,7 @@ async def alpha_node(
                 now_ts=now_dt.timestamp(),
             )
         scalper_results.append(sc_entry)
+        prov_by_mint[cand["mint"]] = (active_prov, candles_5m, candles_1m)
 
     active_social = db.get_active_social_signals(ttl_minutes=config.X_SIGNAL_TTL_MINUTES, now=now_dt)
     active_whales = (
@@ -577,6 +579,106 @@ async def alpha_node(
     winner, winner_cand, is_leg2_only, _, winner_setup, winner_bt, winner_pair, winner_dex = approved_pairs[0]
     winner_mc = round(float(winner_cand.get("market_cap_usd") or 0.0), 2) or None
 
+    # Phase E4A: Capture approval timestamp, audit-only OHLCV provenance, and authoritative pinned-pool native price
+    approved_at_iso = now_iso
+    approval_ohlcv_fetched_at: Optional[str] = None
+    approval_candle_ts: Optional[int] = None
+    approval_candle_close_usd: Optional[float] = None
+    if winner.mint in prov_by_mint:
+        w_prov, w_c5m, w_c1m = prov_by_mint[winner.mint]
+        if w_prov.last_ok_at is not None:
+            approval_ohlcv_fetched_at = datetime.fromtimestamp(w_prov.last_ok_at, tz=timezone.utc).isoformat()
+        elif w_prov.fetched_at is not None:
+            approval_ohlcv_fetched_at = datetime.fromtimestamp(w_prov.fetched_at, tz=timezone.utc).isoformat()
+        w_bars = w_prov.candles or w_c5m or w_c1m
+        if w_bars:
+            last_bar = w_bars[-1]
+            raw_ts = last_bar.get("timestamp")
+            if raw_ts is not None and not isinstance(raw_ts, bool):
+                try:
+                    approval_candle_ts = int(raw_ts)
+                except (ValueError, TypeError):
+                    pass
+            raw_close = last_bar.get("close")
+            if raw_close is not None and not isinstance(raw_close, bool):
+                try:
+                    approval_candle_close_usd = float(raw_close)
+                except (ValueError, TypeError):
+                    pass
+
+    raw_dec = winner_cand.get("token_decimals") if winner_cand.get("token_decimals") is not None else winner_cand.get("decimals")
+    token_decimals: Optional[int] = (
+        raw_dec if (isinstance(raw_dec, int) and not isinstance(raw_dec, bool) and 0 <= raw_dec <= 18) else None
+    )
+    approval_price_native: Optional[float] = None
+    approval_price_observed_at: Optional[str] = None
+    approval_pair_address: Optional[str] = None
+    approval_price_source: Optional[str] = None
+
+    if http_client is not None and winner_pair:
+        try:
+            ds_resp = await http_client.get(
+                f"{config.DEXSCREENER_BASE_URL}/tokens/v1/solana/{winner.mint}",
+                timeout=5.0,
+            )
+            if ds_resp.status_code == 200:
+                ds_pairs = ds_resp.json()
+                if isinstance(ds_pairs, list):
+                    matched_pair = next(
+                        (
+                            p for p in ds_pairs
+                            if isinstance(p, dict)
+                            and str(p.get("chainId") or "").lower() == "solana"
+                            and str(p.get("pairAddress") or "").strip() == str(winner_pair).strip()
+                        ),
+                        None,
+                    )
+                    if matched_pair is not None:
+                        pn_raw = matched_pair.get("priceNative")
+                        if pn_raw is not None and not isinstance(pn_raw, bool):
+                            pn_val = float(pn_raw)
+                            if pn_val > 0.0 and pn_val == pn_val:
+                                approval_price_native = pn_val
+                                approval_price_observed_at = utc_now().isoformat()
+                                approval_pair_address = str(winner_pair).strip()
+                                approval_price_source = "dexscreener_pinned_pool_native"
+        except Exception as exc:
+            logger.debug("[Alpha] DexScreener pinned-pool priceNative lookup failed for %s: %s", winner.mint, exc)
+
+        if token_decimals is None:
+            try:
+                headers = {"x-api-key": config.JUPITER_API_KEY} if config.JUPITER_API_KEY else {}
+                jup_resp = await http_client.get(
+                    f"{config.JUPITER_BASE_URL}/price/v3",
+                    params={"ids": winner.mint},
+                    headers=headers,
+                    timeout=5.0,
+                )
+                if jup_resp.status_code == 200:
+                    jup_data = jup_resp.json()
+                    mint_info = jup_data.get(winner.mint) if isinstance(jup_data, dict) else None
+                    if isinstance(mint_info, dict):
+                        j_dec = mint_info.get("decimals")
+                        if isinstance(j_dec, int) and not isinstance(j_dec, bool) and 0 <= j_dec <= 18:
+                            token_decimals = j_dec
+            except Exception as exc:
+                logger.debug("[Alpha] Jupiter decimals lookup failed for %s: %s", winner.mint, exc)
+
+    if approval_price_native is None and winner_pair:
+        cand_pn = winner_cand.get("price_native")
+        cand_obs = winner_cand.get("price_observed_at")
+        cand_pa = str(winner_cand.get("pair_address") or "").strip()
+        if cand_pn is not None and cand_obs and cand_pa == str(winner_pair).strip():
+            try:
+                pn_val = float(cand_pn)
+                if pn_val > 0.0 and pn_val == pn_val:
+                    approval_price_native = pn_val
+                    approval_price_observed_at = str(cand_obs)
+                    approval_pair_address = cand_pa
+                    approval_price_source = "dexscreener_pinned_pool_native"
+            except (ValueError, TypeError):
+                pass
+
     order = PendingOrder(
         side="BUY",
         mint=winner.mint,
@@ -592,6 +694,15 @@ async def alpha_node(
         strategy="LEG2_ENTRY" if is_leg2_only else winner_setup,
         breakout_telemetry=winner_bt,
         rationale=winner.rationale,
+        approved_at=approved_at_iso,
+        approval_price_observed_at=approval_price_observed_at,
+        approval_pair_address=approval_pair_address,
+        approval_price_native=approval_price_native,
+        approval_price_source=approval_price_source,
+        approval_candle_close_usd=approval_candle_close_usd,
+        approval_ohlcv_fetched_at=approval_ohlcv_fetched_at,
+        approval_candle_ts=approval_candle_ts,
+        token_decimals=token_decimals,
     )
     return {
         "alpha_decisions": [d.model_dump() for d in decisions],

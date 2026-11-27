@@ -204,8 +204,10 @@ async def test_t6a_and_t6b_12_raw_11_closed_5m_triggers_1m_fallback_only_when_al
         if request.url.params.get("aggregate") == "5":
             net_calls["5m"] += 1
             return httpx.Response(200, json={"data": {"attributes": {"ohlcv_list": raw_5m_rows}}})
-        net_calls["1m"] += 1
-        return httpx.Response(200, json={"data": {"attributes": {"ohlcv_list": raw_1m_rows}}})
+        if request.url.params.get("aggregate") == "1":
+            net_calls["1m"] += 1
+            return httpx.Response(200, json={"data": {"attributes": {"ohlcv_list": raw_1m_rows}}})
+        return httpx.Response(404)
 
     cand = {
         "mint": "MintFB1111111111111111111111111111111111111",

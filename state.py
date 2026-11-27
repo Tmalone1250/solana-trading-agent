@@ -131,6 +131,16 @@ class PendingOrder(BaseModel):
     monitor_sol_value: Optional[float] = None
     price_source: Optional[str] = None
     rationale: str = ""
+    # Phase E4A: Approval & price provenance (pre-broadcast integrity)
+    approved_at: Optional[str] = None
+    approval_price_observed_at: Optional[str] = None
+    approval_pair_address: Optional[str] = None
+    approval_price_native: Optional[float] = None
+    approval_price_source: Optional[str] = None
+    approval_candle_close_usd: Optional[float] = None
+    approval_ohlcv_fetched_at: Optional[str] = None
+    approval_candle_ts: Optional[int] = None
+    token_decimals: Optional[int] = None
 
 
 class ActivePosition(BaseModel):

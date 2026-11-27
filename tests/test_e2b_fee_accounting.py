@@ -30,7 +30,12 @@ POOL_PINNED = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi"
 MINT_E2B = "p2Yicb86aZig616Eav2VWG9vuXR5mEqhtzshZYBxzsV"
 
 
-def _mk_paper_buy_order(mint: str = MINT_E2B, symbol: str = "E2B", reason: str = "DECISION_1_ENTRY") -> dict[str, Any]:
+def _mk_paper_buy_order(
+    mint: str = MINT_E2B,
+    symbol: str = "E2B",
+    reason: str = "DECISION_1_ENTRY",
+    strategy: str = "BREAKOUT_IGNITION",
+) -> dict[str, Any]:
     return PendingOrder(
         side="BUY",
         mint=mint,
@@ -42,7 +47,7 @@ def _mk_paper_buy_order(mint: str = MINT_E2B, symbol: str = "E2B", reason: str =
         target_state_after_fill=FocusState.IN_POSITION,
         entry_liquidity_usd=80_000.0,
         entry_mc_usd=500_000.0,
-        strategy="BREAKOUT_IGNITION",
+        strategy=strategy,
     ).model_dump()
 
 
@@ -235,7 +240,7 @@ async def test_e2b_live_unknown_fee_remains_null_and_historical_migration_preser
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(live_handler)) as client:
         out_live = await executor_node(
-            {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "daily_pnl_sol": 0.0, "pending_order": _mk_paper_buy_order()},
+            {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "daily_pnl_sol": 0.0, "pending_order": _mk_paper_buy_order(strategy="SCALPER")},
             config=cfg_live, db=db_live, http_client=client,
         )
     live_pos = out_live["chart_positions"][0]
@@ -547,7 +552,7 @@ async def test_e2b_c2_live_unknown_fees_no_zero_substitution(tmp_path, monkeypat
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         out_b = await executor_node(
-            {"focus_state": FocusState.SCANNING.value, "sol_balance": 3.0, "daily_pnl_sol": 0.0, "pending_order": _mk_paper_buy_order()},
+            {"focus_state": FocusState.SCANNING.value, "sol_balance": 3.0, "daily_pnl_sol": 0.0, "pending_order": _mk_paper_buy_order(strategy="SCALPER")},
             config=cfg, db=db, http_client=client,
         )
         assert out_b["last_execution"]["tx_fee_sol"] is None

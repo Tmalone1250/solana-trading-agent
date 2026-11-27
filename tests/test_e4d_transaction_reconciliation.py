@@ -53,7 +53,7 @@ def _mk_buy_order(mint: str = MINT_A, symbol: str = "E4D", amount_sol: float = 0
         target_state_after_fill=FocusState.IN_POSITION,
         entry_liquidity_usd=80_000.0,
         entry_mc_usd=500_000.0,
-        strategy="BREAKOUT_IGNITION",
+        strategy="SCALPER",
     ).model_dump()
 
 

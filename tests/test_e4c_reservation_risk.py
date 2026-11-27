@@ -41,7 +41,7 @@ def _mk_buy_order(
     symbol: str = "E4C",
     pair_address: str = POOL_A,
     amount_sol: float = 0.50,
-    strategy: str = "BREAKOUT_IGNITION",
+    strategy: str = "SCALPER",
 ) -> dict[str, Any]:
     return PendingOrder(
         side="BUY",

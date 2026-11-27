@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import math
 import time
 import uuid
 from datetime import datetime, timezone
@@ -53,6 +54,307 @@ def sign_jupiter_transaction(tx_base64: str, private_key_bs58: str) -> str:
 
 
 _ORIG_SIGN_JUPITER_TX = sign_jupiter_transaction
+
+AUTHORITATIVE_APPROVAL_PRICE_SOURCE = "dexscreener_pinned_pool_native"
+
+
+class E4AValidationError(RuntimeError):
+    """Raised when Phase E4A pre-broadcast approval or quote integrity checks fail."""
+
+
+def _parse_iso_utc(raw: Optional[str]) -> Optional[datetime]:
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+
+def _parse_e4a_price_impact_pct(order_resp: dict[str, Any]) -> Optional[float]:
+    """Parse priceImpact first, falling back to deprecated priceImpactPct only when absent."""
+    if not isinstance(order_resp, dict):
+        return None
+    raw = order_resp.get("priceImpact")
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        raw = order_resp.get("priceImpactPct")
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        val = float(raw)
+    except (ValueError, TypeError):
+        return None
+    if not math.isfinite(val):
+        return None
+    return val
+
+
+def _e4a_is_active(order: PendingOrder, config: AgentConfig) -> bool:
+    """E4A applies to BREAKOUT_IGNITION BUY in live mode (unconditionally) or paper when any E4A threshold is configured."""
+    if order.side.upper() != "BUY":
+        return False
+    if str(order.strategy or "").upper() != "BREAKOUT_IGNITION":
+        return False
+    if config.EXECUTION_MODE == "live":
+        return True
+    return any(
+        getattr(config, attr) is not None
+        for attr in (
+            "MAX_BUY_APPROVAL_AGE_SECONDS",
+            "MAX_APPROVAL_PRICE_AGE_SECONDS",
+            "MAX_ENTRY_PRICE_DRIFT_PCT",
+            "MAX_NEGATIVE_ENTRY_DRIFT_PCT",
+            "MAX_WORST_CASE_ENTRY_DRIFT_PCT",
+            "MAX_QUOTE_AGE_SECONDS",
+            "MAX_ACCEPTED_SLIPPAGE_BPS",
+            "MAX_ENTRY_PRICE_IMPACT_PCT",
+            "MIN_BLOCK_HEIGHT_HEADROOM",
+            "MIN_RFQ_EXPIRY_HEADROOM_SECONDS",
+        )
+    )
+
+
+def _validate_e4a_approval_provenance(
+    order: PendingOrder,
+    config: AgentConfig,
+    *,
+    now_dt: datetime,
+) -> None:
+    """Validate pre-quote approval provenance, token decimals, and freshness."""
+    if not _e4a_is_active(order, config):
+        return
+
+    is_live = config.EXECUTION_MODE == "live"
+    if is_live:
+        required_live = (
+            "MAX_BUY_APPROVAL_AGE_SECONDS",
+            "MAX_APPROVAL_PRICE_AGE_SECONDS",
+            "MAX_ENTRY_PRICE_DRIFT_PCT",
+            "MAX_QUOTE_AGE_SECONDS",
+            "MAX_ACCEPTED_SLIPPAGE_BPS",
+            "MAX_ENTRY_PRICE_IMPACT_PCT",
+        )
+        missing_cfg = [k for k in required_live if getattr(config, k) is None]
+        if missing_cfg:
+            raise E4AValidationError(
+                f"BLOCKED: E4A_LIVE_THRESHOLDS_UNSET ({','.join(missing_cfg)})"
+            )
+
+    # Validate approval provenance whenever live OR any approval/drift threshold is set in paper
+    need_approval_ctx = is_live or any(
+        getattr(config, k) is not None
+        for k in (
+            "MAX_BUY_APPROVAL_AGE_SECONDS",
+            "MAX_APPROVAL_PRICE_AGE_SECONDS",
+            "MAX_ENTRY_PRICE_DRIFT_PCT",
+            "MAX_NEGATIVE_ENTRY_DRIFT_PCT",
+            "MAX_WORST_CASE_ENTRY_DRIFT_PCT",
+        )
+    )
+    if not need_approval_ctx:
+        return
+
+    app_dt = _parse_iso_utc(order.approved_at)
+    if app_dt is None:
+        raise E4AValidationError("BLOCKED: MISSING_OR_INVALID_APPROVED_AT")
+    if config.MAX_BUY_APPROVAL_AGE_SECONDS is not None:
+        app_age = (now_dt - app_dt).total_seconds()
+        if app_age > float(config.MAX_BUY_APPROVAL_AGE_SECONDS) or app_age < -5.0:
+            raise E4AValidationError(
+                f"BLOCKED: STALE_BUY_APPROVAL (age={app_age:.2f}s > {config.MAX_BUY_APPROVAL_AGE_SECONDS}s)"
+            )
+
+    obs_dt = _parse_iso_utc(order.approval_price_observed_at)
+    if obs_dt is None:
+        raise E4AValidationError("BLOCKED: MISSING_OR_INVALID_APPROVAL_PRICE_OBSERVED_AT")
+    if config.MAX_APPROVAL_PRICE_AGE_SECONDS is not None:
+        obs_age = (now_dt - obs_dt).total_seconds()
+        if obs_age > float(config.MAX_APPROVAL_PRICE_AGE_SECONDS) or obs_age < -5.0:
+            raise E4AValidationError(
+                f"BLOCKED: STALE_APPROVAL_PRICE (age={obs_age:.2f}s > {config.MAX_APPROVAL_PRICE_AGE_SECONDS}s)"
+            )
+
+    if order.approval_price_source != AUTHORITATIVE_APPROVAL_PRICE_SOURCE:
+        raise E4AValidationError(
+            f"BLOCKED: INVALID_APPROVAL_PRICE_SOURCE ({order.approval_price_source!r})"
+        )
+    if not order.pair_address or order.approval_pair_address != order.pair_address:
+        raise E4AValidationError(
+            f"BLOCKED: APPROVAL_POOL_MISMATCH (approval={order.approval_pair_address!r} != order={order.pair_address!r})"
+        )
+    pn = order.approval_price_native
+    if pn is None or isinstance(pn, bool) or not math.isfinite(float(pn)) or float(pn) <= 0.0:
+        raise E4AValidationError(f"BLOCKED: INVALID_APPROVAL_PRICE_NATIVE ({pn!r})")
+
+    dec = order.token_decimals
+    if dec is None or isinstance(dec, bool) or not isinstance(dec, int) or not (0 <= dec <= 18):
+        raise E4AValidationError(f"BLOCKED: MISSING_OR_INVALID_TOKEN_DECIMALS ({dec!r})")
+
+
+async def _fetch_rpc_block_height(config: AgentConfig, client: httpx.AsyncClient) -> int:
+    rpc_url = config.SOLANA_RPC_URL.strip()
+    if not rpc_url:
+        raise E4AValidationError("BLOCKED: SOLANA_RPC_URL_MISSING_FOR_BLOCK_HEIGHT")
+    resp = await client.post(
+        rpc_url,
+        json={"jsonrpc": "2.0", "id": 1, "method": "getBlockHeight", "params": [{"commitment": "confirmed"}]},
+        timeout=config.LIVE_RPC_TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict) or data.get("error") is not None:
+        raise E4AValidationError(f"BLOCKED: RPC_BLOCK_HEIGHT_ERROR ({data})")
+    bh = data.get("result")
+    if isinstance(bh, bool) or not isinstance(bh, int) or bh < 0:
+        raise E4AValidationError(f"BLOCKED: INVALID_RPC_BLOCK_HEIGHT ({bh!r})")
+    return bh
+
+
+async def _validate_e4a_quote_timing_and_expiry(
+    order_resp: dict[str, Any],
+    config: AgentConfig,
+    *,
+    quote_received_at: datetime,
+    client: httpx.AsyncClient,
+    stage: str,
+    is_live: bool,
+    now_dt: Optional[datetime] = None,
+) -> None:
+    """Validate quote age and router-specific expiry at receipt, pre-sign, and pre-submit checkpoints."""
+    check_now = now_dt or utc_now()
+    if config.MAX_QUOTE_AGE_SECONDS is not None:
+        q_age = (check_now - quote_received_at).total_seconds()
+        if q_age > float(config.MAX_QUOTE_AGE_SECONDS):
+            raise E4AValidationError(
+                f"BLOCKED: STALE_QUOTE_{stage} (age={q_age:.2f}s > {config.MAX_QUOTE_AGE_SECONDS}s)"
+            )
+
+    router = str(order_resp.get("router") or "").strip().lower()
+    if router == "jupiterz":
+        headroom = config.MIN_RFQ_EXPIRY_HEADROOM_SECONDS
+        if is_live and headroom is None:
+            raise E4AValidationError("BLOCKED: MIN_RFQ_EXPIRY_HEADROOM_SECONDS_UNSET")
+        if headroom is not None or is_live:
+            exp_dt = _parse_iso_utc(order_resp.get("expireAt"))
+            if exp_dt is None:
+                raise E4AValidationError(f"BLOCKED: MISSING_OR_INVALID_EXPIRE_AT_{stage}")
+            if check_now.timestamp() >= exp_dt.timestamp() - float(headroom or 0.0):
+                raise E4AValidationError(f"BLOCKED: QUOTE_EXPIRED_RFQ_{stage}")
+    elif router in ("metis", "dflow", "okx") or config.MIN_BLOCK_HEIGHT_HEADROOM is not None or is_live:
+        headroom_bh = config.MIN_BLOCK_HEIGHT_HEADROOM
+        if is_live and headroom_bh is None:
+            raise E4AValidationError("BLOCKED: MIN_BLOCK_HEIGHT_HEADROOM_UNSET")
+        if headroom_bh is not None:
+            lvbh_raw = order_resp.get("lastValidBlockHeight")
+            if isinstance(lvbh_raw, bool) or lvbh_raw is None:
+                raise E4AValidationError(f"BLOCKED: MISSING_LAST_VALID_BLOCK_HEIGHT_{stage}")
+            try:
+                lvbh = int(lvbh_raw)
+            except (ValueError, TypeError) as exc:
+                raise E4AValidationError(f"BLOCKED: INVALID_LAST_VALID_BLOCK_HEIGHT_{stage}") from exc
+            if lvbh <= 0:
+                raise E4AValidationError(f"BLOCKED: NONPOSITIVE_LAST_VALID_BLOCK_HEIGHT_{stage}")
+            curr_bh = await _fetch_rpc_block_height(config, client)
+            if curr_bh >= lvbh - int(headroom_bh):
+                raise E4AValidationError(
+                    f"BLOCKED: QUOTE_BLOCK_HEIGHT_EXPIRED_{stage} (curr={curr_bh} >= lvbh={lvbh} - {headroom_bh})"
+                )
+
+
+async def _validate_e4a_quote_receipt(
+    order: PendingOrder,
+    order_resp: dict[str, Any],
+    out_amount: int,
+    config: AgentConfig,
+    *,
+    quote_received_at: datetime,
+    client: httpx.AsyncClient,
+    now_dt: Optional[datetime] = None,
+) -> None:
+    """Checkpoint 1: Validate out_amount > 0, quote timing/expiry, slippage, priceImpact, and drift."""
+    if out_amount <= 0:
+        raise E4AValidationError(f"BLOCKED: NONPOSITIVE_OUT_AMOUNT ({out_amount})")
+
+    if not _e4a_is_active(order, config):
+        return
+
+    is_live = config.EXECUTION_MODE == "live"
+    await _validate_e4a_quote_timing_and_expiry(
+        order_resp, config, quote_received_at=quote_received_at, client=client,
+        stage="RECEIPT", is_live=is_live, now_dt=now_dt,
+    )
+
+    # Slippage validation (preserve RTSE; validate response slippageBps if present/configured)
+    if config.MAX_ACCEPTED_SLIPPAGE_BPS is not None:
+        raw_slip = order_resp.get("slippageBps")
+        if raw_slip is None or isinstance(raw_slip, bool):
+            if is_live:
+                raise E4AValidationError("BLOCKED: MISSING_RESPONSE_SLIPPAGE_BPS")
+        else:
+            try:
+                slip_bps = int(raw_slip)
+            except (ValueError, TypeError) as exc:
+                raise E4AValidationError(f"BLOCKED: INVALID_RESPONSE_SLIPPAGE_BPS ({raw_slip!r})") from exc
+            if slip_bps < 0 or slip_bps > int(config.MAX_ACCEPTED_SLIPPAGE_BPS):
+                raise E4AValidationError(
+                    f"BLOCKED: EXCESSIVE_SLIPPAGE_BPS ({slip_bps} > {config.MAX_ACCEPTED_SLIPPAGE_BPS})"
+                )
+
+    # Price impact validation (priceImpact primary, priceImpactPct fallback; missing != 0)
+    if config.MAX_ENTRY_PRICE_IMPACT_PCT is not None:
+        impact_pct = _parse_e4a_price_impact_pct(order_resp)
+        if impact_pct is None:
+            raise E4AValidationError("BLOCKED: MISSING_OR_MALFORMED_PRICE_IMPACT")
+        if abs(impact_pct) > float(config.MAX_ENTRY_PRICE_IMPACT_PCT):
+            raise E4AValidationError(
+                f"BLOCKED: EXCESSIVE_PRICE_IMPACT (|{impact_pct:.4f}| > {config.MAX_ENTRY_PRICE_IMPACT_PCT})"
+            )
+
+    # Entry price drift & worst-case otherAmountThreshold validation
+    if any(
+        getattr(config, k) is not None
+        for k in ("MAX_ENTRY_PRICE_DRIFT_PCT", "MAX_NEGATIVE_ENTRY_DRIFT_PCT", "MAX_WORST_CASE_ENTRY_DRIFT_PCT")
+    ):
+        assert order.approval_price_native is not None and order.token_decimals is not None
+        spent_sol = order.amount_atomic / LAMPORTS_PER_SOL
+        quoted_tokens = out_amount / (10 ** order.token_decimals)
+        if quoted_tokens <= 0.0:
+            raise E4AValidationError("BLOCKED: ZERO_QUOTED_TOKENS")
+        quote_price_native = spent_sol / quoted_tokens
+        entry_drift_pct = ((quote_price_native - order.approval_price_native) / order.approval_price_native) * 100.0
+
+        if config.MAX_ENTRY_PRICE_DRIFT_PCT is not None and entry_drift_pct > float(config.MAX_ENTRY_PRICE_DRIFT_PCT):
+            raise E4AValidationError(
+                f"BLOCKED: EXCESSIVE_ADVERSE_ENTRY_DRIFT ({entry_drift_pct:.4f}% > {config.MAX_ENTRY_PRICE_DRIFT_PCT}%)"
+            )
+        if config.MAX_NEGATIVE_ENTRY_DRIFT_PCT is not None and entry_drift_pct < -float(config.MAX_NEGATIVE_ENTRY_DRIFT_PCT):
+            raise E4AValidationError(
+                f"BLOCKED: EXCESSIVE_NEGATIVE_ENTRY_DRIFT ({entry_drift_pct:.4f}% < -{config.MAX_NEGATIVE_ENTRY_DRIFT_PCT}%)"
+            )
+
+        oat_raw = order_resp.get("otherAmountThreshold")
+        if oat_raw is not None and not isinstance(oat_raw, bool):
+            try:
+                oat_int = int(oat_raw)
+            except (ValueError, TypeError) as exc:
+                raise E4AValidationError(f"BLOCKED: INVALID_OTHER_AMOUNT_THRESHOLD ({oat_raw!r})") from exc
+            if oat_int <= 0:
+                raise E4AValidationError(f"BLOCKED: NONPOSITIVE_OTHER_AMOUNT_THRESHOLD ({oat_int})")
+            wc_tokens = oat_int / (10 ** order.token_decimals)
+            wc_price_native = spent_sol / wc_tokens
+            wc_drift_pct = ((wc_price_native - order.approval_price_native) / order.approval_price_native) * 100.0
+            wc_limit = (
+                float(config.MAX_WORST_CASE_ENTRY_DRIFT_PCT)
+                if config.MAX_WORST_CASE_ENTRY_DRIFT_PCT is not None
+                else (float(config.MAX_ENTRY_PRICE_DRIFT_PCT) if config.MAX_ENTRY_PRICE_DRIFT_PCT is not None else None)
+            )
+            if wc_limit is not None and wc_drift_pct > wc_limit:
+                raise E4AValidationError(
+                    f"BLOCKED: EXCESSIVE_WORST_CASE_DRIFT ({wc_drift_pct:.4f}% > {wc_limit}%)"
+                )
 
 
 async def fetch_live_wallet_sol_balance(
@@ -219,6 +521,18 @@ async def executor_node(
                 logger.warning("[Executor] Duplicate mint guard blocked %s BUY of %s", f"{lane_tag}_slot", order.symbol)
                 return {"pending_order": None}
 
+            # Phase E4A: Pre-quote approval provenance & threshold validation
+            try:
+                _validate_e4a_approval_provenance(order, config, now_dt=utc_now())
+            except E4AValidationError as exc:
+                logger.warning("[Executor] E4A approval guard blocked %s BUY of %s: %s", f"{lane_tag}_slot", order.symbol, exc)
+                db.log_action(
+                    mode=config.EXECUTION_MODE, action="DECISION_1", symbol=order.symbol, asset_id=order.mint,
+                    strategy=order.strategy or "SCALPER", reason=str(exc),
+                    pair_address=order.pair_address, dex_id=order.dex_id,
+                )
+                return {"pending_order": None}
+
             # Live mode: fetch actual wallet SOL balance via RPC strictly OUTSIDE db._lock; fail closed on any error
             live_wallet_sol: Optional[float] = None
             if config.EXECUTION_MODE == "live":
@@ -309,6 +623,7 @@ async def executor_node(
                 input_mint=input_mint, output_mint=output_mint,
                 amount_atomic=order.amount_atomic, config=config, client=client, taker=taker,
             )
+            quote_received_at = utc_now()
             out_amount = int(order_resp["outAmount"])
         except Exception as exc:
             if not is_buy and config.EXECUTION_MODE != "live":
@@ -318,15 +633,26 @@ async def executor_node(
                     fb_sol = round(fb_sol * fb_frac, 6)
                 logger.warning("[Executor] Jupiter quote failed on %s %s (%s); falling back to live SOL quote %.4f", order.side, order.symbol, exc, fb_sol)
                 order_resp = {"outAmount": str(max(1, int(round(fb_sol * LAMPORTS_PER_SOL)))), "transaction": None}
+                quote_received_at = utc_now()
                 out_amount = int(order_resp["outAmount"])
             else:
                 raise
+        # Checkpoint 1: Quote receipt validation (out_amount > 0 in all modes, plus E4A drift/impact/slippage/expiry)
+        await _validate_e4a_quote_receipt(
+            order, order_resp, out_amount, config, quote_received_at=quote_received_at, client=client,
+        )
         tx_signature: Optional[str] = None
         if config.EXECUTION_MODE == "live":
             tx_b64 = order_resp.get("transaction")
             request_id = str(order_resp.get("requestId") or "")
             if not tx_b64:
                 raise RuntimeError("Jupiter /swap/v2/order returned no transaction in live mode")
+            # Checkpoint 2: Pre-sign quote timing & router expiry
+            if _e4a_is_active(order, config):
+                await _validate_e4a_quote_timing_and_expiry(
+                    order_resp, config, quote_received_at=quote_received_at, client=client,
+                    stage="PRE_SIGN", is_live=True,
+                )
             pre_sig: Optional[str] = None
             if sign_jupiter_transaction is _ORIG_SIGN_JUPITER_TX:
                 assert taker is not None
@@ -363,7 +689,7 @@ async def executor_node(
                     amount_atomic=order.amount_atomic,
                     expected_out_amount=out_amount,
                     other_amount_threshold=oat_val,
-                    token_decimals=None,
+                    token_decimals=order.token_decimals,
                     taker_pubkey=taker,
                     reserved_sol=float(order.amount_atomic / LAMPORTS_PER_SOL) + reserve_fee_sol,
                     status="PREPARED",
@@ -379,6 +705,12 @@ async def executor_node(
                     },
                 )
                 attach_intent_to_reservation(db, reservation_id, intent_id)
+                # Checkpoint 3: Pre-submit quote timing & router expiry
+                if _e4a_is_active(order, config):
+                    await _validate_e4a_quote_timing_and_expiry(
+                        order_resp, config, quote_received_at=quote_received_at, client=client,
+                        stage="PRE_SUBMIT", is_live=True,
+                    )
                 db.transition_order_intent(
                     intent_id, new_status="SUBMITTED", expected_statuses=("PREPARED",),
                 )
@@ -398,6 +730,22 @@ async def executor_node(
                 )
         else:
             tx_signature = f"paper-{order.side.lower()}-{order.mint[:8]}"
+    except E4AValidationError as exc:
+        if intent_id:
+            db.transition_order_intent(
+                intent_id, new_status="FAILED", error_detail=f"ABORTED_BEFORE_BROADCAST: {exc}",
+            )
+        if reservation_id:
+            db.release_buy_reservation(reservation_id)
+        finalize_exit_guard(db, sell_key, committed=False)
+        logger.warning("[Executor] E4A quote guard blocked %s %s: %s", order.side, order.symbol, exc)
+        db.log_action(
+            mode=config.EXECUTION_MODE, action="DECISION_1" if is_buy else order.side.upper(),
+            symbol=order.symbol, asset_id=order.mint,
+            strategy=order.strategy or "SCALPER", reason=str(exc),
+            pair_address=order.pair_address, dex_id=order.dex_id,
+        )
+        return {"pending_order": None}
     except BaseException as exc:
         if intent_id:
             if broadcast_attempted:
