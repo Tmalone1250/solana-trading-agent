@@ -23,6 +23,7 @@ SELL_GUARD_MAX = 64
 
 RESERVATION_STATE_ACTIVE = "ACTIVE"
 RESERVATION_STATE_BROADCAST_UNRESOLVED = "BROADCAST_UNRESOLVED"
+ACTIVE_LOCKING_INTENT_STATUSES = ("PREPARED", "SUBMITTED", "UNRESOLVED", "SETTLEMENT_PENDING_PERSISTENCE")
 
 # Guarded by db._lock: db_path -> list of {id, lane, mint, sol_amount, created_ts}
 _inflight_buy_reservations: dict[str, list[dict[str, Any]]] = {}
@@ -165,6 +166,18 @@ def _prune_reservations_locked(db_path: str, now_ts: float) -> list[dict[str, An
             active.append(r)
     _inflight_buy_reservations[db_path] = active
     return active
+
+
+def attach_intent_to_reservation(db: Any, reservation_id: Optional[str], intent_id: str) -> None:
+    """Link an in-flight BUY reservation to its durable DuckDB order_intent ID under db._lock."""
+    if not reservation_id or not intent_id:
+        return
+    with db._lock:
+        key = str(db.db_path)
+        for r in _inflight_buy_reservations.get(key, []):
+            if r.get("id") == reservation_id:
+                r["intent_id"] = intent_id
+                break
 
 
 def mark_buy_reservation_broadcast_unresolved(
@@ -325,6 +338,20 @@ def reserve_buy_slot(
                 sol_bal = float(fallback_state_sol)
 
         active_res = _prune_reservations_locked(str(db.db_path), time.monotonic())
+        durable_intents = db._conn.execute(
+            """
+            SELECT intent_id, reservation_id, lane, mint, reserved_sol
+            FROM order_intents
+            WHERE status IN ('PREPARED', 'SUBMITTED', 'UNRESOLVED', 'SETTLEMENT_PENDING_PERSISTENCE')
+            """
+        ).fetchall()
+        inflight_intent_ids = {str(r.get("intent_id")) for r in active_res if r.get("intent_id")}
+        inflight_res_ids = {str(r.get("id")) for r in active_res if r.get("id")}
+        orphan_durable = [
+            {"intent_id": str(d[0]), "reservation_id": str(d[1] or ""), "lane": str(d[2]), "mint": str(d[3]), "sol_amount": float(d[4] or 0.0)}
+            for d in durable_intents
+            if str(d[0]) not in inflight_intent_ids and (not d[1] or str(d[1]) not in inflight_res_ids)
+        ]
 
         open_mints: set[str] = set()
         for p in chart_list + whale_list + [act_p, wh_p]:
@@ -332,19 +359,21 @@ def reserve_buy_slot(
                 open_mints.add(str(p["mint"]))
         for r in active_res:
             open_mints.add(str(r["mint"]))
+        for d in orphan_durable:
+            open_mints.add(str(d["mint"]))
 
         if mint in open_mints and not is_reentry_same_mint:
             return None, f"DUPLICATE_MINT ({mint})"
 
         live_lane_cnt = len(whale_list) if lane == "whale" else len(chart_list)
-        res_lane_cnt = sum(1 for r in active_res if r["lane"] == lane)
-        total_cnt = len(chart_list) + len(whale_list) + len(active_res)
+        res_lane_cnt = sum(1 for r in active_res if r["lane"] == lane) + sum(1 for d in orphan_durable if d["lane"] == lane)
+        total_cnt = len(chart_list) + len(whale_list) + len(active_res) + len(orphan_durable)
         if (live_lane_cnt + res_lane_cnt) >= max_lane_positions or total_cnt >= max_open_positions:
             return None, f"LANE_CAPACITY (lane={live_lane_cnt + res_lane_cnt}/{max_lane_positions}, total={total_cnt}/{max_open_positions})"
 
         fee_headroom = max(0.0, float(tx_fee_sol or 0.0))
         total_required = float(required_sol) + fee_headroom
-        reserved_sol = sum(float(r["sol_amount"]) for r in active_res)
+        reserved_sol = sum(float(r["sol_amount"]) for r in active_res) + sum(float(d["sol_amount"]) for d in orphan_durable)
         duck_avail_sol = sol_bal - reserved_sol
 
         if live_wallet_sol is not None:
@@ -409,6 +438,8 @@ def apply_trade_settlement(
     focus_state: Optional[str] = None,
     last_decision_rationale: Optional[str] = None,
     reservation_id: Optional[str] = None,
+    intent_id: Optional[str] = None,
+    intent_final_status: str = "CONFIRMED",
     fallback_base_sol: Optional[float] = None,
     fallback_base_pnl: Optional[float] = None,
 ) -> dict[str, Any]:
@@ -507,6 +538,12 @@ def apply_trade_settlement(
                     "active_position": legacy_act, "chart_positions": kept_c,
                     "whale_position": wh_p, "whale_positions": whale_list,
                 }
+
+            if intent_id:
+                db._conn.execute(
+                    "UPDATE order_intents SET status = ?, updated_at = ? WHERE intent_id = ?",
+                    [intent_final_status, _utc_now_iso(), intent_id],
+                )
 
             db._conn.execute("COMMIT")
         except BaseException:

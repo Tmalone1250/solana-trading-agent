@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import logging
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -17,10 +18,12 @@ from db import AgentDatabase, utc_now, utc_now_iso
 from state import ActivePosition, AgentGraphState, FocusState, PendingOrder, is_valid_pool_address
 from state_ledger import (
     acquire_exit_guard,
+    attach_intent_to_reservation,
     clear_sell_guard,
     finalize_exit_guard,
     mark_buy_reservation_broadcast_unresolved,
 )
+from tx_reconciler import derive_and_validate_single_signer_tx
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +50,9 @@ def sign_jupiter_transaction(tx_base64: str, private_key_bs58: str) -> str:
     tx = VersionedTransaction.from_bytes(raw_tx)
     signed_tx = VersionedTransaction(tx.message, [keypair])
     return base64.b64encode(bytes(signed_tx)).decode("ascii")
+
+
+_ORIG_SIGN_JUPITER_TX = sign_jupiter_transaction
 
 
 async def fetch_live_wallet_sol_balance(
@@ -294,6 +300,8 @@ async def executor_node(
     output_mint = order.mint if is_buy else SOL_MINT
     broadcast_attempted = False
     settled_buy = False
+    intent_id: Optional[str] = None
+    buy_opened_at = utc_now_iso() if is_buy else None
 
     try:
         try:
@@ -319,20 +327,89 @@ async def executor_node(
             request_id = str(order_resp.get("requestId") or "")
             if not tx_b64:
                 raise RuntimeError("Jupiter /swap/v2/order returned no transaction in live mode")
-            signed_b64 = sign_jupiter_transaction(tx_b64, config.SOLANA_PRIVATE_KEY_BS58)
+            pre_sig: Optional[str] = None
+            if sign_jupiter_transaction is _ORIG_SIGN_JUPITER_TX:
+                assert taker is not None
+                signed_b64, pre_sig = derive_and_validate_single_signer_tx(
+                    tx_b64, config.SOLANA_PRIVATE_KEY_BS58, order_resp, taker,
+                )
+            else:
+                signed_b64 = sign_jupiter_transaction(tx_b64, config.SOLANA_PRIVATE_KEY_BS58)
+
+            if is_buy:
+                intent_id = uuid.uuid4().hex
+                lvbh_raw = order_resp.get("lastValidBlockHeight")
+                lvbh_val = int(lvbh_raw) if lvbh_raw is not None and not isinstance(lvbh_raw, bool) else None
+                oat_raw = order_resp.get("otherAmountThreshold")
+                oat_val = int(oat_raw) if oat_raw is not None and not isinstance(oat_raw, bool) else None
+                db.create_order_intent(
+                    intent_id=intent_id,
+                    reservation_id=reservation_id,
+                    lane=lane_tag,
+                    mint=order.mint,
+                    symbol=order.symbol,
+                    pair_address=order.pair_address,
+                    dex_id=order.dex_id,
+                    side=order.side,
+                    strategy=order.strategy or "SCALPER",
+                    router=str(order_resp.get("router") or "") or None,
+                    order_mode=str(order_resp.get("mode") or "") or None,
+                    jupiter_request_id=request_id or None,
+                    tx_signature=pre_sig,
+                    last_valid_block_height=lvbh_val,
+                    expire_at=str(order_resp.get("expireAt") or "") or None,
+                    input_mint=input_mint,
+                    output_mint=output_mint,
+                    amount_atomic=order.amount_atomic,
+                    expected_out_amount=out_amount,
+                    other_amount_threshold=oat_val,
+                    token_decimals=None,
+                    taker_pubkey=taker,
+                    reserved_sol=float(order.amount_atomic / LAMPORTS_PER_SOL) + reserve_fee_sol,
+                    status="PREPARED",
+                    order_snapshot={
+                        "opened_at": buy_opened_at,
+                        "reason": order.reason,
+                        "entry_liquidity_usd": order.entry_liquidity_usd,
+                        "entry_mc_usd": order.entry_mc_usd,
+                        "whale_sol_flow": order.whale_sol_flow,
+                        "triggering_wallets": list(order.triggering_wallets),
+                        "breakout_telemetry": order.breakout_telemetry,
+                        "rationale": order.rationale,
+                    },
+                )
+                attach_intent_to_reservation(db, reservation_id, intent_id)
+                db.transition_order_intent(
+                    intent_id, new_status="SUBMITTED", expected_statuses=("PREPARED",),
+                )
+
             broadcast_attempted = True
             exec_resp = await execute_jupiter_signed_order(
                 signed_tx_base64=signed_b64, request_id=request_id, config=config, client=client,
             )
-            tx_signature = str(exec_resp.get("signature") or exec_resp.get("txid") or "")
-            if exec_resp.get("outputAmountResult"):
+            tx_signature = str(exec_resp.get("signature") or exec_resp.get("txid") or pre_sig or "")
+            if exec_resp.get("outputAmountResult") is not None and str(exec_resp.get("outputAmountResult")).strip() != "":
                 out_amount = int(exec_resp["outputAmountResult"])
+            if intent_id and tx_signature:
+                db.transition_order_intent(intent_id, new_status="SUBMITTED", tx_signature=tx_signature)
+            if is_buy and (not tx_signature or out_amount <= 0):
+                raise RuntimeError(
+                    f"Live BUY outcome unresolved: tx_signature={tx_signature!r}, out_amount={out_amount}"
+                )
         else:
             tx_signature = f"paper-{order.side.lower()}-{order.mint[:8]}"
     except BaseException as exc:
+        if intent_id:
+            if broadcast_attempted:
+                db.transition_order_intent(
+                    intent_id, new_status="UNRESOLVED", error_detail=f"{type(exc).__name__}: {exc}",
+                )
+            else:
+                db.transition_order_intent(
+                    intent_id, new_status="FAILED", error_detail=f"ABORTED_BEFORE_BROADCAST: {type(exc).__name__}: {exc}",
+                )
         if reservation_id:
             if broadcast_attempted:
-                # Never release a live reservation after broadcast may have occurred (E4C conservative lock; E4D adds durable reconciliation)
                 mark_buy_reservation_broadcast_unresolved(db, reservation_id, reason=f"{type(exc).__name__}: {exc}")
             else:
                 db.release_buy_reservation(reservation_id)
@@ -366,7 +443,7 @@ async def executor_node(
                 mint=order.mint, symbol=order.symbol, entry_sol=spent_sol, token_amount=out_amount,
                 pair_address=order.pair_address, dex_id=order.dex_id,
                 strategy=pos_strategy, triggering_wallets=list(order.triggering_wallets),
-                whale_shadow_exit_flag=False, opened_at=utc_now_iso(),
+                whale_shadow_exit_flag=False, opened_at=buy_opened_at or utc_now_iso(),
                 entry_liquidity_usd=order.entry_liquidity_usd, entry_mc_usd=order.entry_mc_usd,
                 whale_sol_flow=order.whale_sol_flow, breakout_telemetry=order.breakout_telemetry,
                 current_sol_value=spent_sol, peak_sol_value=spent_sol,
@@ -385,11 +462,35 @@ async def executor_node(
                 lane=lane_tag, side="BUY", mint=order.mint, opened_at=pos.opened_at, new_pos_dict=new_pos_dict,
                 sol_delta=sol_delta, pnl_delta=pnl_delta, focus_state=next_state,
                 last_decision_rationale=rationale_out, reservation_id=reservation_id,
+                intent_id=intent_id, intent_final_status="CONFIRMED",
                 fallback_base_sol=fb_base_sol, fallback_base_pnl=fb_base_pnl,
             )
             settled_buy = True
             sol_balance, daily_pnl_sol = settled["sol_balance"], settled["daily_pnl_sol"]
         except BaseException as exc:
+            if intent_id and not settled_buy:
+                if broadcast_attempted:
+                    snap_retry = {
+                        "opened_at": buy_opened_at,
+                        "reason": order.reason,
+                        "entry_liquidity_usd": order.entry_liquidity_usd,
+                        "entry_mc_usd": order.entry_mc_usd,
+                        "whale_sol_flow": order.whale_sol_flow,
+                        "triggering_wallets": list(order.triggering_wallets),
+                        "breakout_telemetry": order.breakout_telemetry,
+                        "rationale": order.rationale,
+                        "reconciled_out_tokens": out_amount,
+                        "reconciled_entry_sol": order.amount_atomic / LAMPORTS_PER_SOL,
+                    }
+                    db.update_order_intent_snapshot(intent_id, snap_retry)
+                    db.transition_order_intent(
+                        intent_id, new_status="SETTLEMENT_PENDING_PERSISTENCE",
+                        error_detail=f"post-broadcast settlement error: {type(exc).__name__}: {exc}",
+                    )
+                else:
+                    db.transition_order_intent(
+                        intent_id, new_status="FAILED", error_detail=f"pre-broadcast error: {type(exc).__name__}: {exc}",
+                    )
             if reservation_id and not settled_buy:
                 if broadcast_attempted:
                     mark_buy_reservation_broadcast_unresolved(db, reservation_id, reason=f"post-broadcast settlement error: {type(exc).__name__}: {exc}")

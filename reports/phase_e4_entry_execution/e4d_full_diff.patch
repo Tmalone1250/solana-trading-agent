@@ -1,0 +1,1666 @@
+diff --git a/db.py b/db.py
+index 3b536b0..465a06a 100644
+--- a/db.py
++++ b/db.py
+@@ -212,6 +212,40 @@ class AgentDatabase:
+                 )
+                 """
+             )
++            self._conn.execute(
++                """
++                CREATE TABLE IF NOT EXISTS order_intents (
++                    intent_id VARCHAR PRIMARY KEY,
++                    reservation_id VARCHAR,
++                    lane VARCHAR NOT NULL,
++                    mint VARCHAR NOT NULL,
++                    symbol VARCHAR NOT NULL,
++                    pair_address VARCHAR,
++                    dex_id VARCHAR,
++                    side VARCHAR NOT NULL,
++                    strategy VARCHAR NOT NULL,
++                    router VARCHAR,
++                    order_mode VARCHAR,
++                    jupiter_request_id VARCHAR,
++                    tx_signature VARCHAR,
++                    last_valid_block_height BIGINT,
++                    expire_at VARCHAR,
++                    input_mint VARCHAR NOT NULL,
++                    output_mint VARCHAR NOT NULL,
++                    amount_atomic BIGINT NOT NULL,
++                    expected_out_amount BIGINT,
++                    other_amount_threshold BIGINT,
++                    token_decimals INTEGER,
++                    taker_pubkey VARCHAR,
++                    reserved_sol DOUBLE NOT NULL,
++                    status VARCHAR NOT NULL,
++                    error_detail VARCHAR,
++                    order_snapshot_json VARCHAR,
++                    created_at VARCHAR NOT NULL,
++                    updated_at VARCHAR NOT NULL
++                )
++                """
++            )
+             self._conn.execute(
+                 """
+                 CREATE TABLE IF NOT EXISTS social_signals (
+@@ -606,6 +640,203 @@ class AgentDatabase:
+     def reserve_buy_slot(self, **kwargs: Any) -> tuple[Optional[str], Optional[str]]:
+         return reserve_buy_slot(self, **kwargs)
+ 
++    def create_order_intent(
++        self,
++        *,
++        intent_id: str,
++        reservation_id: Optional[str],
++        lane: str,
++        mint: str,
++        symbol: str,
++        pair_address: Optional[str],
++        dex_id: Optional[str],
++        side: str,
++        strategy: str,
++        router: Optional[str],
++        order_mode: Optional[str],
++        jupiter_request_id: Optional[str],
++        tx_signature: Optional[str],
++        last_valid_block_height: Optional[int],
++        expire_at: Optional[str],
++        input_mint: str,
++        output_mint: str,
++        amount_atomic: int,
++        expected_out_amount: Optional[int],
++        other_amount_threshold: Optional[int],
++        token_decimals: Optional[int],
++        taker_pubkey: Optional[str],
++        reserved_sol: float,
++        status: str = "PREPARED",
++        error_detail: Optional[str] = None,
++        order_snapshot: Optional[dict[str, Any]] = None,
++    ) -> None:
++        now_iso = utc_now_iso()
++        with self._lock:
++            self._conn.execute("BEGIN TRANSACTION")
++            try:
++                self._conn.execute(
++                    """
++                    INSERT INTO order_intents (
++                        intent_id, reservation_id, lane, mint, symbol, pair_address, dex_id,
++                        side, strategy, router, order_mode, jupiter_request_id, tx_signature,
++                        last_valid_block_height, expire_at, input_mint, output_mint, amount_atomic,
++                        expected_out_amount, other_amount_threshold, token_decimals, taker_pubkey,
++                        reserved_sol, status, error_detail, order_snapshot_json, created_at, updated_at
++                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                    """,
++                    [
++                        intent_id,
++                        reservation_id,
++                        lane,
++                        mint,
++                        symbol,
++                        pair_address,
++                        dex_id,
++                        side,
++                        strategy,
++                        router,
++                        order_mode,
++                        jupiter_request_id,
++                        tx_signature,
++                        last_valid_block_height,
++                        expire_at,
++                        input_mint,
++                        output_mint,
++                        int(amount_atomic),
++                        int(expected_out_amount) if expected_out_amount is not None else None,
++                        int(other_amount_threshold) if other_amount_threshold is not None else None,
++                        int(token_decimals) if token_decimals is not None else None,
++                        taker_pubkey,
++                        float(reserved_sol),
++                        status,
++                        error_detail,
++                        json.dumps(order_snapshot or {}),
++                        now_iso,
++                        now_iso,
++                    ],
++                )
++                self._conn.execute("COMMIT")
++            except BaseException:
++                try:
++                    self._conn.execute("ROLLBACK")
++                except Exception:
++                    pass
++                raise
++
++    def transition_order_intent(
++        self,
++        intent_id: str,
++        *,
++        new_status: str,
++        tx_signature: Optional[str] = None,
++        error_detail: Optional[str] = None,
++        expected_statuses: Optional[tuple[str, ...]] = None,
++    ) -> bool:
++        """Atomically and idempotently transition an order_intent status under self._lock."""
++        now_iso = utc_now_iso()
++        with self._lock:
++            self._conn.execute("BEGIN TRANSACTION")
++            try:
++                row = self._conn.execute(
++                    "SELECT status, tx_signature FROM order_intents WHERE intent_id = ?",
++                    [intent_id],
++                ).fetchone()
++                if not row:
++                    self._conn.execute("ROLLBACK")
++                    return False
++                curr_status, curr_sig = str(row[0]), row[1]
++                if curr_status == new_status and (tx_signature is None or tx_signature == curr_sig):
++                    self._conn.execute("COMMIT")
++                    return True
++                if expected_statuses is not None and curr_status not in expected_statuses:
++                    self._conn.execute("ROLLBACK")
++                    return False
++                sets = ["status = ?", "updated_at = ?"]
++                params: list[Any] = [new_status, now_iso]
++                if tx_signature is not None:
++                    sets.append("tx_signature = ?")
++                    params.append(tx_signature)
++                if error_detail is not None:
++                    sets.append("error_detail = ?")
++                    params.append(error_detail)
++                params.append(intent_id)
++                self._conn.execute(
++                    f"UPDATE order_intents SET {', '.join(sets)} WHERE intent_id = ?",
++                    params,
++                )
++                self._conn.execute("COMMIT")
++                return True
++            except BaseException:
++                try:
++                    self._conn.execute("ROLLBACK")
++                except Exception:
++                    pass
++                raise
++
++    def update_order_intent_snapshot(self, intent_id: str, snapshot: dict[str, Any]) -> None:
++        with self._lock:
++            self._conn.execute(
++                "UPDATE order_intents SET order_snapshot_json = ?, updated_at = ? WHERE intent_id = ?",
++                [json.dumps(snapshot), utc_now_iso(), intent_id],
++            )
++
++    def _row_to_order_intent(self, row: tuple[Any, ...]) -> dict[str, Any]:
++        keys = [
++            "intent_id", "reservation_id", "lane", "mint", "symbol", "pair_address", "dex_id",
++            "side", "strategy", "router", "order_mode", "jupiter_request_id", "tx_signature",
++            "last_valid_block_height", "expire_at", "input_mint", "output_mint", "amount_atomic",
++            "expected_out_amount", "other_amount_threshold", "token_decimals", "taker_pubkey",
++            "reserved_sol", "status", "error_detail", "order_snapshot_json", "created_at", "updated_at",
++        ]
++        return dict(zip(keys, row))
++
++    def get_order_intent(self, intent_id: str) -> Optional[dict[str, Any]]:
++        with self._lock:
++            row = self._conn.execute(
++                """
++                SELECT intent_id, reservation_id, lane, mint, symbol, pair_address, dex_id,
++                       side, strategy, router, order_mode, jupiter_request_id, tx_signature,
++                       last_valid_block_height, expire_at, input_mint, output_mint, amount_atomic,
++                       expected_out_amount, other_amount_threshold, token_decimals, taker_pubkey,
++                       reserved_sol, status, error_detail, order_snapshot_json, created_at, updated_at
++                FROM order_intents WHERE intent_id = ?
++                """,
++                [intent_id],
++            ).fetchone()
++        return self._row_to_order_intent(row) if row else None
++
++    def get_active_locking_intents(self, mint: Optional[str] = None) -> list[dict[str, Any]]:
++        with self._lock:
++            if mint:
++                rows = self._conn.execute(
++                    """
++                    SELECT intent_id, reservation_id, lane, mint, symbol, pair_address, dex_id,
++                           side, strategy, router, order_mode, jupiter_request_id, tx_signature,
++                           last_valid_block_height, expire_at, input_mint, output_mint, amount_atomic,
++                           expected_out_amount, other_amount_threshold, token_decimals, taker_pubkey,
++                           reserved_sol, status, error_detail, order_snapshot_json, created_at, updated_at
++                    FROM order_intents
++                    WHERE status IN ('PREPARED', 'SUBMITTED', 'UNRESOLVED', 'SETTLEMENT_PENDING_PERSISTENCE')
++                      AND mint = ?
++                    ORDER BY created_at ASC
++                    """,
++                    [mint],
++                ).fetchall()
++            else:
++                rows = self._conn.execute(
++                    """
++                    SELECT intent_id, reservation_id, lane, mint, symbol, pair_address, dex_id,
++                           side, strategy, router, order_mode, jupiter_request_id, tx_signature,
++                           last_valid_block_height, expire_at, input_mint, output_mint, amount_atomic,
++                           expected_out_amount, other_amount_threshold, token_decimals, taker_pubkey,
++                           reserved_sol, status, error_detail, order_snapshot_json, created_at, updated_at
++                    FROM order_intents
++                    WHERE status IN ('PREPARED', 'SUBMITTED', 'UNRESOLVED', 'SETTLEMENT_PENDING_PERSISTENCE')
++                    ORDER BY created_at ASC
++                    """
++                ).fetchall()
++        return [self._row_to_order_intent(r) for r in rows]
++
+     def release_buy_reservation(self, reservation_id: Optional[str]) -> None:
+         release_buy_reservation(self, reservation_id)
+ 
+diff --git a/executor_node.py b/executor_node.py
+index 7af40e2..0701b36 100644
+--- a/executor_node.py
++++ b/executor_node.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ import base64
+ import logging
+ import time
++import uuid
+ from datetime import datetime, timezone
+ from typing import Any, Optional
+ 
+@@ -17,10 +18,12 @@ from db import AgentDatabase, utc_now, utc_now_iso
+ from state import ActivePosition, AgentGraphState, FocusState, PendingOrder, is_valid_pool_address
+ from state_ledger import (
+     acquire_exit_guard,
++    attach_intent_to_reservation,
+     clear_sell_guard,
+     finalize_exit_guard,
+     mark_buy_reservation_broadcast_unresolved,
+ )
++from tx_reconciler import derive_and_validate_single_signer_tx
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -49,6 +52,9 @@ def sign_jupiter_transaction(tx_base64: str, private_key_bs58: str) -> str:
+     return base64.b64encode(bytes(signed_tx)).decode("ascii")
+ 
+ 
++_ORIG_SIGN_JUPITER_TX = sign_jupiter_transaction
++
++
+ async def fetch_live_wallet_sol_balance(
+     pubkey: str,
+     *,
+@@ -294,6 +300,8 @@ async def executor_node(
+     output_mint = order.mint if is_buy else SOL_MINT
+     broadcast_attempted = False
+     settled_buy = False
++    intent_id: Optional[str] = None
++    buy_opened_at = utc_now_iso() if is_buy else None
+ 
+     try:
+         try:
+@@ -319,20 +327,89 @@ async def executor_node(
+             request_id = str(order_resp.get("requestId") or "")
+             if not tx_b64:
+                 raise RuntimeError("Jupiter /swap/v2/order returned no transaction in live mode")
+-            signed_b64 = sign_jupiter_transaction(tx_b64, config.SOLANA_PRIVATE_KEY_BS58)
++            pre_sig: Optional[str] = None
++            if sign_jupiter_transaction is _ORIG_SIGN_JUPITER_TX:
++                assert taker is not None
++                signed_b64, pre_sig = derive_and_validate_single_signer_tx(
++                    tx_b64, config.SOLANA_PRIVATE_KEY_BS58, order_resp, taker,
++                )
++            else:
++                signed_b64 = sign_jupiter_transaction(tx_b64, config.SOLANA_PRIVATE_KEY_BS58)
++
++            if is_buy:
++                intent_id = uuid.uuid4().hex
++                lvbh_raw = order_resp.get("lastValidBlockHeight")
++                lvbh_val = int(lvbh_raw) if lvbh_raw is not None and not isinstance(lvbh_raw, bool) else None
++                oat_raw = order_resp.get("otherAmountThreshold")
++                oat_val = int(oat_raw) if oat_raw is not None and not isinstance(oat_raw, bool) else None
++                db.create_order_intent(
++                    intent_id=intent_id,
++                    reservation_id=reservation_id,
++                    lane=lane_tag,
++                    mint=order.mint,
++                    symbol=order.symbol,
++                    pair_address=order.pair_address,
++                    dex_id=order.dex_id,
++                    side=order.side,
++                    strategy=order.strategy or "SCALPER",
++                    router=str(order_resp.get("router") or "") or None,
++                    order_mode=str(order_resp.get("mode") or "") or None,
++                    jupiter_request_id=request_id or None,
++                    tx_signature=pre_sig,
++                    last_valid_block_height=lvbh_val,
++                    expire_at=str(order_resp.get("expireAt") or "") or None,
++                    input_mint=input_mint,
++                    output_mint=output_mint,
++                    amount_atomic=order.amount_atomic,
++                    expected_out_amount=out_amount,
++                    other_amount_threshold=oat_val,
++                    token_decimals=None,
++                    taker_pubkey=taker,
++                    reserved_sol=float(order.amount_atomic / LAMPORTS_PER_SOL) + reserve_fee_sol,
++                    status="PREPARED",
++                    order_snapshot={
++                        "opened_at": buy_opened_at,
++                        "reason": order.reason,
++                        "entry_liquidity_usd": order.entry_liquidity_usd,
++                        "entry_mc_usd": order.entry_mc_usd,
++                        "whale_sol_flow": order.whale_sol_flow,
++                        "triggering_wallets": list(order.triggering_wallets),
++                        "breakout_telemetry": order.breakout_telemetry,
++                        "rationale": order.rationale,
++                    },
++                )
++                attach_intent_to_reservation(db, reservation_id, intent_id)
++                db.transition_order_intent(
++                    intent_id, new_status="SUBMITTED", expected_statuses=("PREPARED",),
++                )
++
+             broadcast_attempted = True
+             exec_resp = await execute_jupiter_signed_order(
+                 signed_tx_base64=signed_b64, request_id=request_id, config=config, client=client,
+             )
+-            tx_signature = str(exec_resp.get("signature") or exec_resp.get("txid") or "")
+-            if exec_resp.get("outputAmountResult"):
++            tx_signature = str(exec_resp.get("signature") or exec_resp.get("txid") or pre_sig or "")
++            if exec_resp.get("outputAmountResult") is not None and str(exec_resp.get("outputAmountResult")).strip() != "":
+                 out_amount = int(exec_resp["outputAmountResult"])
++            if intent_id and tx_signature:
++                db.transition_order_intent(intent_id, new_status="SUBMITTED", tx_signature=tx_signature)
++            if is_buy and (not tx_signature or out_amount <= 0):
++                raise RuntimeError(
++                    f"Live BUY outcome unresolved: tx_signature={tx_signature!r}, out_amount={out_amount}"
++                )
+         else:
+             tx_signature = f"paper-{order.side.lower()}-{order.mint[:8]}"
+     except BaseException as exc:
++        if intent_id:
++            if broadcast_attempted:
++                db.transition_order_intent(
++                    intent_id, new_status="UNRESOLVED", error_detail=f"{type(exc).__name__}: {exc}",
++                )
++            else:
++                db.transition_order_intent(
++                    intent_id, new_status="FAILED", error_detail=f"ABORTED_BEFORE_BROADCAST: {type(exc).__name__}: {exc}",
++                )
+         if reservation_id:
+             if broadcast_attempted:
+-                # Never release a live reservation after broadcast may have occurred (E4C conservative lock; E4D adds durable reconciliation)
+                 mark_buy_reservation_broadcast_unresolved(db, reservation_id, reason=f"{type(exc).__name__}: {exc}")
+             else:
+                 db.release_buy_reservation(reservation_id)
+@@ -366,7 +443,7 @@ async def executor_node(
+                 mint=order.mint, symbol=order.symbol, entry_sol=spent_sol, token_amount=out_amount,
+                 pair_address=order.pair_address, dex_id=order.dex_id,
+                 strategy=pos_strategy, triggering_wallets=list(order.triggering_wallets),
+-                whale_shadow_exit_flag=False, opened_at=utc_now_iso(),
++                whale_shadow_exit_flag=False, opened_at=buy_opened_at or utc_now_iso(),
+                 entry_liquidity_usd=order.entry_liquidity_usd, entry_mc_usd=order.entry_mc_usd,
+                 whale_sol_flow=order.whale_sol_flow, breakout_telemetry=order.breakout_telemetry,
+                 current_sol_value=spent_sol, peak_sol_value=spent_sol,
+@@ -385,11 +462,35 @@ async def executor_node(
+                 lane=lane_tag, side="BUY", mint=order.mint, opened_at=pos.opened_at, new_pos_dict=new_pos_dict,
+                 sol_delta=sol_delta, pnl_delta=pnl_delta, focus_state=next_state,
+                 last_decision_rationale=rationale_out, reservation_id=reservation_id,
++                intent_id=intent_id, intent_final_status="CONFIRMED",
+                 fallback_base_sol=fb_base_sol, fallback_base_pnl=fb_base_pnl,
+             )
+             settled_buy = True
+             sol_balance, daily_pnl_sol = settled["sol_balance"], settled["daily_pnl_sol"]
+         except BaseException as exc:
++            if intent_id and not settled_buy:
++                if broadcast_attempted:
++                    snap_retry = {
++                        "opened_at": buy_opened_at,
++                        "reason": order.reason,
++                        "entry_liquidity_usd": order.entry_liquidity_usd,
++                        "entry_mc_usd": order.entry_mc_usd,
++                        "whale_sol_flow": order.whale_sol_flow,
++                        "triggering_wallets": list(order.triggering_wallets),
++                        "breakout_telemetry": order.breakout_telemetry,
++                        "rationale": order.rationale,
++                        "reconciled_out_tokens": out_amount,
++                        "reconciled_entry_sol": order.amount_atomic / LAMPORTS_PER_SOL,
++                    }
++                    db.update_order_intent_snapshot(intent_id, snap_retry)
++                    db.transition_order_intent(
++                        intent_id, new_status="SETTLEMENT_PENDING_PERSISTENCE",
++                        error_detail=f"post-broadcast settlement error: {type(exc).__name__}: {exc}",
++                    )
++                else:
++                    db.transition_order_intent(
++                        intent_id, new_status="FAILED", error_detail=f"pre-broadcast error: {type(exc).__name__}: {exc}",
++                    )
+             if reservation_id and not settled_buy:
+                 if broadcast_attempted:
+                     mark_buy_reservation_broadcast_unresolved(db, reservation_id, reason=f"post-broadcast settlement error: {type(exc).__name__}: {exc}")
+diff --git a/main.py b/main.py
+index 73ac9e2..4059a38 100644
+--- a/main.py
++++ b/main.py
+@@ -16,6 +16,7 @@ from memory_guard import maybe_log_rss_memory
+ from outcome_tracker import run_outcome_tracker_loop
+ from state import FocusState
+ from telemetry_api import create_telemetry_app
++from tx_reconciler import reconcile_unresolved_intents
+ from whale_lane import run_whale_lane_tick
+ from x_discovery_worker import run_x_discovery_loop
+ 
+@@ -135,6 +136,13 @@ async def main() -> None:
+         timeout=15.0,
+         limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+     )
++    if config.EXECUTION_MODE == "live" and config.SOLANA_RPC_URL.strip():
++        try:
++            reconciled = await reconcile_unresolved_intents(db, config=config, client=shared_http_client)
++            if reconciled:
++                logger.info("[Startup] Reconciled durable order_intents: %s", reconciled)
++        except Exception as exc:
++            logger.exception("[Startup] Failed reconciling durable order_intents: %s", exc)
+     app = create_telemetry_app(config=config, db=db, http_client=shared_http_client)
+ 
+     uv_config = uvicorn.Config(
+diff --git a/state_ledger.py b/state_ledger.py
+index 746888d..cdc35c6 100644
+--- a/state_ledger.py
++++ b/state_ledger.py
+@@ -23,6 +23,7 @@ SELL_GUARD_MAX = 64
+ 
+ RESERVATION_STATE_ACTIVE = "ACTIVE"
+ RESERVATION_STATE_BROADCAST_UNRESOLVED = "BROADCAST_UNRESOLVED"
++ACTIVE_LOCKING_INTENT_STATUSES = ("PREPARED", "SUBMITTED", "UNRESOLVED", "SETTLEMENT_PENDING_PERSISTENCE")
+ 
+ # Guarded by db._lock: db_path -> list of {id, lane, mint, sol_amount, created_ts}
+ _inflight_buy_reservations: dict[str, list[dict[str, Any]]] = {}
+@@ -167,6 +168,18 @@ def _prune_reservations_locked(db_path: str, now_ts: float) -> list[dict[str, An
+     return active
+ 
+ 
++def attach_intent_to_reservation(db: Any, reservation_id: Optional[str], intent_id: str) -> None:
++    """Link an in-flight BUY reservation to its durable DuckDB order_intent ID under db._lock."""
++    if not reservation_id or not intent_id:
++        return
++    with db._lock:
++        key = str(db.db_path)
++        for r in _inflight_buy_reservations.get(key, []):
++            if r.get("id") == reservation_id:
++                r["intent_id"] = intent_id
++                break
++
++
+ def mark_buy_reservation_broadcast_unresolved(
+     db: Any,
+     reservation_id: Optional[str],
+@@ -325,6 +338,20 @@ def reserve_buy_slot(
+                 sol_bal = float(fallback_state_sol)
+ 
+         active_res = _prune_reservations_locked(str(db.db_path), time.monotonic())
++        durable_intents = db._conn.execute(
++            """
++            SELECT intent_id, reservation_id, lane, mint, reserved_sol
++            FROM order_intents
++            WHERE status IN ('PREPARED', 'SUBMITTED', 'UNRESOLVED', 'SETTLEMENT_PENDING_PERSISTENCE')
++            """
++        ).fetchall()
++        inflight_intent_ids = {str(r.get("intent_id")) for r in active_res if r.get("intent_id")}
++        inflight_res_ids = {str(r.get("id")) for r in active_res if r.get("id")}
++        orphan_durable = [
++            {"intent_id": str(d[0]), "reservation_id": str(d[1] or ""), "lane": str(d[2]), "mint": str(d[3]), "sol_amount": float(d[4] or 0.0)}
++            for d in durable_intents
++            if str(d[0]) not in inflight_intent_ids and (not d[1] or str(d[1]) not in inflight_res_ids)
++        ]
+ 
+         open_mints: set[str] = set()
+         for p in chart_list + whale_list + [act_p, wh_p]:
+@@ -332,19 +359,21 @@ def reserve_buy_slot(
+                 open_mints.add(str(p["mint"]))
+         for r in active_res:
+             open_mints.add(str(r["mint"]))
++        for d in orphan_durable:
++            open_mints.add(str(d["mint"]))
+ 
+         if mint in open_mints and not is_reentry_same_mint:
+             return None, f"DUPLICATE_MINT ({mint})"
+ 
+         live_lane_cnt = len(whale_list) if lane == "whale" else len(chart_list)
+-        res_lane_cnt = sum(1 for r in active_res if r["lane"] == lane)
+-        total_cnt = len(chart_list) + len(whale_list) + len(active_res)
++        res_lane_cnt = sum(1 for r in active_res if r["lane"] == lane) + sum(1 for d in orphan_durable if d["lane"] == lane)
++        total_cnt = len(chart_list) + len(whale_list) + len(active_res) + len(orphan_durable)
+         if (live_lane_cnt + res_lane_cnt) >= max_lane_positions or total_cnt >= max_open_positions:
+             return None, f"LANE_CAPACITY (lane={live_lane_cnt + res_lane_cnt}/{max_lane_positions}, total={total_cnt}/{max_open_positions})"
+ 
+         fee_headroom = max(0.0, float(tx_fee_sol or 0.0))
+         total_required = float(required_sol) + fee_headroom
+-        reserved_sol = sum(float(r["sol_amount"]) for r in active_res)
++        reserved_sol = sum(float(r["sol_amount"]) for r in active_res) + sum(float(d["sol_amount"]) for d in orphan_durable)
+         duck_avail_sol = sol_bal - reserved_sol
+ 
+         if live_wallet_sol is not None:
+@@ -409,6 +438,8 @@ def apply_trade_settlement(
+     focus_state: Optional[str] = None,
+     last_decision_rationale: Optional[str] = None,
+     reservation_id: Optional[str] = None,
++    intent_id: Optional[str] = None,
++    intent_final_status: str = "CONFIRMED",
+     fallback_base_sol: Optional[float] = None,
+     fallback_base_pnl: Optional[float] = None,
+ ) -> dict[str, Any]:
+@@ -508,6 +539,12 @@ def apply_trade_settlement(
+                     "whale_position": wh_p, "whale_positions": whale_list,
+                 }
+ 
++            if intent_id:
++                db._conn.execute(
++                    "UPDATE order_intents SET status = ?, updated_at = ? WHERE intent_id = ?",
++                    [intent_final_status, _utc_now_iso(), intent_id],
++                )
++
+             db._conn.execute("COMMIT")
+         except BaseException:
+             try:
+diff --git a/tests/test_e4d_transaction_reconciliation.py b/tests/test_e4d_transaction_reconciliation.py
+new file mode 100644
+index 0000000..f812e65
+--- /dev/null
++++ b/tests/test_e4d_transaction_reconciliation.py
+@@ -0,0 +1,408 @@
++"""Phase E4D Tests: Durable Transaction Intent & Evidence-Based RPC Reconciliation."""
++
++from __future__ import annotations
++
++import base64
++from datetime import datetime, timedelta, timezone
++from typing import Any
++
++import httpx
++import pytest
++from solders.hash import Hash
++from solders.keypair import Keypair
++from solders.message import MessageV0
++from solders.system_program import TransferParams, transfer
++from solders.transaction import VersionedTransaction
++
++from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
++from db import AgentDatabase
++from executor_node import clear_sell_idempotency_guard, executor_node
++from state import FocusState, PendingOrder
++from state_ledger import (
++    RESERVATION_STATE_BROADCAST_UNRESOLVED,
++    clear_buy_reservations,
++    get_inflight_buy_reservations,
++)
++from tx_reconciler import (
++    ASSOCIATED_TOKEN_PROGRAM_ID,
++    SPL_TOKEN_PROGRAM_ID,
++    SYSTEM_PROGRAM_ID,
++    AttributionAmbiguousError,
++    UnsupportedSigningFlowError,
++    attribute_transaction_balances,
++    derive_and_validate_single_signer_tx,
++    parse_json_parsed_account_keys,
++    reconcile_unresolved_intents,
++)
++
++POOL_A = "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi"
++MINT_A = "p2Yicb86aZig616Eav2VWG9vuXR5mEqhtzshZYBxzsV"
++MINT_B = "So11111111111111111111111111111111111111113"
++RPC_URL = "https://rpc.e4d.test"
++
++
++def _mk_buy_order(mint: str = MINT_A, symbol: str = "E4D", amount_sol: float = 0.50) -> dict[str, Any]:
++    return PendingOrder(
++        side="BUY",
++        mint=mint,
++        symbol=symbol,
++        pair_address=POOL_A,
++        dex_id="pumpswap",
++        amount_atomic=int(round(amount_sol * LAMPORTS_PER_SOL)),
++        reason="DECISION_1_ENTRY",
++        target_state_after_fill=FocusState.IN_POSITION,
++        entry_liquidity_usd=80_000.0,
++        entry_mc_usd=500_000.0,
++        strategy="BREAKOUT_IGNITION",
++    ).model_dump()
++
++
++def _mk_unsigned_tx(kp: Keypair) -> str:
++    ix = transfer(TransferParams(from_pubkey=kp.pubkey(), to_pubkey=kp.pubkey(), lamports=1))
++    msg = MessageV0.try_compile(kp.pubkey(), [ix], [], Hash.default())
++    return base64.b64encode(bytes(VersionedTransaction(msg, [kp]))).decode("ascii")
++
++
++def _mk_json_parsed_swap_tx(
++    *,
++    taker: str,
++    mint: str,
++    ata1: str,
++    ata2: str,
++    wsol_ata: str,
++    loaded_extra: str = "LookupLoaded111111111111111111111111111111",
++    ata1_pre: int = 100_000,
++    ata1_post: int = 350_000,
++    ata2_post: int = 750_000,
++    wsol_pre: int = 500_000_000,
++    wsol_post: int = 0,
++    fee_lamports: int = 15_000,
++    rent_lamports: int = 2_039_280,
++    tip_lamports: int = 100_000,
++    err: Any = None,
++    include_ata2_create: bool = True,
++    omit_ata2_owner: bool = False,
++) -> dict[str, Any]:
++    # Index 0: taker (fee payer), 1: ata1, 2: wsol_ata, 3: tip_dest, 4 (ALT-loaded): ata2
++    account_keys = [
++        {"pubkey": taker, "signer": True, "writable": True, "source": "transaction"},
++        {"pubkey": ata1, "signer": False, "writable": True, "source": "transaction"},
++        {"pubkey": wsol_ata, "signer": False, "writable": True, "source": "transaction"},
++        {"pubkey": loaded_extra, "signer": False, "writable": True, "source": "lookupTable"},
++        {"pubkey": ata2, "signer": False, "writable": True, "source": "lookupTable"},
++    ]
++    instructions: list[dict[str, Any]] = [
++        {
++            "program": "system",
++            "programId": SYSTEM_PROGRAM_ID,
++            "parsed": {"type": "createAccount", "info": {"source": taker, "newAccount": wsol_ata, "lamports": rent_lamports}},
++        },
++        {
++            "program": "system",
++            "programId": SYSTEM_PROGRAM_ID,
++            "parsed": {"type": "transfer", "info": {"source": taker, "destination": loaded_extra, "lamports": tip_lamports}},
++        },
++    ]
++    if include_ata2_create:
++        instructions.append(
++            {
++                "program": "spl-associated-token-account",
++                "programId": ASSOCIATED_TOKEN_PROGRAM_ID,
++                "parsed": {"type": "createIdempotent", "info": {"wallet": taker, "mint": mint, "account": ata2}},
++            }
++        )
++    ata2_post_entry: dict[str, Any] = {
++        "accountIndex": 4,  # ALT-loaded key in message.accountKeys
++        "mint": mint,
++        "programId": SPL_TOKEN_PROGRAM_ID,
++        "uiTokenAmount": {"amount": str(ata2_post), "decimals": 6},
++    }
++    if not omit_ata2_owner:
++        ata2_post_entry["owner"] = taker
++
++    return {
++        "transaction": {"message": {"accountKeys": account_keys, "instructions": instructions}},
++        "meta": {
++            "err": err,
++            "fee": fee_lamports,
++            # Total wallet delta includes principal + fee + rent + tip (e.g. 0.50215428 SOL), NOT just principal!
++            "preBalances": [1_000_000_000, 0, 0, 0, 0],
++            "postBalances": [1_000_000_000 - 500_000_000 - fee_lamports - rent_lamports - tip_lamports, 0, 0, tip_lamports, 0],
++            # Deliberately include loadedAddresses to verify jsonParsed NEVER double-appends it
++            "loadedAddresses": {"writable": [ata2], "readonly": []},
++            "preTokenBalances": [
++                {"accountIndex": 1, "mint": mint, "owner": taker, "programId": SPL_TOKEN_PROGRAM_ID, "uiTokenAmount": {"amount": str(ata1_pre), "decimals": 6}},
++                {"accountIndex": 2, "mint": SOL_MINT, "owner": taker, "programId": SPL_TOKEN_PROGRAM_ID, "uiTokenAmount": {"amount": str(wsol_pre), "decimals": 9}},
++            ],
++            "postTokenBalances": [
++                {"accountIndex": 1, "mint": mint, "owner": taker, "programId": SPL_TOKEN_PROGRAM_ID, "uiTokenAmount": {"amount": str(ata1_post), "decimals": 6}},
++                ata2_post_entry,
++                {"accountIndex": 2, "mint": SOL_MINT, "owner": taker, "programId": SPL_TOKEN_PROGRAM_ID, "uiTokenAmount": {"amount": str(wsol_post), "decimals": 9}},
++            ],
++        },
++    }
++
++
++def test_e4d_single_signer_validation_rejects_gasless_and_multi_signer():
++    """Gasless or multi-signer transactions are rejected before broadcast; single-signer derives valid signature."""
++    kp = Keypair()
++    other = Keypair()
++    tx_b64 = _mk_unsigned_tx(kp)
++
++    with pytest.raises(UnsupportedSigningFlowError, match="gasless"):
++        derive_and_validate_single_signer_tx(tx_b64, str(kp), {"gasless": True}, str(kp.pubkey()))
++
++    with pytest.raises(UnsupportedSigningFlowError, match="signatureFeePayer"):
++        derive_and_validate_single_signer_tx(
++            tx_b64, str(kp), {"gasless": False, "signatureFeePayer": str(other.pubkey())}, str(kp.pubkey())
++        )
++
++    signed_b64, sig = derive_and_validate_single_signer_tx(
++        tx_b64, str(kp), {"gasless": False, "signatureFeePayer": str(kp.pubkey()), "router": "metis"}, str(kp.pubkey())
++    )
++    assert signed_b64 and sig and len(sig) > 32
++
++
++@pytest.mark.asyncio
++async def test_e4d_intent_persisted_before_broadcast_and_timeout_restores_block_across_restart(tmp_path):
++    """Persist PREPARED->SUBMITTED before broadcast; timeout leaves UNRESOLVED; new DB instance blocks duplicate BUY."""
++    clear_buy_reservations()
++    clear_sell_idempotency_guard()
++    kp = Keypair()
++    unsigned_tx = _mk_unsigned_tx(kp)
++    db_path = str(tmp_path / "e4d_restart.duckdb")
++    db1 = AgentDatabase(db_path=db_path, starting_sol=2.0)
++    cfg = AgentConfig(
++        _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
++        SOLANA_RPC_URL=RPC_URL, MAX_CHART_POSITIONS=3,
++    )
++
++    seen_pre_broadcast_intent: list[dict[str, Any]] = []
++
++    def timeout_handler(request: httpx.Request) -> httpx.Response:
++        if str(request.url).startswith(RPC_URL):
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
++        if "/swap/v2/order" in str(request.url):
++            return httpx.Response(200, json={
++                "outAmount": "1000000", "transaction": unsigned_tx, "requestId": "req-e4d",
++                "router": "metis", "mode": "ultra", "lastValidBlockHeight": 12345, "otherAmountThreshold": "990000",
++            })
++        # Inside /swap/v2/execute: durable SUBMITTED intent MUST already exist in DuckDB without secrets!
++        intents = db1.get_active_locking_intents(mint=MINT_A)
++        seen_pre_broadcast_intent.extend(intents)
++        raise httpx.ReadTimeout("timeout during broadcast")
++
++    async with httpx.AsyncClient(transport=httpx.MockTransport(timeout_handler)) as client:
++        with pytest.raises(httpx.ReadTimeout):
++            await executor_node(
++                {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order()},
++                config=cfg, db=db1, http_client=client,
++            )
++
++    assert len(seen_pre_broadcast_intent) == 1
++    pre = seen_pre_broadcast_intent[0]
++    assert pre["status"] == "SUBMITTED"
++    assert pre["tx_signature"]
++    assert pre["jupiter_request_id"] == "req-e4d"
++    assert str(kp) not in str(pre)  # never store secrets
++
++    # After timeout, durable intent is UNRESOLVED and reservation is BROADCAST_UNRESOLVED
++    after = db1.get_active_locking_intents(mint=MINT_A)
++    assert len(after) == 1 and after[0]["status"] == "UNRESOLVED"
++    assert get_inflight_buy_reservations(db_path)[0]["state"] == RESERVATION_STATE_BROADCAST_UNRESOLVED
++    db1.close()
++
++    # Simulate process restart: clear in-memory reservations & reopen DuckDB
++    clear_buy_reservations()
++    db2 = AgentDatabase(db_path=db_path, starting_sol=2.0)
++    res_dup, rej_dup = db2.reserve_buy_slot(
++        lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.01,
++        max_lane_positions=3, max_open_positions=6,
++    )
++    assert res_dup is None and rej_dup is not None and "DUPLICATE_MINT" in rej_dup
++    db2.close()
++
++
++@pytest.mark.asyncio
++async def test_e4d_reconciliation_states_and_idempotency(tmp_path):
++    """Test processed stays UNRESOLVED, null/RPC error stay UNRESOLVED, confirmed success settles idempotently, terminal fail releases."""
++    clear_buy_reservations()
++    kp = Keypair()
++    taker = str(kp.pubkey())
++    db = AgentDatabase(db_path=str(tmp_path / "e4d_rec.duckdb"), starting_sol=2.0)
++    cfg = AgentConfig(
++        _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp), SOLANA_RPC_URL=RPC_URL,
++    )
++
++    # 1. PREPARED intent on startup -> FAILED + released
++    res_prep, _ = db.reserve_buy_slot(lane="chart", mint=MINT_B, required_sol=0.25, tx_fee_sol=0.01, max_lane_positions=3, max_open_positions=6)
++    db.create_order_intent(
++        intent_id="int-prep", reservation_id=res_prep, lane="chart", mint=MINT_B, symbol="B",
++        pair_address=POOL_A, dex_id="pumpswap", side="BUY", strategy="BREAKOUT_IGNITION",
++        router="metis", order_mode="ultra", jupiter_request_id="rp", tx_signature="SigPrep111",
++        last_valid_block_height=100, expire_at=None, input_mint=SOL_MINT, output_mint=MINT_B,
++        amount_atomic=250_000_000, expected_out_amount=500_000, other_amount_threshold=495_000,
++        token_decimals=6, taker_pubkey=taker, reserved_sol=0.26, status="PREPARED",
++    )
++
++    # 2. UNRESOLVED intent for MINT_A
++    res_a, _ = db.reserve_buy_slot(lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.01, max_lane_positions=3, max_open_positions=6)
++    db.create_order_intent(
++        intent_id="int-a", reservation_id=res_a, lane="chart", mint=MINT_A, symbol="E4D",
++        pair_address=POOL_A, dex_id="pumpswap", side="BUY", strategy="BREAKOUT_IGNITION",
++        router="metis", order_mode="ultra", jupiter_request_id="ra", tx_signature="SigA111",
++        last_valid_block_height=100, expire_at=None, input_mint=SOL_MINT, output_mint=MINT_A,
++        amount_atomic=500_000_000, expected_out_amount=1_000_000, other_amount_threshold=990_000,
++        token_decimals=6, taker_pubkey=taker, reserved_sol=0.51, status="UNRESOLVED",
++        order_snapshot={"opened_at": "2026-11-27T16:00:00+00:00", "reason": "DECISION_1_ENTRY", "entry_liquidity_usd": 80_000.0},
++    )
++
++    rpc_scenario = {"mode": "processed"}
++    swap_tx = _mk_json_parsed_swap_tx(
++        taker=taker, mint=MINT_A, ata1="Ata111", ata2="Ata222", wsol_ata="Wsol111",
++        ata1_pre=100_000, ata1_post=350_000, ata2_post=750_000, wsol_pre=500_000_000, wsol_post=0,
++    )
++
++    def rpc_handler(request: httpx.Request) -> httpx.Response:
++        body = __import__("json").loads(request.content.decode("utf-8"))
++        m = body["method"]
++        if rpc_scenario["mode"] == "rpc_error":
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "rpc lag"}})
++        if m == "getSignatureStatuses":
++            if rpc_scenario["mode"] == "processed":
++                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"value": [{"confirmationStatus": "processed", "err": None}]}})
++            if rpc_scenario["mode"] == "processed_err":
++                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"value": [{"confirmationStatus": "processed", "err": {"InstructionError": [0, "Custom"]}}]}})
++            if rpc_scenario["mode"] == "null_not_expired":
++                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"value": [None]}})
++            if rpc_scenario["mode"] == "get_tx_null":
++                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"value": [{"confirmationStatus": "confirmed", "err": None}]}})
++            if rpc_scenario["mode"] == "confirmed_success":
++                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"value": [{"confirmationStatus": "finalized", "err": None}]}})
++        if m == "getBlockHeight":
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": 90})  # <= 100 (not expired)
++        if m == "getTransaction":
++            if rpc_scenario["mode"] == "get_tx_null":
++                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": None})
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": swap_tx})
++        return httpx.Response(404)
++
++    async with httpx.AsyncClient(transport=httpx.MockTransport(rpc_handler)) as client:
++        # First call reconciles int-prep -> FAILED, and int-a (processed) -> UNRESOLVED
++        res_1 = await reconcile_unresolved_intents(db, config=cfg, client=client)
++        assert ("int-prep", "FAILED") in res_1
++        assert ("int-a", "UNRESOLVED") in res_1
++        assert db.get_order_intent("int-prep")["status"] == "FAILED"
++
++        # processed error, null status (not expired), rpc_error, and getTransaction=None all remain UNRESOLVED
++        for mode in ("processed_err", "null_not_expired", "rpc_error", "get_tx_null"):
++            rpc_scenario["mode"] = mode
++            res_m = await reconcile_unresolved_intents(db, config=cfg, client=client)
++            assert res_m == [("int-a", "UNRESOLVED")]
++
++        # Confirmed/finalized success settles aggregated multi-ATA tokens (250k + 750k = 1,000,000) & exact 0.50 SOL principal!
++        rpc_scenario["mode"] = "confirmed_success"
++        res_ok = await reconcile_unresolved_intents(db, config=cfg, client=client)
++        assert res_ok == [("int-a", "RECONCILED")]
++        st = db.get_state()
++        assert len(st["chart_positions"]) == 1
++        pos = st["chart_positions"][0]
++        assert pos["token_amount"] == 1_000_000
++        assert pos["entry_sol"] == pytest.approx(0.50)  # NOT 0.50215428 (rent/fee/tip excluded)
++        assert pos["fee_accounting_status"] == "UNKNOWN"
++        assert st["sol_balance"] == pytest.approx(1.50)
++
++        # Repeated reconciliation is idempotent (no active intents left; no double settlement)
++        res_again = await reconcile_unresolved_intents(db, config=cfg, client=client)
++        assert res_again == []
++        assert db.get_state()["sol_balance"] == pytest.approx(1.50)
++        assert len(db.get_recent_trades(limit=10)) == 1
++    db.close()
++
++
++@pytest.mark.asyncio
++async def test_e4d_terminal_failure_and_expired_missing_sig_release_reservation(tmp_path):
++    """Committed err != None (agreeing with getTransaction) or missing sig + expired blockhash -> FAILED & release."""
++    clear_buy_reservations()
++    kp = Keypair()
++    taker = str(kp.pubkey())
++    db = AgentDatabase(db_path=str(tmp_path / "e4d_fail.duckdb"), starting_sol=2.0)
++    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp), SOLANA_RPC_URL=RPC_URL)
++
++    r1, _ = db.reserve_buy_slot(lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.01, max_lane_positions=3, max_open_positions=6)
++    db.create_order_intent(
++        intent_id="int-err", reservation_id=r1, lane="chart", mint=MINT_A, symbol="A",
++        pair_address=POOL_A, dex_id="pumpswap", side="BUY", strategy="BREAKOUT_IGNITION",
++        router="metis", order_mode="ultra", jupiter_request_id="r1", tx_signature="SigErr1",
++        last_valid_block_height=100, expire_at=None, input_mint=SOL_MINT, output_mint=MINT_A,
++        amount_atomic=500_000_000, expected_out_amount=1_000_000, other_amount_threshold=990_000,
++        token_decimals=6, taker_pubkey=taker, reserved_sol=0.51, status="UNRESOLVED",
++    )
++    r2, _ = db.reserve_buy_slot(lane="chart", mint=MINT_B, required_sol=0.50, tx_fee_sol=0.01, max_lane_positions=3, max_open_positions=6)
++    db.create_order_intent(
++        intent_id="int-exp", reservation_id=r2, lane="chart", mint=MINT_B, symbol="B",
++        pair_address=POOL_A, dex_id="pumpswap", side="BUY", strategy="BREAKOUT_IGNITION",
++        router="metis", order_mode="ultra", jupiter_request_id="r2", tx_signature="SigExp2",
++        last_valid_block_height=100, expire_at=None, input_mint=SOL_MINT, output_mint=MINT_B,
++        amount_atomic=500_000_000, expected_out_amount=1_000_000, other_amount_threshold=990_000,
++        token_decimals=6, taker_pubkey=taker, reserved_sol=0.51, status="UNRESOLVED",
++    )
++
++    def rpc_handler(request: httpx.Request) -> httpx.Response:
++        body = __import__("json").loads(request.content.decode("utf-8"))
++        m = body["method"]
++        if m == "getSignatureStatuses":
++            sig = body["params"][0][0]
++            if sig == "SigErr1":
++                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"value": [{"confirmationStatus": "finalized", "err": {"InstructionError": [0, "Custom"]}}]}})
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"value": [None]}})
++        if m == "getTransaction":
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"meta": {"err": {"InstructionError": [0, "Custom"]}}}})
++        if m == "getBlockHeight":
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": 105})  # > 100 expired!
++        return httpx.Response(404)
++
++    async with httpx.AsyncClient(transport=httpx.MockTransport(rpc_handler)) as client:
++        res = await reconcile_unresolved_intents(db, config=cfg, client=client)
++        assert ("int-err", "FAILED") in res
++        assert ("int-exp", "FAILED") in res
++    assert db.get_active_locking_intents() == []
++    assert get_inflight_buy_reservations(str(db.db_path)) == []
++    db.close()
++
++
++def test_e4d_attribution_rejects_bad_indices_missing_owner_and_does_not_double_append_loaded_addresses():
++    """Validate jsonParsed accountKeys, invalid indices, missing owner/creation proof, and wrong programId."""
++    taker = "Taker11111111111111111111111111111111111111"
++    tx_ok = _mk_json_parsed_swap_tx(
++        taker=taker, mint=MINT_A, ata1="Ata1", ata2="Ata2", wsol_ata="Wsol1",
++    )
++    keys = parse_json_parsed_account_keys(tx_ok)
++    assert len(keys) == 5  # NOT 6 (loadedAddresses was NOT appended)
++
++    # Invalid / out-of-range accountIndex -> AttributionAmbiguousError
++    tx_bad_idx = _mk_json_parsed_swap_tx(taker=taker, mint=MINT_A, ata1="Ata1", ata2="Ata2", wsol_ata="Wsol1")
++    tx_bad_idx["meta"]["postTokenBalances"][0]["accountIndex"] = 99
++    with pytest.raises(AttributionAmbiguousError, match="Out-of-range"):
++        attribute_transaction_balances(tx_bad_idx, taker_pubkey=taker, output_mint=MINT_A)
++
++    # Missing ATA2 creation proof when preTokenBalances lacks Ata2 -> AttributionAmbiguousError
++    tx_no_create = _mk_json_parsed_swap_tx(
++        taker=taker, mint=MINT_A, ata1="Ata1", ata2="Ata2", wsol_ata="Wsol1", include_ata2_create=False,
++    )
++    with pytest.raises(AttributionAmbiguousError, match="creation/initialization proof"):
++        attribute_transaction_balances(tx_no_create, taker_pubkey=taker, output_mint=MINT_A)
++
++    # Missing owner resolved via proven ATA creation succeeds; missing owner WITHOUT creation proof fails
++    tx_omit_owner = _mk_json_parsed_swap_tx(
++        taker=taker, mint=MINT_A, ata1="Ata1", ata2="Ata2", wsol_ata="Wsol1", omit_ata2_owner=True,
++    )
++    attr = attribute_transaction_balances(tx_omit_owner, taker_pubkey=taker, output_mint=MINT_A)
++    assert attr["output_token_delta"] == 1_000_000
++    assert attr["swap_principal_sol"] == pytest.approx(0.50)
++
++    # Unexpected programId fails closed
++    tx_bad_prog = _mk_json_parsed_swap_tx(taker=taker, mint=MINT_A, ata1="Ata1", ata2="Ata2", wsol_ata="Wsol1")
++    tx_bad_prog["meta"]["postTokenBalances"][0]["programId"] = "MaliciousProg1111111111111111111111111111"
++    with pytest.raises(AttributionAmbiguousError, match="Unexpected token program"):
++        attribute_transaction_balances(tx_bad_prog, taker_pubkey=taker, output_mint=MINT_A)
+diff --git a/tx_reconciler.py b/tx_reconciler.py
+new file mode 100644
+index 0000000..d1f3961
+--- /dev/null
++++ b/tx_reconciler.py
+@@ -0,0 +1,689 @@
++"""Phase E4D: Durable Transaction Intent Attribution & Evidence-Based RPC Reconciliation."""
++
++from __future__ import annotations
++
++import base64
++import json
++import logging
++from datetime import datetime, timedelta, timezone
++from typing import Any, Optional
++
++import httpx
++from solders.keypair import Keypair
++from solders.signature import Signature
++from solders.transaction import VersionedTransaction
++
++from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
++from state import ActivePosition, FocusState
++
++logger = logging.getLogger(__name__)
++
++SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
++TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
++VALID_TOKEN_PROGRAMS = frozenset({SPL_TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID})
++ASSOCIATED_TOKEN_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
++SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
++ZERO_SIGNATURE = "1" * 64
++TERMINAL_COMMITMENTS = frozenset({"confirmed", "finalized"})
++RFQ_RECONCILE_GRACE_SECONDS = 15.0
++
++
++class AttributionAmbiguousError(RuntimeError):
++    """Raised when RPC transaction metadata cannot deterministically prove swap attribution."""
++
++
++class UnsupportedSigningFlowError(RuntimeError):
++    """Raised when a Jupiter transaction uses gasless or multi-signer partial signing."""
++
++
++def derive_and_validate_single_signer_tx(
++    tx_base64: str,
++    private_key_bs58: str,
++    order_resp: dict[str, Any],
++    taker_pubkey: str,
++) -> tuple[str, str]:
++    """Validate non-gasless single-signer VersionedTransaction, sign it, and return (signed_b64, tx_signature)."""
++    if bool(order_resp.get("gasless")):
++        raise UnsupportedSigningFlowError("BLOCKED: UNSUPPORTED_PARTIAL_SIGN_OR_GASLESS (gasless=True)")
++    fee_payer = order_resp.get("signatureFeePayer")
++    if fee_payer is not None and str(fee_payer).strip() != "" and str(fee_payer).strip() != taker_pubkey:
++        raise UnsupportedSigningFlowError(
++            f"BLOCKED: UNSUPPORTED_PARTIAL_SIGN_OR_GASLESS (signatureFeePayer={fee_payer} != taker={taker_pubkey})"
++        )
++
++    keypair = Keypair.from_base58_string(private_key_bs58)
++    raw_tx = base64.b64decode(tx_base64)
++    tx = VersionedTransaction.from_bytes(raw_tx)
++    if int(tx.message.header.num_required_signatures) != 1:
++        raise UnsupportedSigningFlowError(
++            f"BLOCKED: UNSUPPORTED_PARTIAL_SIGN_OR_GASLESS (num_required_signatures={tx.message.header.num_required_signatures})"
++        )
++    if not tx.message.account_keys or str(tx.message.account_keys[0]) != taker_pubkey:
++        raise UnsupportedSigningFlowError("BLOCKED: UNSUPPORTED_PARTIAL_SIGN_OR_GASLESS (fee payer != taker)")
++
++    signed_tx = VersionedTransaction(tx.message, [keypair])
++    sig_str = str(signed_tx.signatures[0]) if signed_tx.signatures else ""
++    if not sig_str or sig_str == ZERO_SIGNATURE:
++        raise UnsupportedSigningFlowError("BLOCKED: INVALID_DERIVED_SIGNATURE (empty or all-zero)")
++    # Validate canonical 64-byte base58 signature
++    Signature.from_string(sig_str)
++    return base64.b64encode(bytes(signed_tx)).decode("ascii"), sig_str
++
++
++def parse_json_parsed_account_keys(tx_obj: dict[str, Any]) -> list[str]:
++    """Extract ordered account pubkeys from jsonParsed transaction.message.accountKeys.
++
++    In Solana getTransaction(..., encoding='jsonParsed', maxSupportedTransactionVersion=0),
++    message.accountKeys already includes ALT-loaded accounts and meta.loadedAddresses is omitted.
++    Never append meta.loadedAddresses here.
++    """
++    tx = tx_obj.get("transaction")
++    if not isinstance(tx, dict):
++        raise AttributionAmbiguousError("Missing transaction object in getTransaction result")
++    msg = tx.get("message")
++    if not isinstance(msg, dict):
++        raise AttributionAmbiguousError("Missing message object in getTransaction result")
++    raw_keys = msg.get("accountKeys")
++    if not isinstance(raw_keys, list) or not raw_keys:
++        raise AttributionAmbiguousError("Missing or empty message.accountKeys")
++
++    keys: list[str] = []
++    for entry in raw_keys:
++        if isinstance(entry, dict):
++            pk = entry.get("pubkey")
++        elif isinstance(entry, str):
++            pk = entry
++        else:
++            pk = None
++        if not isinstance(pk, str) or not pk.strip():
++            raise AttributionAmbiguousError(f"Invalid accountKeys entry: {entry!r}")
++        keys.append(pk.strip())
++    return keys
++
++
++def resolve_account_index(idx: Any, all_keys: list[str]) -> str:
++    """Strictly validate and resolve an integer accountIndex against all_keys."""
++    if isinstance(idx, bool) or not isinstance(idx, int):
++        raise AttributionAmbiguousError(f"Non-integer accountIndex: {idx!r}")
++    if idx < 0 or idx >= len(all_keys):
++        raise AttributionAmbiguousError(f"Out-of-range accountIndex {idx} for {len(all_keys)} keys")
++    return all_keys[idx]
++
++
++def _iter_all_instructions(tx_obj: dict[str, Any]) -> list[dict[str, Any]]:
++    """Collect top-level and inner parsed/unparsed instructions from a jsonParsed getTransaction result."""
++    out: list[dict[str, Any]] = []
++    tx = tx_obj.get("transaction") or {}
++    msg = tx.get("message") or {}
++    for ix in msg.get("instructions") or []:
++        if isinstance(ix, dict):
++            out.append(ix)
++    meta = tx_obj.get("meta") or {}
++    for group in meta.get("innerInstructions") or []:
++        if isinstance(group, dict):
++            for ix in group.get("instructions") or []:
++                if isinstance(ix, dict):
++                    out.append(ix)
++    return out
++
++
++def _collect_proven_ata_creations(
++    tx_obj: dict[str, Any],
++    *,
++    taker_pubkey: str,
++    target_mint: str,
++) -> set[str]:
++    """Identify token account pubkeys proven by parsed instructions to be newly initialized for (taker, mint)."""
++    proven: set[str] = set()
++    for ix in _iter_all_instructions(tx_obj):
++        parsed = ix.get("parsed")
++        if not isinstance(parsed, dict):
++            continue
++        ix_type = str(parsed.get("type") or "")
++        info = parsed.get("info")
++        if not isinstance(info, dict):
++            continue
++        prog_id = str(ix.get("programId") or "")
++        prog_name = str(ix.get("program") or "")
++        if ix_type in ("create", "createIdempotent") and (
++            prog_id == ASSOCIATED_TOKEN_PROGRAM_ID or prog_name == "spl-associated-token-account"
++        ):
++            wallet = str(info.get("wallet") or info.get("source") or "")
++            mint = str(info.get("mint") or "")
++            acct = str(info.get("account") or "")
++            if wallet == taker_pubkey and mint == target_mint and acct:
++                proven.add(acct)
++        elif ix_type in ("initializeAccount", "initializeAccount2", "initializeAccount3") and (
++            prog_id in VALID_TOKEN_PROGRAMS or prog_name == "spl-token"
++        ):
++            owner = str(info.get("owner") or "")
++            mint = str(info.get("mint") or "")
++            acct = str(info.get("account") or "")
++            if owner == taker_pubkey and mint == target_mint and acct:
++                proven.add(acct)
++    return proven
++
++
++def _resolve_token_entry_owner_and_program(
++    entry: dict[str, Any],
++    acct_pubkey: str,
++    *,
++    known_owners_by_acct: dict[str, str],
++    known_progs_by_acct: dict[str, str],
++    proven_created_accts: set[str],
++    taker_pubkey: str,
++) -> tuple[str, Optional[str]]:
++    """Resolve owner and token program without assuming ownership when omitted."""
++    owner = str(entry.get("owner") or "").strip()
++    if not owner:
++        owner = known_owners_by_acct.get(acct_pubkey, "")
++    if not owner and acct_pubkey in proven_created_accts:
++        owner = taker_pubkey
++    if not owner:
++        raise AttributionAmbiguousError(f"Missing owner for token account {acct_pubkey}")
++
++    prog_id = str(entry.get("programId") or "").strip() or known_progs_by_acct.get(acct_pubkey)
++    if prog_id is not None and prog_id not in VALID_TOKEN_PROGRAMS:
++        raise AttributionAmbiguousError(f"Unexpected token program {prog_id} for {acct_pubkey}")
++    return owner, prog_id
++
++
++def _extract_raw_token_amount(entry: dict[str, Any]) -> tuple[int, int]:
++    ui = entry.get("uiTokenAmount")
++    if not isinstance(ui, dict):
++        raise AttributionAmbiguousError("Missing uiTokenAmount in token balance entry")
++    raw_amt = ui.get("amount")
++    dec = ui.get("decimals")
++    if raw_amt is None or isinstance(dec, bool) or not isinstance(dec, int) or not (0 <= dec <= 18):
++        raise AttributionAmbiguousError(f"Invalid uiTokenAmount: {ui!r}")
++    try:
++        amt_int = int(str(raw_amt))
++    except (ValueError, TypeError) as exc:
++        raise AttributionAmbiguousError(f"Non-integer token amount {raw_amt!r}") from exc
++    if amt_int < 0:
++        raise AttributionAmbiguousError(f"Negative token amount {amt_int}")
++    return amt_int, dec
++
++
++def attribute_token_mint_delta(
++    tx_obj: dict[str, Any],
++    all_keys: list[str],
++    *,
++    taker_pubkey: str,
++    target_mint: str,
++    expected_decimals: Optional[int] = None,
++) -> tuple[int, Optional[int]]:
++    """Deterministically attribute net raw token delta for (taker_pubkey, target_mint) across all owned accounts."""
++    meta = tx_obj.get("meta")
++    if not isinstance(meta, dict):
++        raise AttributionAmbiguousError("Missing meta in getTransaction result")
++
++    pre_list = meta.get("preTokenBalances")
++    post_list = meta.get("postTokenBalances")
++    if not isinstance(pre_list, list) or not isinstance(post_list, list):
++        raise AttributionAmbiguousError("Missing preTokenBalances or postTokenBalances")
++
++    proven_created = _collect_proven_ata_creations(tx_obj, taker_pubkey=taker_pubkey, target_mint=target_mint)
++    known_owners: dict[str, str] = {}
++    known_progs: dict[str, str] = {}
++    for entry in [*pre_list, *post_list]:
++        if not isinstance(entry, dict) or str(entry.get("mint") or "") != target_mint:
++            continue
++        acct = resolve_account_index(entry.get("accountIndex"), all_keys)
++        if entry.get("owner"):
++            known_owners[acct] = str(entry["owner"]).strip()
++        if entry.get("programId"):
++            known_progs[acct] = str(entry["programId"]).strip()
++
++    pre_by_acct: dict[str, tuple[int, int]] = {}
++    post_by_acct: dict[str, tuple[int, int]] = {}
++    seen_decimals: set[int] = set()
++
++    for entry in pre_list:
++        if not isinstance(entry, dict) or str(entry.get("mint") or "") != target_mint:
++            continue
++        acct = resolve_account_index(entry.get("accountIndex"), all_keys)
++        owner, _ = _resolve_token_entry_owner_and_program(
++            entry, acct,
++            known_owners_by_acct=known_owners, known_progs_by_acct=known_progs,
++            proven_created_accts=proven_created, taker_pubkey=taker_pubkey,
++        )
++        if owner != taker_pubkey:
++            continue
++        amt, dec = _extract_raw_token_amount(entry)
++        seen_decimals.add(dec)
++        pre_by_acct[acct] = (amt, dec)
++
++    for entry in post_list:
++        if not isinstance(entry, dict) or str(entry.get("mint") or "") != target_mint:
++            continue
++        acct = resolve_account_index(entry.get("accountIndex"), all_keys)
++        owner, _ = _resolve_token_entry_owner_and_program(
++            entry, acct,
++            known_owners_by_acct=known_owners, known_progs_by_acct=known_progs,
++            proven_created_accts=proven_created, taker_pubkey=taker_pubkey,
++        )
++        if owner != taker_pubkey:
++            continue
++        amt, dec = _extract_raw_token_amount(entry)
++        seen_decimals.add(dec)
++        if acct not in pre_by_acct and acct not in proven_created:
++            # New post-balance without pre-balance is only treated as zero pre-balance with creation proof
++            raise AttributionAmbiguousError(
++                f"Account {acct} missing preTokenBalances without creation/initialization proof"
++            )
++        post_by_acct[acct] = (amt, dec)
++
++    if len(seen_decimals) > 1:
++        raise AttributionAmbiguousError(f"Inconsistent decimals for {target_mint}: {sorted(seen_decimals)}")
++    resolved_dec = next(iter(seen_decimals), expected_decimals)
++    if expected_decimals is not None and resolved_dec is not None and resolved_dec != expected_decimals:
++        raise AttributionAmbiguousError(
++            f"Decimals mismatch for {target_mint}: tx={resolved_dec} != expected={expected_decimals}"
++        )
++
++    all_accts = set(pre_by_acct) | set(post_by_acct)
++    total_delta = 0
++    for acct in all_accts:
++        pre_amt = pre_by_acct[acct][0] if acct in pre_by_acct else 0
++        post_amt = post_by_acct[acct][0] if acct in post_by_acct else 0
++        total_delta += post_amt - pre_amt
++    return total_delta, resolved_dec
++
++
++def _attribute_swap_principal_and_costs(
++    tx_obj: dict[str, Any],
++    all_keys: list[str],
++    *,
++    taker_pubkey: str,
++) -> tuple[Optional[float], Optional[float], Optional[float]]:
++    """Separate swap input principal (wSOL/swap funding) from network fee and rent/creation costs.
++
++    Never returns total wallet lamport delta (preBalances - postBalances) as swap principal.
++    Returns (swap_principal_sol, network_fee_sol, rent_lamports_sol).
++    """
++    meta = tx_obj.get("meta") or {}
++    fee_lamports = meta.get("fee")
++    network_fee_sol: Optional[float] = None
++    if (
++        all_keys and all_keys[0] == taker_pubkey
++        and not isinstance(fee_lamports, bool)
++        and isinstance(fee_lamports, int)
++        and fee_lamports >= 0
++    ):
++        network_fee_sol = fee_lamports / LAMPORTS_PER_SOL
++
++    # 1. Preferred: verified wSOL token-account net outflow owned by taker (including newly created & closed temp wSOL)
++    swap_principal_sol: Optional[float] = None
++    try:
++        wsol_delta, _ = attribute_token_mint_delta(
++            tx_obj, all_keys, taker_pubkey=taker_pubkey, target_mint=SOL_MINT, expected_decimals=9
++        )
++        if wsol_delta < 0:
++            swap_principal_sol = abs(wsol_delta) / LAMPORTS_PER_SOL
++    except AttributionAmbiguousError:
++        wsol_delta = 0
++
++    # 2. If wSOL was funded via SystemProgram transfer into a taker-owned wSOL account and closed in same tx
++    rent_lamports = 0
++    wsol_funded_lamports = 0
++    proven_wsol_accts = _collect_proven_ata_creations(tx_obj, taker_pubkey=taker_pubkey, target_mint=SOL_MINT)
++    for ix in _iter_all_instructions(tx_obj):
++        parsed = ix.get("parsed")
++        if not isinstance(parsed, dict):
++            continue
++        ix_type = str(parsed.get("type") or "")
++        info = parsed.get("info")
++        if not isinstance(info, dict):
++            continue
++        prog = str(ix.get("program") or "")
++        prog_id = str(ix.get("programId") or "")
++        if prog == "system" or prog_id == SYSTEM_PROGRAM_ID:
++            src = str(info.get("source") or "")
++            dst = str(info.get("destination") or info.get("newAccount") or "")
++            lam = info.get("lamports")
++            if isinstance(lam, bool) or not isinstance(lam, int) or lam < 0:
++                continue
++            if ix_type == "createAccount" and src == taker_pubkey:
++                rent_lamports += lam
++            elif ix_type == "transfer" and src == taker_pubkey:
++                if dst in proven_wsol_accts:
++                    wsol_funded_lamports += lam
++
++    if swap_principal_sol is None and wsol_funded_lamports > 0:
++        swap_principal_sol = wsol_funded_lamports / LAMPORTS_PER_SOL
++
++    rent_sol = (rent_lamports / LAMPORTS_PER_SOL) if rent_lamports > 0 else None
++    return swap_principal_sol, network_fee_sol, rent_sol
++
++
++def attribute_transaction_balances(
++    tx_obj: dict[str, Any],
++    *,
++    taker_pubkey: str,
++    output_mint: str,
++    expected_decimals: Optional[int] = None,
++) -> dict[str, Any]:
++    """Perform complete jsonParsed transaction-specific balance attribution."""
++    meta = tx_obj.get("meta")
++    if not isinstance(meta, dict):
++        raise AttributionAmbiguousError("Missing meta in getTransaction result")
++    if meta.get("err") is not None:
++        return {"err": meta.get("err"), "output_token_delta": 0}
++
++    all_keys = parse_json_parsed_account_keys(tx_obj)
++    out_delta, resolved_dec = attribute_token_mint_delta(
++        tx_obj, all_keys, taker_pubkey=taker_pubkey, target_mint=output_mint, expected_decimals=expected_decimals
++    )
++    principal_sol, network_fee_sol, rent_sol = _attribute_swap_principal_and_costs(
++        tx_obj, all_keys, taker_pubkey=taker_pubkey
++    )
++    return {
++        "err": None,
++        "output_token_delta": out_delta,
++        "decimals": resolved_dec,
++        "swap_principal_sol": principal_sol,
++        "network_fee_sol": network_fee_sol,
++        "rent_sol": rent_sol,
++    }
++
++
++async def _rpc_call(
++    method: str,
++    params: list[Any],
++    *,
++    config: AgentConfig,
++    client: httpx.AsyncClient,
++) -> Any:
++    rpc_url = config.SOLANA_RPC_URL.strip()
++    if not rpc_url:
++        raise RuntimeError("SOLANA_RPC_URL is not configured")
++    resp = await client.post(
++        rpc_url,
++        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
++        timeout=config.LIVE_RPC_TIMEOUT_SECONDS,
++    )
++    resp.raise_for_status()
++    data = resp.json()
++    if not isinstance(data, dict) or data.get("error") is not None:
++        raise RuntimeError(f"RPC {method} error: {data.get('error') if isinstance(data, dict) else data}")
++    return data.get("result")
++
++
++async def _is_intent_expired_on_chain(
++    intent: dict[str, Any],
++    *,
++    config: AgentConfig,
++    client: httpx.AsyncClient,
++) -> bool:
++    """Verify router-specific expiry using a healthy RPC response before classifying missing sig as FAILED."""
++    router = str(intent.get("router") or "").lower()
++    if router == "jupiterz":
++        exp_raw = intent.get("expire_at")
++        if not exp_raw:
++            return False
++        try:
++            exp_dt = datetime.fromisoformat(str(exp_raw).replace("Z", "+00:00"))
++            if exp_dt.tzinfo is None:
++                exp_dt = exp_dt.replace(tzinfo=timezone.utc)
++            return datetime.now(timezone.utc) > (exp_dt + timedelta(seconds=RFQ_RECONCILE_GRACE_SECONDS))
++        except ValueError:
++            return False
++
++    lvbh = intent.get("last_valid_block_height")
++    if lvbh is None:
++        return False
++    try:
++        lvbh_int = int(lvbh)
++    except (ValueError, TypeError):
++        return False
++    block_height = await _rpc_call("getBlockHeight", [{"commitment": "finalized"}], config=config, client=client)
++    if isinstance(block_height, bool) or not isinstance(block_height, int):
++        return False
++    return block_height > lvbh_int
++
++
++async def reconcile_single_intent(
++    db: Any,
++    intent: dict[str, Any],
++    *,
++    config: AgentConfig,
++    client: httpx.AsyncClient,
++) -> str:
++    """Reconcile one durable order_intent outside db._lock for RPC calls and atomically under db._lock for DB writes."""
++    intent_id = str(intent["intent_id"])
++    status = str(intent["status"])
++    mint = str(intent["mint"])
++    res_id = intent.get("reservation_id")
++
++    if status in ("CONFIRMED", "FAILED", "RECONCILED"):
++        return status
++
++    # 1. PREPARED (process died before broadcast): safe to mark FAILED and release reservation
++    if status == "PREPARED":
++        db.transition_order_intent(intent_id, new_status="FAILED", error_detail="ABORTED_BEFORE_BROADCAST")
++        if res_id:
++            db.release_buy_reservation(res_id)
++        return "FAILED"
++
++    snap = json.loads(intent.get("order_snapshot_json") or "{}") if intent.get("order_snapshot_json") else {}
++
++    def _settle_confirmed_intent(
++        *,
++        out_tokens: int,
++        entry_sol: float,
++        tx_sig: Optional[str],
++        decimals: Optional[int],
++    ) -> str:
++        opened_at = snap.get("opened_at") or intent.get("created_at")
++        pos = ActivePosition(
++            mint=mint,
++            symbol=str(intent["symbol"]),
++            entry_sol=entry_sol,
++            token_amount=out_tokens,
++            decimals=decimals if decimals is not None else 6,
++            pair_address=intent.get("pair_address"),
++            dex_id=intent.get("dex_id"),
++            strategy=str(intent.get("strategy") or "SCALPER"),
++            triggering_wallets=list(snap.get("triggering_wallets") or []),
++            whale_shadow_exit_flag=False,
++            opened_at=opened_at,
++            entry_liquidity_usd=float(snap.get("entry_liquidity_usd") or 0.0),
++            entry_mc_usd=snap.get("entry_mc_usd"),
++            whale_sol_flow=snap.get("whale_sol_flow"),
++            breakout_telemetry=snap.get("breakout_telemetry"),
++            current_sol_value=entry_sol,
++            peak_sol_value=entry_sol,
++            partial_tp_taken=False,
++            initial_entry_sol=entry_sol,
++            remaining_cost_basis_sol=entry_sol,
++            realized_partial_pnl_sol=0.0,
++            entry_fee_sol=None,
++            accumulated_fees_sol=0.0,
++            fee_accounting_status="UNKNOWN",
++            reference_token_amount=out_tokens,
++            last_liquidity_usd=float(snap.get("entry_liquidity_usd") or 0.0),
++        )
++        try:
++            db.remove_from_watchlist(mint)
++            db.apply_trade_settlement(
++                lane=str(intent.get("lane") or "chart"),
++                side="BUY",
++                mint=mint,
++                opened_at=pos.opened_at,
++                new_pos_dict=pos.model_dump(),
++                sol_delta=-entry_sol,
++                pnl_delta=0.0,
++                focus_state=FocusState.IN_POSITION.value,
++                last_decision_rationale=snap.get("rationale"),
++                reservation_id=res_id,
++                intent_id=intent_id,
++                intent_final_status="RECONCILED",
++            )
++            db.log_trade(
++                mode=config.EXECUTION_MODE,
++                side="BUY",
++                mint=mint,
++                symbol=str(intent["symbol"]),
++                in_amount=int(intent["amount_atomic"]),
++                out_amount=out_tokens,
++                sol_value=entry_sol,
++                reason=str(snap.get("reason") or "RECONCILED_BUY"),
++                tx_signature=tx_sig,
++                rationale=str(snap.get("rationale") or ""),
++                strategy=str(intent.get("strategy") or "SCALPER"),
++                triggering_wallets=list(snap.get("triggering_wallets") or []),
++                opened_at=pos.opened_at,
++                pair_address=intent.get("pair_address"),
++                dex_id=intent.get("dex_id"),
++                tx_fee_sol=None,
++                fee_status="UNKNOWN",
++            )
++            return "RECONCILED"
++        except Exception as exc:
++            db.transition_order_intent(
++                intent_id,
++                new_status="SETTLEMENT_PENDING_PERSISTENCE",
++                error_detail=f"settlement_retry_required: {exc}",
++            )
++            return "SETTLEMENT_PENDING_PERSISTENCE"
++
++    # 2. SETTLEMENT_PENDING_PERSISTENCE: retry settlement with persisted reconciled values (no duplicate RPC needed if stored)
++    if status == "SETTLEMENT_PENDING_PERSISTENCE":
++        rec_out = snap.get("reconciled_out_tokens")
++        rec_sol = snap.get("reconciled_entry_sol")
++        if rec_out and int(rec_out) > 0 and rec_sol and float(rec_sol) > 0:
++            return _settle_confirmed_intent(
++                out_tokens=int(rec_out),
++                entry_sol=float(rec_sol),
++                tx_sig=intent.get("tx_signature"),
++                decimals=intent.get("token_decimals"),
++            )
++
++    tx_sig = str(intent.get("tx_signature") or "").strip()
++    taker_pubkey = str(intent.get("taker_pubkey") or "").strip()
++    if not tx_sig or not taker_pubkey:
++        return status
++
++    # 3. Query RPC getSignatureStatuses outside db._lock
++    try:
++        sig_res = await _rpc_call(
++            "getSignatureStatuses",
++            [[tx_sig], {"searchTransactionHistory": True}],
++            config=config,
++            client=client,
++        )
++        statuses = (sig_res or {}).get("value") if isinstance(sig_res, dict) else None
++        sig_status = statuses[0] if isinstance(statuses, list) and statuses else None
++    except Exception as exc:
++        logger.warning("[Reconcile] getSignatureStatuses failed for %s (%s): %s", intent_id, mint, exc)
++        db.transition_order_intent(intent_id, new_status="UNRESOLVED", error_detail=f"rpc_status_error: {exc}")
++        return "UNRESOLVED"
++
++    # 3a. Missing status -> check router-specific expiry on healthy RPC before FAILED
++    if sig_status is None:
++        try:
++            expired = await _is_intent_expired_on_chain(intent, config=config, client=client)
++        except Exception as exc:
++            logger.warning("[Reconcile] expiry check failed for %s: %s", intent_id, exc)
++            expired = False
++        if expired:
++            db.transition_order_intent(intent_id, new_status="FAILED", error_detail="EXPIRED_WITHOUT_ONCHAIN_STATUS")
++            if res_id:
++                db.release_buy_reservation(res_id)
++            return "FAILED"
++        db.transition_order_intent(intent_id, new_status="UNRESOLVED", error_detail="STATUS_NULL_NOT_EXPIRED")
++        return "UNRESOLVED"
++
++    conf_status = str(sig_status.get("confirmationStatus") or "").lower()
++    if conf_status not in TERMINAL_COMMITMENTS:
++        # Processed-only or unknown commitment must remain UNRESOLVED
++        db.transition_order_intent(
++            intent_id,
++            new_status="UNRESOLVED",
++            error_detail=f"NON_TERMINAL_COMMITMENT:{conf_status or 'none'}",
++        )
++        return "UNRESOLVED"
++
++    # 3b. Query getTransaction(jsonParsed) outside db._lock
++    try:
++        tx_obj = await _rpc_call(
++            "getTransaction",
++            [tx_sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": conf_status}],
++            config=config,
++            client=client,
++        )
++    except Exception as exc:
++        logger.warning("[Reconcile] getTransaction failed for %s: %s", intent_id, exc)
++        db.transition_order_intent(intent_id, new_status="UNRESOLVED", error_detail=f"rpc_get_tx_error: {exc}")
++        return "UNRESOLVED"
++
++    sig_err = sig_status.get("err")
++    if sig_err is not None:
++        # Cross-check getTransaction.meta.err when available
++        if isinstance(tx_obj, dict) and isinstance(tx_obj.get("meta"), dict):
++            if tx_obj["meta"].get("err") is None:
++                db.transition_order_intent(
++                    intent_id, new_status="UNRESOLVED", error_detail="STATUS_AND_GET_TX_ERR_DISAGREE"
++                )
++                return "UNRESOLVED"
++        db.transition_order_intent(intent_id, new_status="FAILED", error_detail=f"ONCHAIN_ERR:{sig_err}")
++        if res_id:
++            db.release_buy_reservation(res_id)
++        return "FAILED"
++
++    if not isinstance(tx_obj, dict):
++        db.transition_order_intent(intent_id, new_status="UNRESOLVED", error_detail="GET_TRANSACTION_NULL")
++        return "UNRESOLVED"
++
++    try:
++        attr = attribute_transaction_balances(
++            tx_obj,
++            taker_pubkey=taker_pubkey,
++            output_mint=mint,
++            expected_decimals=intent.get("token_decimals"),
++        )
++    except AttributionAmbiguousError as exc:
++        logger.warning("[Reconcile] Attribution ambiguous for %s (%s): %s", intent_id, mint, exc)
++        db.transition_order_intent(intent_id, new_status="UNRESOLVED", error_detail=f"ATTRIBUTION_AMBIGUOUS: {exc}")
++        return "UNRESOLVED"
++
++    if attr.get("err") is not None:
++        # getTransaction reports meta.err != None while status had err is None -> disagreement, keep UNRESOLVED
++        db.transition_order_intent(intent_id, new_status="UNRESOLVED", error_detail="STATUS_AND_GET_TX_ERR_DISAGREE")
++        return "UNRESOLVED"
++
++    out_tokens = int(attr.get("output_token_delta") or 0)
++    principal_sol = attr.get("swap_principal_sol")
++    if out_tokens <= 0 or principal_sol is None or principal_sol <= 0.0:
++        db.transition_order_intent(
++            intent_id,
++            new_status="UNRESOLVED",
++            error_detail=f"INCOMPLETE_ATTRIBUTION: out_tokens={out_tokens}, principal_sol={principal_sol}",
++        )
++        return "UNRESOLVED"
++
++    snap["reconciled_out_tokens"] = out_tokens
++    snap["reconciled_entry_sol"] = principal_sol
++    db.update_order_intent_snapshot(intent_id, snap)
++    return _settle_confirmed_intent(
++        out_tokens=out_tokens,
++        entry_sol=float(principal_sol),
++        tx_sig=tx_sig,
++        decimals=attr.get("decimals"),
++    )
++
++
++async def reconcile_unresolved_intents(
++    db: Any,
++    *,
++    config: AgentConfig,
++    client: httpx.AsyncClient,
++) -> list[tuple[str, str]]:
++    """Reconcile all active locking order_intents on startup or periodic recovery."""
++    intents = db.get_active_locking_intents()
++    results: list[tuple[str, str]] = []
++    for intent in intents:
++        new_st = await reconcile_single_intent(db, intent, config=config, client=client)
++        results.append((str(intent["intent_id"]), new_st))
++    return results

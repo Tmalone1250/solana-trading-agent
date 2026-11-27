@@ -214,6 +214,40 @@ class AgentDatabase:
             )
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS order_intents (
+                    intent_id VARCHAR PRIMARY KEY,
+                    reservation_id VARCHAR,
+                    lane VARCHAR NOT NULL,
+                    mint VARCHAR NOT NULL,
+                    symbol VARCHAR NOT NULL,
+                    pair_address VARCHAR,
+                    dex_id VARCHAR,
+                    side VARCHAR NOT NULL,
+                    strategy VARCHAR NOT NULL,
+                    router VARCHAR,
+                    order_mode VARCHAR,
+                    jupiter_request_id VARCHAR,
+                    tx_signature VARCHAR,
+                    last_valid_block_height BIGINT,
+                    expire_at VARCHAR,
+                    input_mint VARCHAR NOT NULL,
+                    output_mint VARCHAR NOT NULL,
+                    amount_atomic BIGINT NOT NULL,
+                    expected_out_amount BIGINT,
+                    other_amount_threshold BIGINT,
+                    token_decimals INTEGER,
+                    taker_pubkey VARCHAR,
+                    reserved_sol DOUBLE NOT NULL,
+                    status VARCHAR NOT NULL,
+                    error_detail VARCHAR,
+                    order_snapshot_json VARCHAR,
+                    created_at VARCHAR NOT NULL,
+                    updated_at VARCHAR NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS social_signals (
                     mint VARCHAR PRIMARY KEY,
                     mention_count INTEGER NOT NULL DEFAULT 0,
@@ -605,6 +639,203 @@ class AgentDatabase:
 
     def reserve_buy_slot(self, **kwargs: Any) -> tuple[Optional[str], Optional[str]]:
         return reserve_buy_slot(self, **kwargs)
+
+    def create_order_intent(
+        self,
+        *,
+        intent_id: str,
+        reservation_id: Optional[str],
+        lane: str,
+        mint: str,
+        symbol: str,
+        pair_address: Optional[str],
+        dex_id: Optional[str],
+        side: str,
+        strategy: str,
+        router: Optional[str],
+        order_mode: Optional[str],
+        jupiter_request_id: Optional[str],
+        tx_signature: Optional[str],
+        last_valid_block_height: Optional[int],
+        expire_at: Optional[str],
+        input_mint: str,
+        output_mint: str,
+        amount_atomic: int,
+        expected_out_amount: Optional[int],
+        other_amount_threshold: Optional[int],
+        token_decimals: Optional[int],
+        taker_pubkey: Optional[str],
+        reserved_sol: float,
+        status: str = "PREPARED",
+        error_detail: Optional[str] = None,
+        order_snapshot: Optional[dict[str, Any]] = None,
+    ) -> None:
+        now_iso = utc_now_iso()
+        with self._lock:
+            self._conn.execute("BEGIN TRANSACTION")
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO order_intents (
+                        intent_id, reservation_id, lane, mint, symbol, pair_address, dex_id,
+                        side, strategy, router, order_mode, jupiter_request_id, tx_signature,
+                        last_valid_block_height, expire_at, input_mint, output_mint, amount_atomic,
+                        expected_out_amount, other_amount_threshold, token_decimals, taker_pubkey,
+                        reserved_sol, status, error_detail, order_snapshot_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        intent_id,
+                        reservation_id,
+                        lane,
+                        mint,
+                        symbol,
+                        pair_address,
+                        dex_id,
+                        side,
+                        strategy,
+                        router,
+                        order_mode,
+                        jupiter_request_id,
+                        tx_signature,
+                        last_valid_block_height,
+                        expire_at,
+                        input_mint,
+                        output_mint,
+                        int(amount_atomic),
+                        int(expected_out_amount) if expected_out_amount is not None else None,
+                        int(other_amount_threshold) if other_amount_threshold is not None else None,
+                        int(token_decimals) if token_decimals is not None else None,
+                        taker_pubkey,
+                        float(reserved_sol),
+                        status,
+                        error_detail,
+                        json.dumps(order_snapshot or {}),
+                        now_iso,
+                        now_iso,
+                    ],
+                )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                try:
+                    self._conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+
+    def transition_order_intent(
+        self,
+        intent_id: str,
+        *,
+        new_status: str,
+        tx_signature: Optional[str] = None,
+        error_detail: Optional[str] = None,
+        expected_statuses: Optional[tuple[str, ...]] = None,
+    ) -> bool:
+        """Atomically and idempotently transition an order_intent status under self._lock."""
+        now_iso = utc_now_iso()
+        with self._lock:
+            self._conn.execute("BEGIN TRANSACTION")
+            try:
+                row = self._conn.execute(
+                    "SELECT status, tx_signature FROM order_intents WHERE intent_id = ?",
+                    [intent_id],
+                ).fetchone()
+                if not row:
+                    self._conn.execute("ROLLBACK")
+                    return False
+                curr_status, curr_sig = str(row[0]), row[1]
+                if curr_status == new_status and (tx_signature is None or tx_signature == curr_sig):
+                    self._conn.execute("COMMIT")
+                    return True
+                if expected_statuses is not None and curr_status not in expected_statuses:
+                    self._conn.execute("ROLLBACK")
+                    return False
+                sets = ["status = ?", "updated_at = ?"]
+                params: list[Any] = [new_status, now_iso]
+                if tx_signature is not None:
+                    sets.append("tx_signature = ?")
+                    params.append(tx_signature)
+                if error_detail is not None:
+                    sets.append("error_detail = ?")
+                    params.append(error_detail)
+                params.append(intent_id)
+                self._conn.execute(
+                    f"UPDATE order_intents SET {', '.join(sets)} WHERE intent_id = ?",
+                    params,
+                )
+                self._conn.execute("COMMIT")
+                return True
+            except BaseException:
+                try:
+                    self._conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+
+    def update_order_intent_snapshot(self, intent_id: str, snapshot: dict[str, Any]) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE order_intents SET order_snapshot_json = ?, updated_at = ? WHERE intent_id = ?",
+                [json.dumps(snapshot), utc_now_iso(), intent_id],
+            )
+
+    def _row_to_order_intent(self, row: tuple[Any, ...]) -> dict[str, Any]:
+        keys = [
+            "intent_id", "reservation_id", "lane", "mint", "symbol", "pair_address", "dex_id",
+            "side", "strategy", "router", "order_mode", "jupiter_request_id", "tx_signature",
+            "last_valid_block_height", "expire_at", "input_mint", "output_mint", "amount_atomic",
+            "expected_out_amount", "other_amount_threshold", "token_decimals", "taker_pubkey",
+            "reserved_sol", "status", "error_detail", "order_snapshot_json", "created_at", "updated_at",
+        ]
+        return dict(zip(keys, row))
+
+    def get_order_intent(self, intent_id: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT intent_id, reservation_id, lane, mint, symbol, pair_address, dex_id,
+                       side, strategy, router, order_mode, jupiter_request_id, tx_signature,
+                       last_valid_block_height, expire_at, input_mint, output_mint, amount_atomic,
+                       expected_out_amount, other_amount_threshold, token_decimals, taker_pubkey,
+                       reserved_sol, status, error_detail, order_snapshot_json, created_at, updated_at
+                FROM order_intents WHERE intent_id = ?
+                """,
+                [intent_id],
+            ).fetchone()
+        return self._row_to_order_intent(row) if row else None
+
+    def get_active_locking_intents(self, mint: Optional[str] = None) -> list[dict[str, Any]]:
+        with self._lock:
+            if mint:
+                rows = self._conn.execute(
+                    """
+                    SELECT intent_id, reservation_id, lane, mint, symbol, pair_address, dex_id,
+                           side, strategy, router, order_mode, jupiter_request_id, tx_signature,
+                           last_valid_block_height, expire_at, input_mint, output_mint, amount_atomic,
+                           expected_out_amount, other_amount_threshold, token_decimals, taker_pubkey,
+                           reserved_sol, status, error_detail, order_snapshot_json, created_at, updated_at
+                    FROM order_intents
+                    WHERE status IN ('PREPARED', 'SUBMITTED', 'UNRESOLVED', 'SETTLEMENT_PENDING_PERSISTENCE')
+                      AND mint = ?
+                    ORDER BY created_at ASC
+                    """,
+                    [mint],
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT intent_id, reservation_id, lane, mint, symbol, pair_address, dex_id,
+                           side, strategy, router, order_mode, jupiter_request_id, tx_signature,
+                           last_valid_block_height, expire_at, input_mint, output_mint, amount_atomic,
+                           expected_out_amount, other_amount_threshold, token_decimals, taker_pubkey,
+                           reserved_sol, status, error_detail, order_snapshot_json, created_at, updated_at
+                    FROM order_intents
+                    WHERE status IN ('PREPARED', 'SUBMITTED', 'UNRESOLVED', 'SETTLEMENT_PENDING_PERSISTENCE')
+                    ORDER BY created_at ASC
+                    """
+                ).fetchall()
+        return [self._row_to_order_intent(r) for r in rows]
 
     def release_buy_reservation(self, reservation_id: Optional[str]) -> None:
         release_buy_reservation(self, reservation_id)
