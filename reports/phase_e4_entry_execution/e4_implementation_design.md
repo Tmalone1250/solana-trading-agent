@@ -5,12 +5,22 @@
 **Design Branch:** `design/e4-entry-execution`  
 **Exact Application-Source Baseline:** `ca01c640ac60477e63a33a86217298573680c5f0` (`impl/e3c-parser-cache-integrity`)  
 **Audit Reference:** `reports/phase_e4_entry_execution/e4_breakout_ignition_entry_audit.md` (report-only commit `1780d0836af205103887c2e5818a3ed817922c86`)  
-**Revision:** Rev 2 (Post Independent-Review Corrective Pass)  
+**Revision:** Rev 3 (Final Narrowly Scoped Corrective Pass)  
 **Date:** 2026-11-27
 
 ---
 
 ## 0. Independent-Review Corrective Log
+
+### Rev 3 Resolutions
+| # | Finding | Resolution in Rev 3 |
+|---|---|---|
+| 1 | E4A allowed either DexScreener pinned-pool `priceNative` or a Jupiter mint-level quote. | Restricted `BREAKOUT_IGNITION` to **one** authoritative source explicitly tied to `order.pair_address` (`dexscreener_pinned_pool_native`), recording `approval_pair_address`, `approval_price_source`, `approval_price_observed_at`, `approval_price_native`, and `token_decimals`. Removed mint-level Jupiter quote as an authorization/drift fallback; missing/invalid pinned-pool price rejects `BUY` before quoting. |
+| 2 | E4D marked any `getSignatureStatuses` `err != None` as `FAILED` without checking commitment. | Required configured `confirmed`/`finalized` commitment before classifying `err != None` as terminal `FAILED`. Processed-only errors, missing/inconsistent statuses, or `getSignatureStatuses`/`getTransaction` disagreements remain `UNRESOLVED` with reservation locked. |
+| 3 | E4D token-delta attribution needed ALT key resolution, multi-account aggregation, new/closed ATA rules, and missing `owner`/`programId` handling. | Specified full `accountKeys + meta.loadedAddresses` resolution, aggregation across all taker-owned accounts for `order.mint`, strict new-ATA zero-pre-balance proof requirements, closed/multi-account handling, and ownership resolution when `owner`/`programId` is omitted (never assuming ownership or falling back to wallet balance). |
+| 4 | E4D needed explicit separation of swap input principal from total wallet lamport delta (`preBalances - postBalances`). | Prohibited using total wallet lamport delta as swap cost basis; specified attributing swap principal from verified wSOL deltas or parsed swap instructions, network fee from `meta.fee` + fee payer, and rent/other transfers separately while preserving E2B `UNKNOWN` fee status when exact attribution is unavailable. |
+
+### Rev 2 Resolutions
 
 | # | Review Finding | Resolution in Rev 2 |
 |---|---|---|
@@ -79,14 +89,16 @@ Separate three distinct timestamps on `PendingOrder` (`state.py`, `alpha_node.py
 - `approval_price_observed_at: Optional[str] = None` — UTC ISO-8601 timestamp when the authoritative approval price was actually observed.
 - `approval_ohlcv_fetched_at: Optional[str] = None` and `approval_candle_ts: Optional[int] = None` — E3B/E3C OHLCV provenance retained strictly for audit/telemetry (never used as a live execution price or to reconstruct a new breakout evaluation).
 
-**Single Authoritative Approval-Price Source:**
-- **Source:** The pinned pool's live native SOL-per-token spot price (`priceNative` from DexScreener `/tokens/v1/solana/{mint}` matched strictly to `pair_address`, or Jupiter batched SOL-denominated quote for `mint`), recorded as:
+**Single Authoritative Approval-Price Source (`BREAKOUT_IGNITION`):**
+- **Authoritative source:** Live native SOL-per-token spot price (`priceNative`) from DexScreener `/tokens/v1/solana/{mint}` **matched strictly to the exact pinned `order.pair_address`** (`approval_price_source = "dexscreener_pinned_pool_native"`), recorded with:
+  - `approval_pair_address: Optional[str] = None` (must match `order.pair_address` verbatim).
   - `approval_price_native: Optional[float] = None` (SOL per 1 whole token).
-  - `approval_price_source: Optional[str] = None` (e.g., `"dexscreener_pinned_pool_native"`).
+  - `approval_price_source: Optional[str] = None` (must equal `"dexscreener_pinned_pool_native"`).
+  - `approval_price_observed_at: Optional[str] = None`.
   - `token_decimals: Optional[int] = None` (explicitly obtained from Jupiter Token v2 / batched price v3 / mint metadata and validated as `int` in `0 <= d <= 18`; **never** silently defaulted to `6` when missing).
-- **No silent candle-close fallback:** The latest closed candle close may be stored separately as diagnostic `approval_candle_close_usd`, but must **never** be substituted for `approval_price_native` as a current executable price.
-- **Optional USD comparison rule:** Prefer native SOL-per-token directly to avoid cross-feed clock skew. If USD comparison is ever enabled, require both `approval_price_usd` and a synchronized `sol_usd_price` with `abs(sol_usd_observed_at - approval_price_observed_at) <= MAX_SOL_USD_SKEW_SECONDS`, failing closed if either timestamp is missing or skewed.
-- **Fail-closed validation:** If `approved_at`, `approval_price_observed_at`, `approval_price_native`, or `token_decimals` is missing, non-finite (`NaN`/`Inf`), `<= 0`, or stale (`now - approved_at > MAX_BUY_APPROVAL_AGE_SECONDS` or `now - approval_price_observed_at > MAX_APPROVAL_PRICE_AGE_SECONDS`), `executor_node` rejects the `BUY` before quoting.
+- **No silent mint-level or candle-close substitution:** Never substitute a mint-level Jupiter quote (which is not pool-pinned) or an older candle close as the drift reference. Any alternative/diagnostic value (e.g. `approval_candle_close_usd`) is strictly non-authoritative and cannot authorize execution or serve as the drift reference.
+- **Optional USD comparison rule:** Prefer native SOL-per-token directly to avoid cross-feed clock skew. If USD comparison is ever enabled, require both `approval_price_usd` (from the exact pinned pool) and a synchronized `sol_usd_price` with `abs(sol_usd_observed_at - approval_price_observed_at) <= MAX_SOL_USD_SKEW_SECONDS`, failing closed if either timestamp is missing or skewed.
+- **Fail-closed validation:** If `approved_at`, `approval_price_observed_at`, `approval_pair_address != order.pair_address`, `approval_price_source != "dexscreener_pinned_pool_native"`, `approval_price_native`, or `token_decimals` is missing, non-finite (`NaN`/`Inf`), `<= 0`, or stale (`now - approved_at > MAX_BUY_APPROVAL_AGE_SECONDS` or `now - approval_price_observed_at > MAX_APPROVAL_PRICE_AGE_SECONDS`), `executor_node` rejects the `BUY` before quoting.
 
 #### 4A.2 Precise Entry-Drift Formula & Sign Convention
 Given `spent_sol = order.amount_atomic / LAMPORTS_PER_SOL` and quote `out_amount` (atomic units) with validated `token_decimals`:
@@ -217,15 +229,27 @@ Wallet token balance (`getTokenAccountsByOwner` / `getBalance`) is **supporting 
 
 **Reconciliation procedure for `UNRESOLVED` / `SUBMITTED` intents:**
 1. Call `getSignatureStatuses([tx_signature], searchTransactionHistory=True)` on a healthy RPC endpoint.
-2. **If `status` is present and `status.err is not None`:**
-   - Transaction failed on-chain → transition to `FAILED`, release reservation.
-3. **If `status` is present and `status.err is None` and `confirmationStatus in ("confirmed", "finalized")` (finality level configurable; `"finalized"` recommended before releasing lock, `"confirmed"` minimum for position tracking):**
+2. **Committed Failure Policy (`err != None`):**
+   - A `processed`-only error is **not** sufficient to release a reservation (it can be fork-dependent or incomplete).
+   - Require `status.confirmationStatus` to meet the configured `RECONCILE_FAILURE_COMMITMENT` policy (`"confirmed"` or `"finalized"`). If `status.err is not None` at `processed` only, or if status is missing/inconsistent, keep `UNRESOLVED` and keep the mint/reservation locked.
+   - Cross-check `getTransaction.meta.err` when `getTransaction` is available. If `getSignatureStatuses` and `getTransaction` disagree (e.g., one reports `err != None` and the other reports `None`, or `getTransaction` is `None`/lagging), retain `UNRESOLVED` until consistent committed evidence is observed.
+   - Only when committed `status.err is not None` and cross-checked `getTransaction` (if present) agrees on failure → transition to `FAILED` and release reservation.
+3. **Committed Success & Deterministic Token-Delta Attribution (`status.err is None` and `confirmationStatus in ("confirmed", "finalized")`):**
    - Call `getTransaction(tx_signature, encoding="jsonParsed", maxSupportedTransactionVersion=0, commitment=...)`.
-   - If `getTransaction` returns `None`, lacks `meta`, or has `meta.err != None`: keep `UNRESOLVED` (or `FAILED` if `meta.err != None`) — never guess.
-   - Derive **actual output token delta** from `meta.preTokenBalances` and `meta.postTokenBalances` matching `(owner == taker_pubkey, mint == order.mint)` (validating `accountIndex`, `programId`, and `uiTokenAmount.decimals`).
-   - Derive **actual input lamport delta** for `taker_pubkey` from `meta.preBalances[taker_idx] - meta.postBalances[taker_idx]` (and record `meta.fee` if unambiguous, preserving E2B semantics).
-   - If token delta `> 0`: settle `ActivePosition` via `apply_trade_settlement()` → `RECONCILED` (or `SETTLEMENT_PENDING_PERSISTENCE` on DB error).
-   - If token delta `<= 0` or token balance records are inconsistent/missing: keep `UNRESOLVED` and alert operator (never fabricate a position or debit SOL without position).
+   - If `getTransaction` returns `None`, lacks `meta`, or has `meta.err != None`: retain `UNRESOLVED` (or `FAILED` only under the committed-failure rule above) — never guess.
+   - **Complete account-key resolution:** Build the full ordered account list `all_keys = message.accountKeys + meta.loadedAddresses.writable + meta.loadedAddresses.readonly` (so ALT-loaded accounts are resolved accurately).
+   - **Deterministic output token-delta attribution (`order.mint`):**
+     - Match `meta.preTokenBalances` and `meta.postTokenBalances` by `accountIndex` (resolved against `all_keys`), `mint == order.mint`, and validated token program (`SPL Token` / `Token-2022`) + `uiTokenAmount.decimals` consistency.
+     - **Missing `owner` / `programId`:** Treat omitted `owner` or `programId` in token balance entries as a requirement to resolve account ownership from reliable transaction/account evidence (parsed token-account owner / ATA derivation from `(taker_pubkey, token_program, order.mint)` / decoded instruction accounts) — **never** assume ownership without proof.
+     - **Newly created, closed, and multiple token accounts:** Aggregate raw integer token amounts across **all** verified taker-owned accounts for `order.mint`. A missing `preTokenBalances` entry for an account in `postTokenBalances` may be treated as `0` **only** when transaction metadata and account creation/ownership evidence (e.g. `Create` / `CreateIdempotent` ATA instruction for `taker_pubkey` and `order.mint`) establish that the account did not previously hold `order.mint`. Closed accounts (present in `preTokenBalances`, absent in `postTokenBalances`) must be included in the aggregate delta.
+     - If ownership, `accountIndex` mapping, `decimals`/program consistency, or pre/post attribution cannot be proven, **retain `UNRESOLVED`** (never infer success or acquired amount from current wallet balance).
+   - **Swap Input Principal vs. Total Wallet Lamport Delta (Do Not Conflate):**
+     - Never treat total taker lamport delta (`preBalances[taker] - postBalances[taker]`) as swap input principal or cost basis; that aggregate delta conflates swap input, base tx fee, priority fee, ATA rent/account creation, and any other SOL transfers.
+     - Determine **actual swap input principal** from verified wSOL (`SOL_MINT`) token-account deltas belonging to the swap or validated parsed/decoded swap instructions and their account relationships.
+     - Determine **network fee** from `meta.fee` alongside the verified fee payer (`all_keys[0] == taker_pubkey`).
+     - Attribute ATA rent / account creation and other SOL transfers separately when possible; never double-count fees or rent in lifecycle PnL or E2B fee accounting.
+     - Preserve `fee_accounting_status = "UNKNOWN"` whenever exact fee/principal attribution is unavailable; if actual input/output attribution required for a valid `ActivePosition` cannot be established safely, keep the intent `UNRESOLVED`.
+   - When verified output `token_delta > 0` and principal is reliably attributed: settle `ActivePosition` via `apply_trade_settlement()` → `RECONCILED` (or `SETTLEMENT_PENDING_PERSISTENCE` on DB error).
 4. **Safe `FAILED` classification when `getSignatureStatuses` returns `None`:**
    - **Never** classify a single `None` response as `FAILED`.
    - Require a healthy RPC response **AND** verified router-specific expiry:
@@ -254,7 +278,7 @@ Wallet token balance (`getTokenAccountsByOwner` / `getBalance`) is **supporting 
 
 ## 5. State & Database Schema Changes, Migration & Restart Behavior
 
-- **`PendingOrder` (`state.py`)**: Optional backward-compatible fields `approved_at`, `approval_price_observed_at`, `approval_price_native`, `approval_price_source`, `approval_candle_close_usd`, `approval_ohlcv_fetched_at`, `approval_candle_ts`, `token_decimals`.
+- **`PendingOrder` (`state.py`)**: Optional backward-compatible fields `approved_at`, `approval_price_observed_at`, `approval_pair_address`, `approval_price_native`, `approval_price_source`, `approval_candle_close_usd`, `approval_ohlcv_fetched_at`, `approval_candle_ts`, `token_decimals`.
 - **`watchlist` (`db.py`)**: `ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS safety_checked_at VARCHAR` (existing `NULL` rows treated as stale, never backfilled as fresh).
 - **`order_intents` (`db.py`, added in E4D)**: New table storing non-secret reconciliation metadata and lifecycle status.
 - **Restart behavior:** Startup reconciliation runs before scanner/alpha loops; unresolved intents remain locked in `reserve_buy_slot()` until resolved.
