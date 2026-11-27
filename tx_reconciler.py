@@ -505,7 +505,25 @@ async def reconcile_single_intent(
             last_liquidity_usd=float(snap.get("entry_liquidity_usd") or 0.0),
         )
         try:
-            db.remove_from_watchlist(mint)
+            trade_payload = {
+                "mode": config.EXECUTION_MODE,
+                "side": "BUY",
+                "mint": mint,
+                "symbol": str(intent["symbol"]),
+                "in_amount": int(intent["amount_atomic"]),
+                "out_amount": out_tokens,
+                "sol_value": entry_sol,
+                "reason": str(snap.get("reason") or "RECONCILED_BUY"),
+                "tx_signature": tx_sig,
+                "rationale": str(snap.get("rationale") or ""),
+                "strategy": str(intent.get("strategy") or "SCALPER"),
+                "triggering_wallets": list(snap.get("triggering_wallets") or []),
+                "opened_at": pos.opened_at,
+                "pair_address": intent.get("pair_address"),
+                "dex_id": intent.get("dex_id"),
+                "tx_fee_sol": None,
+                "fee_status": "UNKNOWN",
+            }
             db.apply_trade_settlement(
                 lane=str(intent.get("lane") or "chart"),
                 side="BUY",
@@ -519,25 +537,7 @@ async def reconcile_single_intent(
                 reservation_id=res_id,
                 intent_id=intent_id,
                 intent_final_status="RECONCILED",
-            )
-            db.log_trade(
-                mode=config.EXECUTION_MODE,
-                side="BUY",
-                mint=mint,
-                symbol=str(intent["symbol"]),
-                in_amount=int(intent["amount_atomic"]),
-                out_amount=out_tokens,
-                sol_value=entry_sol,
-                reason=str(snap.get("reason") or "RECONCILED_BUY"),
-                tx_signature=tx_sig,
-                rationale=str(snap.get("rationale") or ""),
-                strategy=str(intent.get("strategy") or "SCALPER"),
-                triggering_wallets=list(snap.get("triggering_wallets") or []),
-                opened_at=pos.opened_at,
-                pair_address=intent.get("pair_address"),
-                dex_id=intent.get("dex_id"),
-                tx_fee_sol=None,
-                fee_status="UNKNOWN",
+                reconciled_trade_row=trade_payload,
             )
             return "RECONCILED"
         except Exception as exc:
@@ -548,16 +548,19 @@ async def reconcile_single_intent(
             )
             return "SETTLEMENT_PENDING_PERSISTENCE"
 
-    # 2. SETTLEMENT_PENDING_PERSISTENCE: retry settlement with persisted reconciled values (no duplicate RPC needed if stored)
+    # 2. SETTLEMENT_PENDING_PERSISTENCE: retry settlement with persisted reconciled values (including decimals)
     if status == "SETTLEMENT_PENDING_PERSISTENCE":
         rec_out = snap.get("reconciled_out_tokens")
         rec_sol = snap.get("reconciled_entry_sol")
+        rec_dec = snap.get("reconciled_decimals")
+        if rec_dec is None:
+            rec_dec = intent.get("token_decimals")
         if rec_out and int(rec_out) > 0 and rec_sol and float(rec_sol) > 0:
             return _settle_confirmed_intent(
                 out_tokens=int(rec_out),
                 entry_sol=float(rec_sol),
                 tx_sig=intent.get("tx_signature"),
-                decimals=intent.get("token_decimals"),
+                decimals=int(rec_dec) if rec_dec is not None else None,
             )
 
     tx_sig = str(intent.get("tx_signature") or "").strip()
@@ -620,13 +623,17 @@ async def reconcile_single_intent(
 
     sig_err = sig_status.get("err")
     if sig_err is not None:
-        # Cross-check getTransaction.meta.err when available
-        if isinstance(tx_obj, dict) and isinstance(tx_obj.get("meta"), dict):
-            if tx_obj["meta"].get("err") is None:
-                db.transition_order_intent(
-                    intent_id, new_status="UNRESOLVED", error_detail="STATUS_AND_GET_TX_ERR_DISAGREE"
-                )
-                return "UNRESOLVED"
+        # Require matching terminal getTransaction.meta.err; null/missing/malformed meta remains UNRESOLVED
+        if not isinstance(tx_obj, dict) or not isinstance(tx_obj.get("meta"), dict):
+            db.transition_order_intent(
+                intent_id, new_status="UNRESOLVED", error_detail="GET_TRANSACTION_MISSING_OR_MALFORMED_ON_ERR"
+            )
+            return "UNRESOLVED"
+        if tx_obj["meta"].get("err") is None:
+            db.transition_order_intent(
+                intent_id, new_status="UNRESOLVED", error_detail="STATUS_AND_GET_TX_ERR_DISAGREE"
+            )
+            return "UNRESOLVED"
         db.transition_order_intent(intent_id, new_status="FAILED", error_detail=f"ONCHAIN_ERR:{sig_err}")
         if res_id:
             db.release_buy_reservation(res_id)
@@ -665,6 +672,7 @@ async def reconcile_single_intent(
 
     snap["reconciled_out_tokens"] = out_tokens
     snap["reconciled_entry_sol"] = principal_sol
+    snap["reconciled_decimals"] = attr.get("decimals")
     db.update_order_intent_snapshot(intent_id, snap)
     return _settle_confirmed_intent(
         out_tokens=out_tokens,

@@ -425,6 +425,58 @@ def release_buy_reservation(db: Any, reservation_id: Optional[str]) -> None:
         ]
 
 
+def _insert_reconciled_trade_locked(conn: Any, trade_row: dict[str, Any]) -> None:
+    """Insert a reconciled BUY row into `trades` inside the active settlement DuckDB transaction."""
+    clean_pair = (
+        trade_row.get("pair_address").strip()
+        if isinstance(trade_row.get("pair_address"), str) and trade_row.get("pair_address", "").strip()
+        else None
+    )
+    clean_dex = (
+        trade_row.get("dex_id").strip()
+        if isinstance(trade_row.get("dex_id"), str) and trade_row.get("dex_id", "").strip()
+        else None
+    )
+    clean_fee_status = (
+        trade_row.get("fee_status").strip()
+        if isinstance(trade_row.get("fee_status"), str) and trade_row.get("fee_status", "").strip()
+        else None
+    )
+    conn.execute(
+        """
+        INSERT INTO trades (
+            timestamp, mode, side, mint, symbol, in_amount, out_amount,
+            sol_value, pnl_sol, pnl_pct, reason, tx_signature, rationale,
+            strategy, triggering_wallets_json, opened_at, jupiter_price_impact_raw,
+            pair_address, dex_id, tx_fee_sol, fee_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            _utc_now_iso(),
+            str(trade_row["mode"]),
+            str(trade_row["side"]),
+            str(trade_row["mint"]),
+            str(trade_row["symbol"]),
+            int(trade_row["in_amount"]),
+            int(trade_row["out_amount"]),
+            float(trade_row["sol_value"]),
+            trade_row.get("pnl_sol"),
+            trade_row.get("pnl_pct"),
+            str(trade_row["reason"]),
+            trade_row.get("tx_signature"),
+            str(trade_row.get("rationale") or ""),
+            str(trade_row.get("strategy") or "SCALPER"),
+            json.dumps(trade_row.get("triggering_wallets") or []),
+            trade_row.get("opened_at"),
+            trade_row.get("jupiter_price_impact_raw"),
+            clean_pair,
+            clean_dex,
+            trade_row.get("tx_fee_sol"),
+            clean_fee_status,
+        ],
+    )
+
+
 def apply_trade_settlement(
     db: Any,
     *,
@@ -440,6 +492,7 @@ def apply_trade_settlement(
     reservation_id: Optional[str] = None,
     intent_id: Optional[str] = None,
     intent_final_status: str = "CONFIRMED",
+    reconciled_trade_row: Optional[dict[str, Any]] = None,
     fallback_base_sol: Optional[float] = None,
     fallback_base_pnl: Optional[float] = None,
 ) -> dict[str, Any]:
@@ -538,6 +591,10 @@ def apply_trade_settlement(
                     "active_position": legacy_act, "chart_positions": kept_c,
                     "whale_position": wh_p, "whale_positions": whale_list,
                 }
+
+            if reconciled_trade_row is not None:
+                _insert_reconciled_trade_locked(db._conn, reconciled_trade_row)
+                db._conn.execute("DELETE FROM active_watchlist WHERE mint = ?", [mint])
 
             if intent_id:
                 db._conn.execute(

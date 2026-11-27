@@ -748,6 +748,10 @@ class AgentDatabase:
                 if curr_status == new_status and (tx_signature is None or tx_signature == curr_sig):
                     self._conn.execute("COMMIT")
                     return True
+                # Never allow a terminal intent (RECONCILED or FAILED) to transition backward
+                if curr_status in ("RECONCILED", "FAILED") and new_status != curr_status:
+                    self._conn.execute("ROLLBACK")
+                    return False
                 if expected_statuses is not None and curr_status not in expected_statuses:
                     self._conn.execute("ROLLBACK")
                     return False

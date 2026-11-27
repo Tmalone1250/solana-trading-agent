@@ -406,3 +406,124 @@ def test_e4d_attribution_rejects_bad_indices_missing_owner_and_does_not_double_a
     tx_bad_prog["meta"]["postTokenBalances"][0]["programId"] = "MaliciousProg1111111111111111111111111111"
     with pytest.raises(AttributionAmbiguousError, match="Unexpected token program"):
         attribute_transaction_balances(tx_bad_prog, taker_pubkey=taker, output_mint=MINT_A)
+
+
+@pytest.mark.asyncio
+async def test_e4d_atomic_trade_insert_rollback_and_decimal_preservation_on_retry(tmp_path, monkeypatch):
+    """Findings 1 & 3: Trade-insert failure rolls back position/SOL/trade/intent; retry preserves non-6 decimals & settles once."""
+    clear_buy_reservations()
+    kp = Keypair()
+    taker = str(kp.pubkey())
+    db = AgentDatabase(db_path=str(tmp_path / "e4d_atomic.duckdb"), starting_sol=2.0)
+    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp), SOLANA_RPC_URL=RPC_URL)
+
+    res_a, _ = db.reserve_buy_slot(
+        lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.01, max_lane_positions=3, max_open_positions=6,
+    )
+    db.create_order_intent(
+        intent_id="int-dec9", reservation_id=res_a, lane="chart", mint=MINT_A, symbol="DEC9",
+        pair_address=POOL_A, dex_id="pumpswap", side="BUY", strategy="BREAKOUT_IGNITION",
+        router="metis", order_mode="ultra", jupiter_request_id="r9", tx_signature="SigDec9",
+        last_valid_block_height=100, expire_at=None, input_mint=SOL_MINT, output_mint=MINT_A,
+        amount_atomic=500_000_000, expected_out_amount=1_000_000, other_amount_threshold=990_000,
+        token_decimals=None,  # Deliberately None so retry must use reconciled_decimals=9!
+        taker_pubkey=taker, reserved_sol=0.51, status="UNRESOLVED",
+        order_snapshot={"opened_at": "2026-11-27T16:00:00+00:00", "reason": "DECISION_1_ENTRY", "entry_liquidity_usd": 80_000.0},
+    )
+
+    swap_tx_dec9 = _mk_json_parsed_swap_tx(
+        taker=taker, mint=MINT_A, ata1="Ata1", ata2="Ata2", wsol_ata="Wsol1",
+    )
+    for b in [*swap_tx_dec9["meta"]["preTokenBalances"], *swap_tx_dec9["meta"]["postTokenBalances"]]:
+        if b["mint"] == MINT_A:
+            b["uiTokenAmount"]["decimals"] = 9
+
+    def rpc_handler(request: httpx.Request) -> httpx.Response:
+        body = __import__("json").loads(request.content.decode("utf-8"))
+        m = body["method"]
+        if m == "getSignatureStatuses":
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"value": [{"confirmationStatus": "finalized", "err": None}]}})
+        if m == "getTransaction":
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": swap_tx_dec9})
+        return httpx.Response(404)
+
+    import state_ledger
+    orig_insert = state_ledger._insert_reconciled_trade_locked
+
+    def _boom_trade_insert(conn, row):
+        raise RuntimeError("simulated trades insert failure")
+
+    monkeypatch.setattr(state_ledger, "_insert_reconciled_trade_locked", _boom_trade_insert)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(rpc_handler)) as client:
+        res1 = await reconcile_unresolved_intents(db, config=cfg, client=client)
+        assert res1 == [("int-dec9", "SETTLEMENT_PENDING_PERSISTENCE")]
+
+        # Everything rolled back atomically: 0 positions, 2.0 SOL untouched, 0 trades, reservation still locked!
+        st_fail = db.get_state()
+        assert st_fail["chart_positions"] == []
+        assert st_fail["sol_balance"] == pytest.approx(2.0)
+        assert db.get_recent_trades(limit=10) == []
+        assert len(get_inflight_buy_reservations(str(db.db_path))) == 1
+        res_dup, rej_dup = db.reserve_buy_slot(
+            lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.01, max_lane_positions=3, max_open_positions=6,
+        )
+        assert res_dup is None and rej_dup is not None and "DUPLICATE_MINT" in rej_dup
+
+        # Restore trade insert & retry -> commits 1 position with decimals=9, 1 SOL debit, 1 trade, RECONCILED, reservation released
+        monkeypatch.setattr(state_ledger, "_insert_reconciled_trade_locked", orig_insert)
+        res2 = await reconcile_unresolved_intents(db, config=cfg, client=client)
+        assert res2 == [("int-dec9", "RECONCILED")]
+
+    st_ok = db.get_state()
+    assert len(st_ok["chart_positions"]) == 1
+    assert st_ok["chart_positions"][0]["decimals"] == 9
+    assert st_ok["chart_positions"][0]["token_amount"] == 1_000_000
+    assert st_ok["sol_balance"] == pytest.approx(1.50)
+    assert len(db.get_recent_trades(limit=10)) == 1
+    assert get_inflight_buy_reservations(str(db.db_path)) == []
+    assert db.get_order_intent("int-dec9")["status"] == "RECONCILED"
+    # Terminal RECONCILED cannot transition backward to SETTLEMENT_PENDING_PERSISTENCE
+    assert db.transition_order_intent("int-dec9", new_status="SETTLEMENT_PENDING_PERSISTENCE") is False
+    assert db.get_order_intent("int-dec9")["status"] == "RECONCILED"
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_e4d_terminal_status_error_with_null_missing_or_malformed_get_transaction_remains_unresolved(tmp_path):
+    """Finding 2: Terminal status err with null/missing/malformed/disagreeing getTransaction stays UNRESOLVED."""
+    clear_buy_reservations()
+    kp = Keypair()
+    taker = str(kp.pubkey())
+    db = AgentDatabase(db_path=str(tmp_path / "e4d_f2.duckdb"), starting_sol=2.0)
+    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp), SOLANA_RPC_URL=RPC_URL)
+
+    r1, _ = db.reserve_buy_slot(lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.01, max_lane_positions=3, max_open_positions=6)
+    db.create_order_intent(
+        intent_id="int-f2", reservation_id=r1, lane="chart", mint=MINT_A, symbol="F2",
+        pair_address=POOL_A, dex_id="pumpswap", side="BUY", strategy="BREAKOUT_IGNITION",
+        router="metis", order_mode="ultra", jupiter_request_id="rf2", tx_signature="SigF2",
+        last_valid_block_height=100, expire_at=None, input_mint=SOL_MINT, output_mint=MINT_A,
+        amount_atomic=500_000_000, expected_out_amount=1_000_000, other_amount_threshold=990_000,
+        token_decimals=6, taker_pubkey=taker, reserved_sol=0.51, status="UNRESOLVED",
+    )
+
+    tx_payloads: list[Any] = [None, {}, {"meta": None}, {"meta": "bad"}, {"meta": {"err": None}}]
+    idx = {"i": 0}
+
+    def rpc_handler(request: httpx.Request) -> httpx.Response:
+        body = __import__("json").loads(request.content.decode("utf-8"))
+        if body["method"] == "getSignatureStatuses":
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"value": [{"confirmationStatus": "finalized", "err": {"InstructionError": [0, "Custom"]}}]}})
+        if body["method"] == "getTransaction":
+            val = tx_payloads[idx["i"]]
+            idx["i"] += 1
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": val})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(rpc_handler)) as client:
+        for _ in tx_payloads:
+            res = await reconcile_unresolved_intents(db, config=cfg, client=client)
+            assert res == [("int-f2", "UNRESOLVED")]
+            assert len(get_inflight_buy_reservations(str(db.db_path))) == 1
+    db.close()

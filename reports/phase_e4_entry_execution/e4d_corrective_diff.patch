@@ -1,0 +1,339 @@
+diff --git a/db.py b/db.py
+index 465a06a..6110832 100644
+--- a/db.py
++++ b/db.py
+@@ -748,6 +748,10 @@ class AgentDatabase:
+                 if curr_status == new_status and (tx_signature is None or tx_signature == curr_sig):
+                     self._conn.execute("COMMIT")
+                     return True
++                # Never allow a terminal intent (RECONCILED or FAILED) to transition backward
++                if curr_status in ("RECONCILED", "FAILED") and new_status != curr_status:
++                    self._conn.execute("ROLLBACK")
++                    return False
+                 if expected_statuses is not None and curr_status not in expected_statuses:
+                     self._conn.execute("ROLLBACK")
+                     return False
+diff --git a/state_ledger.py b/state_ledger.py
+index cdc35c6..f278e41 100644
+--- a/state_ledger.py
++++ b/state_ledger.py
+@@ -425,6 +425,58 @@ def release_buy_reservation(db: Any, reservation_id: Optional[str]) -> None:
+         ]
+ 
+ 
++def _insert_reconciled_trade_locked(conn: Any, trade_row: dict[str, Any]) -> None:
++    """Insert a reconciled BUY row into `trades` inside the active settlement DuckDB transaction."""
++    clean_pair = (
++        trade_row.get("pair_address").strip()
++        if isinstance(trade_row.get("pair_address"), str) and trade_row.get("pair_address", "").strip()
++        else None
++    )
++    clean_dex = (
++        trade_row.get("dex_id").strip()
++        if isinstance(trade_row.get("dex_id"), str) and trade_row.get("dex_id", "").strip()
++        else None
++    )
++    clean_fee_status = (
++        trade_row.get("fee_status").strip()
++        if isinstance(trade_row.get("fee_status"), str) and trade_row.get("fee_status", "").strip()
++        else None
++    )
++    conn.execute(
++        """
++        INSERT INTO trades (
++            timestamp, mode, side, mint, symbol, in_amount, out_amount,
++            sol_value, pnl_sol, pnl_pct, reason, tx_signature, rationale,
++            strategy, triggering_wallets_json, opened_at, jupiter_price_impact_raw,
++            pair_address, dex_id, tx_fee_sol, fee_status
++        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++        """,
++        [
++            _utc_now_iso(),
++            str(trade_row["mode"]),
++            str(trade_row["side"]),
++            str(trade_row["mint"]),
++            str(trade_row["symbol"]),
++            int(trade_row["in_amount"]),
++            int(trade_row["out_amount"]),
++            float(trade_row["sol_value"]),
++            trade_row.get("pnl_sol"),
++            trade_row.get("pnl_pct"),
++            str(trade_row["reason"]),
++            trade_row.get("tx_signature"),
++            str(trade_row.get("rationale") or ""),
++            str(trade_row.get("strategy") or "SCALPER"),
++            json.dumps(trade_row.get("triggering_wallets") or []),
++            trade_row.get("opened_at"),
++            trade_row.get("jupiter_price_impact_raw"),
++            clean_pair,
++            clean_dex,
++            trade_row.get("tx_fee_sol"),
++            clean_fee_status,
++        ],
++    )
++
++
+ def apply_trade_settlement(
+     db: Any,
+     *,
+@@ -440,6 +492,7 @@ def apply_trade_settlement(
+     reservation_id: Optional[str] = None,
+     intent_id: Optional[str] = None,
+     intent_final_status: str = "CONFIRMED",
++    reconciled_trade_row: Optional[dict[str, Any]] = None,
+     fallback_base_sol: Optional[float] = None,
+     fallback_base_pnl: Optional[float] = None,
+ ) -> dict[str, Any]:
+@@ -539,6 +592,10 @@ def apply_trade_settlement(
+                     "whale_position": wh_p, "whale_positions": whale_list,
+                 }
+ 
++            if reconciled_trade_row is not None:
++                _insert_reconciled_trade_locked(db._conn, reconciled_trade_row)
++                db._conn.execute("DELETE FROM active_watchlist WHERE mint = ?", [mint])
++
+             if intent_id:
+                 db._conn.execute(
+                     "UPDATE order_intents SET status = ?, updated_at = ? WHERE intent_id = ?",
+diff --git a/tests/test_e4d_transaction_reconciliation.py b/tests/test_e4d_transaction_reconciliation.py
+index f812e65..c86bac6 100644
+--- a/tests/test_e4d_transaction_reconciliation.py
++++ b/tests/test_e4d_transaction_reconciliation.py
+@@ -406,3 +406,124 @@ def test_e4d_attribution_rejects_bad_indices_missing_owner_and_does_not_double_a
+     tx_bad_prog["meta"]["postTokenBalances"][0]["programId"] = "MaliciousProg1111111111111111111111111111"
+     with pytest.raises(AttributionAmbiguousError, match="Unexpected token program"):
+         attribute_transaction_balances(tx_bad_prog, taker_pubkey=taker, output_mint=MINT_A)
++
++
++@pytest.mark.asyncio
++async def test_e4d_atomic_trade_insert_rollback_and_decimal_preservation_on_retry(tmp_path, monkeypatch):
++    """Findings 1 & 3: Trade-insert failure rolls back position/SOL/trade/intent; retry preserves non-6 decimals & settles once."""
++    clear_buy_reservations()
++    kp = Keypair()
++    taker = str(kp.pubkey())
++    db = AgentDatabase(db_path=str(tmp_path / "e4d_atomic.duckdb"), starting_sol=2.0)
++    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp), SOLANA_RPC_URL=RPC_URL)
++
++    res_a, _ = db.reserve_buy_slot(
++        lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.01, max_lane_positions=3, max_open_positions=6,
++    )
++    db.create_order_intent(
++        intent_id="int-dec9", reservation_id=res_a, lane="chart", mint=MINT_A, symbol="DEC9",
++        pair_address=POOL_A, dex_id="pumpswap", side="BUY", strategy="BREAKOUT_IGNITION",
++        router="metis", order_mode="ultra", jupiter_request_id="r9", tx_signature="SigDec9",
++        last_valid_block_height=100, expire_at=None, input_mint=SOL_MINT, output_mint=MINT_A,
++        amount_atomic=500_000_000, expected_out_amount=1_000_000, other_amount_threshold=990_000,
++        token_decimals=None,  # Deliberately None so retry must use reconciled_decimals=9!
++        taker_pubkey=taker, reserved_sol=0.51, status="UNRESOLVED",
++        order_snapshot={"opened_at": "2026-11-27T16:00:00+00:00", "reason": "DECISION_1_ENTRY", "entry_liquidity_usd": 80_000.0},
++    )
++
++    swap_tx_dec9 = _mk_json_parsed_swap_tx(
++        taker=taker, mint=MINT_A, ata1="Ata1", ata2="Ata2", wsol_ata="Wsol1",
++    )
++    for b in [*swap_tx_dec9["meta"]["preTokenBalances"], *swap_tx_dec9["meta"]["postTokenBalances"]]:
++        if b["mint"] == MINT_A:
++            b["uiTokenAmount"]["decimals"] = 9
++
++    def rpc_handler(request: httpx.Request) -> httpx.Response:
++        body = __import__("json").loads(request.content.decode("utf-8"))
++        m = body["method"]
++        if m == "getSignatureStatuses":
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"value": [{"confirmationStatus": "finalized", "err": None}]}})
++        if m == "getTransaction":
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": swap_tx_dec9})
++        return httpx.Response(404)
++
++    import state_ledger
++    orig_insert = state_ledger._insert_reconciled_trade_locked
++
++    def _boom_trade_insert(conn, row):
++        raise RuntimeError("simulated trades insert failure")
++
++    monkeypatch.setattr(state_ledger, "_insert_reconciled_trade_locked", _boom_trade_insert)
++
++    async with httpx.AsyncClient(transport=httpx.MockTransport(rpc_handler)) as client:
++        res1 = await reconcile_unresolved_intents(db, config=cfg, client=client)
++        assert res1 == [("int-dec9", "SETTLEMENT_PENDING_PERSISTENCE")]
++
++        # Everything rolled back atomically: 0 positions, 2.0 SOL untouched, 0 trades, reservation still locked!
++        st_fail = db.get_state()
++        assert st_fail["chart_positions"] == []
++        assert st_fail["sol_balance"] == pytest.approx(2.0)
++        assert db.get_recent_trades(limit=10) == []
++        assert len(get_inflight_buy_reservations(str(db.db_path))) == 1
++        res_dup, rej_dup = db.reserve_buy_slot(
++            lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.01, max_lane_positions=3, max_open_positions=6,
++        )
++        assert res_dup is None and rej_dup is not None and "DUPLICATE_MINT" in rej_dup
++
++        # Restore trade insert & retry -> commits 1 position with decimals=9, 1 SOL debit, 1 trade, RECONCILED, reservation released
++        monkeypatch.setattr(state_ledger, "_insert_reconciled_trade_locked", orig_insert)
++        res2 = await reconcile_unresolved_intents(db, config=cfg, client=client)
++        assert res2 == [("int-dec9", "RECONCILED")]
++
++    st_ok = db.get_state()
++    assert len(st_ok["chart_positions"]) == 1
++    assert st_ok["chart_positions"][0]["decimals"] == 9
++    assert st_ok["chart_positions"][0]["token_amount"] == 1_000_000
++    assert st_ok["sol_balance"] == pytest.approx(1.50)
++    assert len(db.get_recent_trades(limit=10)) == 1
++    assert get_inflight_buy_reservations(str(db.db_path)) == []
++    assert db.get_order_intent("int-dec9")["status"] == "RECONCILED"
++    # Terminal RECONCILED cannot transition backward to SETTLEMENT_PENDING_PERSISTENCE
++    assert db.transition_order_intent("int-dec9", new_status="SETTLEMENT_PENDING_PERSISTENCE") is False
++    assert db.get_order_intent("int-dec9")["status"] == "RECONCILED"
++    db.close()
++
++
++@pytest.mark.asyncio
++async def test_e4d_terminal_status_error_with_null_missing_or_malformed_get_transaction_remains_unresolved(tmp_path):
++    """Finding 2: Terminal status err with null/missing/malformed/disagreeing getTransaction stays UNRESOLVED."""
++    clear_buy_reservations()
++    kp = Keypair()
++    taker = str(kp.pubkey())
++    db = AgentDatabase(db_path=str(tmp_path / "e4d_f2.duckdb"), starting_sol=2.0)
++    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp), SOLANA_RPC_URL=RPC_URL)
++
++    r1, _ = db.reserve_buy_slot(lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.01, max_lane_positions=3, max_open_positions=6)
++    db.create_order_intent(
++        intent_id="int-f2", reservation_id=r1, lane="chart", mint=MINT_A, symbol="F2",
++        pair_address=POOL_A, dex_id="pumpswap", side="BUY", strategy="BREAKOUT_IGNITION",
++        router="metis", order_mode="ultra", jupiter_request_id="rf2", tx_signature="SigF2",
++        last_valid_block_height=100, expire_at=None, input_mint=SOL_MINT, output_mint=MINT_A,
++        amount_atomic=500_000_000, expected_out_amount=1_000_000, other_amount_threshold=990_000,
++        token_decimals=6, taker_pubkey=taker, reserved_sol=0.51, status="UNRESOLVED",
++    )
++
++    tx_payloads: list[Any] = [None, {}, {"meta": None}, {"meta": "bad"}, {"meta": {"err": None}}]
++    idx = {"i": 0}
++
++    def rpc_handler(request: httpx.Request) -> httpx.Response:
++        body = __import__("json").loads(request.content.decode("utf-8"))
++        if body["method"] == "getSignatureStatuses":
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"value": [{"confirmationStatus": "finalized", "err": {"InstructionError": [0, "Custom"]}}]}})
++        if body["method"] == "getTransaction":
++            val = tx_payloads[idx["i"]]
++            idx["i"] += 1
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": val})
++        return httpx.Response(404)
++
++    async with httpx.AsyncClient(transport=httpx.MockTransport(rpc_handler)) as client:
++        for _ in tx_payloads:
++            res = await reconcile_unresolved_intents(db, config=cfg, client=client)
++            assert res == [("int-f2", "UNRESOLVED")]
++            assert len(get_inflight_buy_reservations(str(db.db_path))) == 1
++    db.close()
+diff --git a/tx_reconciler.py b/tx_reconciler.py
+index d1f3961..0e7685b 100644
+--- a/tx_reconciler.py
++++ b/tx_reconciler.py
+@@ -505,7 +505,25 @@ async def reconcile_single_intent(
+             last_liquidity_usd=float(snap.get("entry_liquidity_usd") or 0.0),
+         )
+         try:
+-            db.remove_from_watchlist(mint)
++            trade_payload = {
++                "mode": config.EXECUTION_MODE,
++                "side": "BUY",
++                "mint": mint,
++                "symbol": str(intent["symbol"]),
++                "in_amount": int(intent["amount_atomic"]),
++                "out_amount": out_tokens,
++                "sol_value": entry_sol,
++                "reason": str(snap.get("reason") or "RECONCILED_BUY"),
++                "tx_signature": tx_sig,
++                "rationale": str(snap.get("rationale") or ""),
++                "strategy": str(intent.get("strategy") or "SCALPER"),
++                "triggering_wallets": list(snap.get("triggering_wallets") or []),
++                "opened_at": pos.opened_at,
++                "pair_address": intent.get("pair_address"),
++                "dex_id": intent.get("dex_id"),
++                "tx_fee_sol": None,
++                "fee_status": "UNKNOWN",
++            }
+             db.apply_trade_settlement(
+                 lane=str(intent.get("lane") or "chart"),
+                 side="BUY",
+@@ -519,25 +537,7 @@ async def reconcile_single_intent(
+                 reservation_id=res_id,
+                 intent_id=intent_id,
+                 intent_final_status="RECONCILED",
+-            )
+-            db.log_trade(
+-                mode=config.EXECUTION_MODE,
+-                side="BUY",
+-                mint=mint,
+-                symbol=str(intent["symbol"]),
+-                in_amount=int(intent["amount_atomic"]),
+-                out_amount=out_tokens,
+-                sol_value=entry_sol,
+-                reason=str(snap.get("reason") or "RECONCILED_BUY"),
+-                tx_signature=tx_sig,
+-                rationale=str(snap.get("rationale") or ""),
+-                strategy=str(intent.get("strategy") or "SCALPER"),
+-                triggering_wallets=list(snap.get("triggering_wallets") or []),
+-                opened_at=pos.opened_at,
+-                pair_address=intent.get("pair_address"),
+-                dex_id=intent.get("dex_id"),
+-                tx_fee_sol=None,
+-                fee_status="UNKNOWN",
++                reconciled_trade_row=trade_payload,
+             )
+             return "RECONCILED"
+         except Exception as exc:
+@@ -548,16 +548,19 @@ async def reconcile_single_intent(
+             )
+             return "SETTLEMENT_PENDING_PERSISTENCE"
+ 
+-    # 2. SETTLEMENT_PENDING_PERSISTENCE: retry settlement with persisted reconciled values (no duplicate RPC needed if stored)
++    # 2. SETTLEMENT_PENDING_PERSISTENCE: retry settlement with persisted reconciled values (including decimals)
+     if status == "SETTLEMENT_PENDING_PERSISTENCE":
+         rec_out = snap.get("reconciled_out_tokens")
+         rec_sol = snap.get("reconciled_entry_sol")
++        rec_dec = snap.get("reconciled_decimals")
++        if rec_dec is None:
++            rec_dec = intent.get("token_decimals")
+         if rec_out and int(rec_out) > 0 and rec_sol and float(rec_sol) > 0:
+             return _settle_confirmed_intent(
+                 out_tokens=int(rec_out),
+                 entry_sol=float(rec_sol),
+                 tx_sig=intent.get("tx_signature"),
+-                decimals=intent.get("token_decimals"),
++                decimals=int(rec_dec) if rec_dec is not None else None,
+             )
+ 
+     tx_sig = str(intent.get("tx_signature") or "").strip()
+@@ -620,13 +623,17 @@ async def reconcile_single_intent(
+ 
+     sig_err = sig_status.get("err")
+     if sig_err is not None:
+-        # Cross-check getTransaction.meta.err when available
+-        if isinstance(tx_obj, dict) and isinstance(tx_obj.get("meta"), dict):
+-            if tx_obj["meta"].get("err") is None:
+-                db.transition_order_intent(
+-                    intent_id, new_status="UNRESOLVED", error_detail="STATUS_AND_GET_TX_ERR_DISAGREE"
+-                )
+-                return "UNRESOLVED"
++        # Require matching terminal getTransaction.meta.err; null/missing/malformed meta remains UNRESOLVED
++        if not isinstance(tx_obj, dict) or not isinstance(tx_obj.get("meta"), dict):
++            db.transition_order_intent(
++                intent_id, new_status="UNRESOLVED", error_detail="GET_TRANSACTION_MISSING_OR_MALFORMED_ON_ERR"
++            )
++            return "UNRESOLVED"
++        if tx_obj["meta"].get("err") is None:
++            db.transition_order_intent(
++                intent_id, new_status="UNRESOLVED", error_detail="STATUS_AND_GET_TX_ERR_DISAGREE"
++            )
++            return "UNRESOLVED"
+         db.transition_order_intent(intent_id, new_status="FAILED", error_detail=f"ONCHAIN_ERR:{sig_err}")
+         if res_id:
+             db.release_buy_reservation(res_id)
+@@ -665,6 +672,7 @@ async def reconcile_single_intent(
+ 
+     snap["reconciled_out_tokens"] = out_tokens
+     snap["reconciled_entry_sol"] = principal_sol
++    snap["reconciled_decimals"] = attr.get("decimals")
+     db.update_order_intent_snapshot(intent_id, snap)
+     return _settle_confirmed_intent(
+         out_tokens=out_tokens,
