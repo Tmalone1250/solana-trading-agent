@@ -337,3 +337,132 @@ async def test_e4a_quote_age_enforced_at_all_three_checkpoints():
                 await _validate_e4a_quote_timing_and_expiry(
                     resp, cfg, quote_received_at=stale_received, client=client, stage=stage, is_live=True,
                 )
+
+
+@pytest.mark.asyncio
+async def test_e4a_corrective_strict_parsing_missing_oat_and_router_allowlist(tmp_path, monkeypatch):
+    """Reject missing/inconsistent otherAmountThreshold, non-strict atomic/int fields, and missing/unsupported routers with zero signing/broadcast."""
+    import executor_node as ex_mod
+    clear_buy_reservations()
+    clear_sell_idempotency_guard()
+    kp = Keypair()
+    unsigned_tx = _mk_unsigned_tx(kp)
+    db = AgentDatabase(db_path=str(tmp_path / "e4a_corr.duckdb"), starting_sol=5.0)
+    cfg = _mk_live_e4a_cfg(kp)
+
+    base_quote = {
+        "outAmount": "1000000000",
+        "otherAmountThreshold": "980000000",
+        "slippageBps": 200,
+        "priceImpact": -0.5,
+        "router": "metis",
+        "lastValidBlockHeight": 1000,
+        "transaction": unsigned_tx,
+        "requestId": "req-e4a-corr",
+    }
+
+    bad_quotes = [
+        # 1. Missing / null otherAmountThreshold
+        {k: v for k, v in base_quote.items() if k != "otherAmountThreshold"},
+        {**base_quote, "otherAmountThreshold": None},
+        # 2. Strict atomic parsing for otherAmountThreshold
+        {**base_quote, "otherAmountThreshold": True},
+        {**base_quote, "otherAmountThreshold": False},
+        {**base_quote, "otherAmountThreshold": 980000000.0},
+        {**base_quote, "otherAmountThreshold": "980000000.5"},
+        {**base_quote, "otherAmountThreshold": "9.8e8"},
+        {**base_quote, "otherAmountThreshold": ""},
+        {**base_quote, "otherAmountThreshold": " 980000000 "},
+        {**base_quote, "otherAmountThreshold": 0},
+        {**base_quote, "otherAmountThreshold": -5},
+        # 3. otherAmountThreshold > outAmount (internally inconsistent)
+        {**base_quote, "otherAmountThreshold": "1000000001"},
+        # 4. Strict atomic parsing for outAmount in live mode
+        {**base_quote, "outAmount": None},
+        {**base_quote, "outAmount": True},
+        {**base_quote, "outAmount": 1000000000.0},
+        {**base_quote, "outAmount": "1000000000.5"},
+        {**base_quote, "outAmount": ""},
+        {**base_quote, "outAmount": "0"},
+        {**base_quote, "outAmount": "-10"},
+        # 5. Strict int parsing for lastValidBlockHeight and slippageBps
+        {**base_quote, "lastValidBlockHeight": 1000.0},
+        {**base_quote, "lastValidBlockHeight": "1000.0"},
+        {**base_quote, "lastValidBlockHeight": True},
+        {**base_quote, "slippageBps": 200.0},
+        {**base_quote, "slippageBps": "200.5"},
+        {**base_quote, "slippageBps": True},
+        # 6. Explicit router allowlist (missing, empty, malformed, unsupported)
+        {k: v for k, v in base_quote.items() if k != "router"},
+        {**base_quote, "router": None},
+        {**base_quote, "router": ""},
+        {**base_quote, "router": "raydium"},
+        {**base_quote, "router": 123},
+    ]
+
+    sign_calls = {"n": 0}
+    exec_calls = {"n": 0}
+    orig_derive = ex_mod.derive_and_validate_single_signer_tx
+
+    def spy_derive(*args: Any, **kwargs: Any):
+        sign_calls["n"] += 1
+        return orig_derive(*args, **kwargs)
+
+    monkeypatch.setattr(ex_mod, "derive_and_validate_single_signer_tx", spy_derive)
+
+    curr_quote = {"val": dict(base_quote)}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith(RPC_URL):
+            body = __import__("json").loads(request.content.decode("utf-8"))
+            if body["method"] == "getBalance":
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
+            if body["method"] == "getBlockHeight":
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": 990})
+        if "/swap/v2/order" in str(request.url):
+            return httpx.Response(200, json=curr_quote["val"])
+        if "/swap/v2/execute" in str(request.url):
+            exec_calls["n"] += 1
+            return httpx.Response(200, json={"signature": "SigE4ACorr111", "outputAmountResult": "1000000000"})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        for bq in bad_quotes:
+            curr_quote["val"] = bq
+            out = await executor_node(
+                {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4a_order()},
+                config=cfg, db=db, http_client=client,
+            )
+            assert out == {"pending_order": None}
+            assert get_inflight_buy_reservations(str(db.db_path)) == []
+            assert db.get_active_locking_intents() == []
+            assert sign_calls["n"] == 0
+            assert exec_calls["n"] == 0
+
+        # Malformed outAmount in paper mode also rejected before settlement
+        cfg_paper = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.001)
+        for bad_out in (None, True, 1000000.0, "1000000.5", "0", "-5", "abc"):
+            curr_quote["val"] = {"outAmount": bad_out, "transaction": None}
+            out_p = await executor_node(
+                {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4a_order()},
+                config=cfg_paper, db=db, http_client=client,
+            )
+            assert out_p == {"pending_order": None}
+            assert get_inflight_buy_reservations(str(db.db_path)) == []
+
+        # Supported routers (dflow, okx with lastValidBlockHeight; jupiterz with expireAt) pass
+        for ok_router_patch in (
+            {"router": "dflow", "lastValidBlockHeight": 1000},
+            {"router": "okx", "lastValidBlockHeight": 1000},
+            {"router": "jupiterz", "expireAt": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()},
+        ):
+            curr_quote["val"] = {**base_quote, **ok_router_patch}
+            # Use unique mint per successful trade to avoid duplicate open position
+            order_ok = _mk_e4a_order()
+            order_ok["mint"] = str(Keypair().pubkey())
+            out_ok = await executor_node(
+                {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": order_ok},
+                config=cfg, db=db, http_client=client,
+            )
+            assert len(out_ok["chart_positions"]) >= 1
+    db.close()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import logging
 import math
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -60,6 +61,24 @@ AUTHORITATIVE_APPROVAL_PRICE_SOURCE = "dexscreener_pinned_pool_native"
 
 class E4AValidationError(RuntimeError):
     """Raised when Phase E4A pre-broadcast approval or quote integrity checks fail."""
+
+
+def _parse_strict_int(raw: Any, field_name: str, *, min_value: int = 1) -> int:
+    """Strictly parse integer atomic/integer fields; reject bool, float, fractional, empty, malformed, or out-of-range."""
+    if raw is None or isinstance(raw, (bool, float)):
+        raise E4AValidationError(f"BLOCKED: INVALID_{field_name} ({raw!r})")
+    if isinstance(raw, int):
+        val = raw
+    elif isinstance(raw, str):
+        if not re.fullmatch(r"-?[0-9]+", raw):
+            raise E4AValidationError(f"BLOCKED: INVALID_{field_name} ({raw!r})")
+        val = int(raw)
+    else:
+        raise E4AValidationError(f"BLOCKED: INVALID_{field_name} ({raw!r})")
+    if val < min_value:
+        kind = "NEGATIVE" if val < 0 else "NONPOSITIVE"
+        raise E4AValidationError(f"BLOCKED: {kind}_{field_name} ({val})")
+    return val
 
 
 def _parse_iso_utc(raw: Optional[str]) -> Optional[datetime]:
@@ -232,8 +251,24 @@ async def _validate_e4a_quote_timing_and_expiry(
                 f"BLOCKED: STALE_QUOTE_{stage} (age={q_age:.2f}s > {config.MAX_QUOTE_AGE_SECONDS}s)"
             )
 
-    router = str(order_resp.get("router") or "").strip().lower()
-    if router == "jupiterz":
+    raw_router = order_resp.get("router")
+    router = raw_router.strip().lower() if isinstance(raw_router, str) else ""
+    if router in ("metis", "dflow", "okx"):
+        headroom_bh = config.MIN_BLOCK_HEIGHT_HEADROOM
+        if is_live and headroom_bh is None:
+            raise E4AValidationError("BLOCKED: MIN_BLOCK_HEIGHT_HEADROOM_UNSET")
+        if headroom_bh is not None:
+            lvbh = _parse_strict_int(
+                order_resp.get("lastValidBlockHeight"),
+                f"LAST_VALID_BLOCK_HEIGHT_{stage}",
+                min_value=1,
+            )
+            curr_bh = await _fetch_rpc_block_height(config, client)
+            if curr_bh >= lvbh - int(headroom_bh):
+                raise E4AValidationError(
+                    f"BLOCKED: QUOTE_BLOCK_HEIGHT_EXPIRED_{stage} (curr={curr_bh} >= lvbh={lvbh} - {headroom_bh})"
+                )
+    elif router == "jupiterz":
         headroom = config.MIN_RFQ_EXPIRY_HEADROOM_SECONDS
         if is_live and headroom is None:
             raise E4AValidationError("BLOCKED: MIN_RFQ_EXPIRY_HEADROOM_SECONDS_UNSET")
@@ -243,25 +278,8 @@ async def _validate_e4a_quote_timing_and_expiry(
                 raise E4AValidationError(f"BLOCKED: MISSING_OR_INVALID_EXPIRE_AT_{stage}")
             if check_now.timestamp() >= exp_dt.timestamp() - float(headroom or 0.0):
                 raise E4AValidationError(f"BLOCKED: QUOTE_EXPIRED_RFQ_{stage}")
-    elif router in ("metis", "dflow", "okx") or config.MIN_BLOCK_HEIGHT_HEADROOM is not None or is_live:
-        headroom_bh = config.MIN_BLOCK_HEIGHT_HEADROOM
-        if is_live and headroom_bh is None:
-            raise E4AValidationError("BLOCKED: MIN_BLOCK_HEIGHT_HEADROOM_UNSET")
-        if headroom_bh is not None:
-            lvbh_raw = order_resp.get("lastValidBlockHeight")
-            if isinstance(lvbh_raw, bool) or lvbh_raw is None:
-                raise E4AValidationError(f"BLOCKED: MISSING_LAST_VALID_BLOCK_HEIGHT_{stage}")
-            try:
-                lvbh = int(lvbh_raw)
-            except (ValueError, TypeError) as exc:
-                raise E4AValidationError(f"BLOCKED: INVALID_LAST_VALID_BLOCK_HEIGHT_{stage}") from exc
-            if lvbh <= 0:
-                raise E4AValidationError(f"BLOCKED: NONPOSITIVE_LAST_VALID_BLOCK_HEIGHT_{stage}")
-            curr_bh = await _fetch_rpc_block_height(config, client)
-            if curr_bh >= lvbh - int(headroom_bh):
-                raise E4AValidationError(
-                    f"BLOCKED: QUOTE_BLOCK_HEIGHT_EXPIRED_{stage} (curr={curr_bh} >= lvbh={lvbh} - {headroom_bh})"
-                )
+    elif is_live:
+        raise E4AValidationError(f"BLOCKED: UNSUPPORTED_OR_MISSING_ROUTER_{stage} ({raw_router!r})")
 
 
 async def _validate_e4a_quote_receipt(
@@ -290,15 +308,12 @@ async def _validate_e4a_quote_receipt(
     # Slippage validation (preserve RTSE; validate response slippageBps if present/configured)
     if config.MAX_ACCEPTED_SLIPPAGE_BPS is not None:
         raw_slip = order_resp.get("slippageBps")
-        if raw_slip is None or isinstance(raw_slip, bool):
+        if raw_slip is None:
             if is_live:
                 raise E4AValidationError("BLOCKED: MISSING_RESPONSE_SLIPPAGE_BPS")
         else:
-            try:
-                slip_bps = int(raw_slip)
-            except (ValueError, TypeError) as exc:
-                raise E4AValidationError(f"BLOCKED: INVALID_RESPONSE_SLIPPAGE_BPS ({raw_slip!r})") from exc
-            if slip_bps < 0 or slip_bps > int(config.MAX_ACCEPTED_SLIPPAGE_BPS):
+            slip_bps = _parse_strict_int(raw_slip, "RESPONSE_SLIPPAGE_BPS", min_value=0)
+            if slip_bps > int(config.MAX_ACCEPTED_SLIPPAGE_BPS):
                 raise E4AValidationError(
                     f"BLOCKED: EXCESSIVE_SLIPPAGE_BPS ({slip_bps} > {config.MAX_ACCEPTED_SLIPPAGE_BPS})"
                 )
@@ -335,26 +350,27 @@ async def _validate_e4a_quote_receipt(
                 f"BLOCKED: EXCESSIVE_NEGATIVE_ENTRY_DRIFT ({entry_drift_pct:.4f}% < -{config.MAX_NEGATIVE_ENTRY_DRIFT_PCT}%)"
             )
 
-        oat_raw = order_resp.get("otherAmountThreshold")
-        if oat_raw is not None and not isinstance(oat_raw, bool):
-            try:
-                oat_int = int(oat_raw)
-            except (ValueError, TypeError) as exc:
-                raise E4AValidationError(f"BLOCKED: INVALID_OTHER_AMOUNT_THRESHOLD ({oat_raw!r})") from exc
-            if oat_int <= 0:
-                raise E4AValidationError(f"BLOCKED: NONPOSITIVE_OTHER_AMOUNT_THRESHOLD ({oat_int})")
-            wc_tokens = oat_int / (10 ** order.token_decimals)
-            wc_price_native = spent_sol / wc_tokens
-            wc_drift_pct = ((wc_price_native - order.approval_price_native) / order.approval_price_native) * 100.0
-            wc_limit = (
-                float(config.MAX_WORST_CASE_ENTRY_DRIFT_PCT)
-                if config.MAX_WORST_CASE_ENTRY_DRIFT_PCT is not None
-                else (float(config.MAX_ENTRY_PRICE_DRIFT_PCT) if config.MAX_ENTRY_PRICE_DRIFT_PCT is not None else None)
+        oat_int = _parse_strict_int(
+            order_resp.get("otherAmountThreshold"),
+            "OTHER_AMOUNT_THRESHOLD",
+            min_value=1,
+        )
+        if oat_int > out_amount:
+            raise E4AValidationError(
+                f"BLOCKED: INCONSISTENT_OTHER_AMOUNT_THRESHOLD ({oat_int} > {out_amount})"
             )
-            if wc_limit is not None and wc_drift_pct > wc_limit:
-                raise E4AValidationError(
-                    f"BLOCKED: EXCESSIVE_WORST_CASE_DRIFT ({wc_drift_pct:.4f}% > {wc_limit}%)"
-                )
+        wc_tokens = oat_int / (10 ** order.token_decimals)
+        wc_price_native = spent_sol / wc_tokens
+        wc_drift_pct = ((wc_price_native - order.approval_price_native) / order.approval_price_native) * 100.0
+        wc_limit = (
+            float(config.MAX_WORST_CASE_ENTRY_DRIFT_PCT)
+            if config.MAX_WORST_CASE_ENTRY_DRIFT_PCT is not None
+            else (float(config.MAX_ENTRY_PRICE_DRIFT_PCT) if config.MAX_ENTRY_PRICE_DRIFT_PCT is not None else None)
+        )
+        if wc_limit is not None and wc_drift_pct > wc_limit:
+            raise E4AValidationError(
+                f"BLOCKED: EXCESSIVE_WORST_CASE_DRIFT ({wc_drift_pct:.4f}% > {wc_limit}%)"
+            )
 
 
 async def fetch_live_wallet_sol_balance(
@@ -624,7 +640,6 @@ async def executor_node(
                 amount_atomic=order.amount_atomic, config=config, client=client, taker=taker,
             )
             quote_received_at = utc_now()
-            out_amount = int(order_resp["outAmount"])
         except Exception as exc:
             if not is_buy and config.EXECUTION_MODE != "live":
                 fb_sol = float(existing_for_fallback.get("current_sol_value") or existing_for_fallback.get("entry_sol") or 0.0) if isinstance(existing_for_fallback, dict) else 0.0
@@ -634,9 +649,9 @@ async def executor_node(
                 logger.warning("[Executor] Jupiter quote failed on %s %s (%s); falling back to live SOL quote %.4f", order.side, order.symbol, exc, fb_sol)
                 order_resp = {"outAmount": str(max(1, int(round(fb_sol * LAMPORTS_PER_SOL)))), "transaction": None}
                 quote_received_at = utc_now()
-                out_amount = int(order_resp["outAmount"])
             else:
                 raise
+        out_amount = _parse_strict_int(order_resp.get("outAmount"), "OUT_AMOUNT", min_value=1)
         # Checkpoint 1: Quote receipt validation (out_amount > 0 in all modes, plus E4A drift/impact/slippage/expiry)
         await _validate_e4a_quote_receipt(
             order, order_resp, out_amount, config, quote_received_at=quote_received_at, client=client,
@@ -665,9 +680,9 @@ async def executor_node(
             if is_buy:
                 intent_id = uuid.uuid4().hex
                 lvbh_raw = order_resp.get("lastValidBlockHeight")
-                lvbh_val = int(lvbh_raw) if lvbh_raw is not None and not isinstance(lvbh_raw, bool) else None
+                lvbh_val = _parse_strict_int(lvbh_raw, "LAST_VALID_BLOCK_HEIGHT", min_value=1) if lvbh_raw is not None else None
                 oat_raw = order_resp.get("otherAmountThreshold")
-                oat_val = int(oat_raw) if oat_raw is not None and not isinstance(oat_raw, bool) else None
+                oat_val = _parse_strict_int(oat_raw, "OTHER_AMOUNT_THRESHOLD", min_value=1) if oat_raw is not None else None
                 db.create_order_intent(
                     intent_id=intent_id,
                     reservation_id=reservation_id,

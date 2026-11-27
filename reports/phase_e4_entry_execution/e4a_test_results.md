@@ -1,7 +1,7 @@
 # Phase E4A Test Results
 
 - **Branch:** `impl/e4a-approval-quote-integrity`
-- **Baseline:** `f7c04c27279524fe12f442236df3be205a65718b`
+- **Baseline:** `f7c04c27279524fe12f442236df3be205a65718b` (corrective pass parent `0688fb704aedfb75f3bac329f52064d7af9a9aae`)
 
 ## 1. Focused Suites (`E4A`, `E4C`, `E4D`, `E2B`, `E3A`)
 
@@ -10,14 +10,15 @@ Command:
 venv/bin/pytest -q tests/test_e4a_approval_quote_integrity.py tests/test_e4c_reservation_risk.py tests/test_e4d_transaction_reconciliation.py tests/test_e2b_fee_accounting.py tests/test_e3a_candle_eligibility.py
 ```
 
-Result: **`43 passed in 3.08s`**
+Result: **`44 passed in 3.48s`**
 
-### `tests/test_e4a_approval_quote_integrity.py` (5 tests)
+### `tests/test_e4a_approval_quote_integrity.py` (6 tests)
 1. `test_e4a_alpha_node_selects_exact_pinned_pool_price_and_decimals` — PASSED
 2. `test_e4a_approval_provenance_rejects_wrong_pool_invalid_price_decimals_and_stale` — PASSED
 3. `test_e4a_live_fails_closed_when_thresholds_unset_and_paper_rejects_zero_out_amount` — PASSED
 4. `test_e4a_quote_receipt_rejects_slippage_impact_drift_worst_case_and_expiry_headroom` — PASSED
-5. `test_e4a_pre_sign_and_pre_submit_recheck_expiry_and_release_reservation_cleanly` — PASSED
+5. `test_e4a_quote_age_enforced_at_all_three_checkpoints` — PASSED
+6. `test_e4a_corrective_strict_parsing_missing_oat_and_router_allowlist` — PASSED
 
 ## 2. Full Test Suite
 
@@ -26,7 +27,7 @@ Command:
 venv/bin/pytest -q tests/
 ```
 
-Result: **`192 passed, 3 failed in 31.80s`**
+Result: **`193 passed, 3 failed in 31.44s`**
 
 ### Pre-Existing E1 Baseline Failures (Unchanged, 3 total)
 1. `tests/test_insider_scanner.py::test_unconditional_hard_stop_loss_on_leg2_reentry_chart_and_whale_positions_at_minus_11_75_pct`
@@ -34,9 +35,3 @@ Result: **`192 passed, 3 failed in 31.80s`**
 3. `tests/test_soak_readiness.py::test_signal_and_telemetry_completeness_mc_usd_exact_quote_and_live_momentum_cache`
 
 Zero regressions introduced across all other tests.
-
-## 3. Existing Test Fixture Adjustments for E4A Fail-Closed Behavior
-- `tests/test_e4c_reservation_risk.py`: Set `_mk_buy_order(..., strategy="SCALPER")` default for E4C reservation/concurrency unit tests so live-mode E4C tests without E4A thresholds do not trip `E4A_LIVE_THRESHOLDS_UNSET`.
-- `tests/test_e4d_transaction_reconciliation.py`: Set `_mk_buy_order(..., strategy="SCALPER")` for the live E4D pre-broadcast intent persistence test.
-- `tests/test_e2b_fee_accounting.py`: Parameterized `_mk_paper_buy_order(..., strategy=...)` and passed `strategy="SCALPER"` in the two live-mode unknown-fee tests.
-- `tests/test_e3a_candle_eligibility.py`: Restricted the mock 1m OHLCV counter in `test_t6a_and_t6b_12_raw_11_closed_5m_triggers_1m_fallback_only_when_allowed` to `request.url.params.get("aggregate") == "1"` so E4A's post-approval DexScreener/Jupiter lookups are not miscounted as 1m OHLCV fetches.

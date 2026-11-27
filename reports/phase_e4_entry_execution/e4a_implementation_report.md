@@ -54,3 +54,9 @@ Added 10 optional `Field(default=None, ...)` settings to `AgentConfig`:
 ## Artifacts
 - Full diff: [e4a_full_diff.patch](file:///home/tmalone1250/ToshibaDrive/Dev/Web3_Dev/solana-trading-agent/reports/phase_e4_entry_execution/e4a_full_diff.patch)
 - Test results: [e4a_test_results.md](file:///home/tmalone1250/ToshibaDrive/Dev/Web3_Dev/solana-trading-agent/reports/phase_e4_entry_execution/e4a_test_results.md)
+
+## E4A Corrective Pass (from `0688fb704aedfb75f3bac329f52064d7af9a9aae`)
+- **Fail closed when `otherAmountThreshold` is missing or inconsistent:** In `executor_node.py` (`_validate_e4a_quote_receipt`), when E4A entry-drift validation is active, `otherAmountThreshold` is required and strictly parsed (`_parse_strict_int(..., min_value=1)`), and any `otherAmountThreshold > out_amount` is rejected (`INCONSISTENT_OTHER_AMOUNT_THRESHOLD`).
+- **Strict atomic/integer parsing:** Added `_parse_strict_int` in `executor_node.py` (rejecting `None`, `bool`, `float`, fractional/scientific strings, empty/whitespace strings, and out-of-range values) and applied it to `outAmount` (outside the paper-SELL fallback `try/except`, rejecting malformed `outAmount` in both paper and live modes), `otherAmountThreshold`, `lastValidBlockHeight`, and `slippageBps`.
+- **Explicit router allowlist & expiry handling:** In `_validate_e4a_quote_timing_and_expiry`, `metis`/`dflow`/`okx` route to RPC `getBlockHeight` + `lastValidBlockHeight` headroom, `jupiterz` routes to `expireAt` RFQ headroom, and missing, empty, malformed, or unsupported router identifiers fail closed in live mode (`UNSUPPORTED_OR_MISSING_ROUTER_<STAGE>`) without falling into the block-height branch.
+- **Regression coverage:** Added `test_e4a_corrective_strict_parsing_missing_oat_and_router_allowlist` in `tests/test_e4a_approval_quote_integrity.py`. Only `executor_node.py`, `tests/test_e4a_approval_quote_integrity.py`, and E4A report artifacts were modified in this corrective pass.
