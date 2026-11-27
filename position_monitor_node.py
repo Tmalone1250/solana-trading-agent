@@ -20,6 +20,7 @@ from chart_exit_engine import (
     PRIO_PARTIAL_TP,
     compute_exodus,
     evaluate_chart_position_exit,
+    evaluate_exodus_signal,
     pos_matches,
 )
 from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
@@ -262,8 +263,9 @@ async def position_monitor_node(
         pos, current_sol_value=current_sol_value, flow=flow, lane_label="watch_reentry", used_exact_quote=used_watch_q,
     )
     total_5m = buys_5m + sells_5m
+    now_dt = now or utc_now()
     w_flow_ok, w_liq_ok, w_obs_liq = _resolve_exodus_observation_inputs(flow, pos, current_liq)
-    is_exodus, sell_ratio_5m, _, exodus_reason = compute_exodus(
+    w_ex_eval = evaluate_exodus_signal(
         buys_5m=buys_5m if w_flow_ok else None,
         sells_5m=sells_5m if w_flow_ok else None,
         entry_liquidity_usd=pos.entry_liquidity_usd,
@@ -271,14 +273,24 @@ async def position_monitor_node(
         config=config,
         flow_available=w_flow_ok,
         liq_available=w_liq_ok,
+        opened_at=pos.opened_at,
+        now_dt=now_dt,
+        enforce_warmup=True,
+        confirm_count=pos.exodus_confirm_count,
+        last_confirmed_at=pos.exodus_last_confirmed_at,
+        enforce_confirmation=True,
     )
+    is_exodus = w_ex_eval.triggered
+    exodus_reason = w_ex_eval.detail
     if w_flow_ok:
-        pos.last_5m_sell_ratio = sell_ratio_5m
+        pos.last_5m_sell_ratio = w_ex_eval.sell_ratio_5m
+    pos.exodus_confirm_count = w_ex_eval.confirm_count
+    pos.exodus_last_confirmed_at = w_ex_eval.last_confirmed_at
+    pos.last_exodus_status = w_ex_eval.status
 
     # =========================================================================
     # STATE 3: WATCHING_REENTRY
     # =========================================================================
-    now_dt = now or utc_now()
     run_peak = pos.run_peak_sol or pos.peak_sol_value or current_sol_value
     retrace_low = pos.retrace_low_sol if pos.retrace_low_sol is not None else current_sol_value
     if current_sol_value < retrace_low:

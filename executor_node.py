@@ -444,6 +444,7 @@ async def executor_node(
             watch_pos = ActivePosition(
                 mint=order.mint, symbol=order.symbol, entry_sol=entry_sol, token_amount=0,
                 pair_address=pos_pair_address, dex_id=pos_dex_id,
+                opened_at=pos_opened_at,
                 strategy=pos_strategy, entry_liquidity_usd=prev_liq, current_sol_value=received_sol,
                 peak_sol_value=prev_peak, breakeven_armed=False, trail_armed=False,
                 retrace_low_sol=received_sol, run_peak_sol=prev_peak, watch_started_at=utc_now_iso(),
