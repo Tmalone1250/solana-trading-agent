@@ -28,6 +28,7 @@ from ohlcv_client import (
 from scalper_entry_engine import evaluate_scalper_entry
 from state import FocusState
 from tests.test_breakout_ignition import _make_breakout_candles, _strong_flow_pair
+from tests.test_e3b_cache_provenance import make_verified_ohlcv_result
 
 
 class _StubDecisionClient:
@@ -51,7 +52,8 @@ def test_t1_forming_5m_candle_dropped_and_blocks_breakout():
     # 150s into the last 5m bar -> forming!
     decision_ts = last_ts + 150.0
     res = evaluate_scalper_entry(
-        candles, _strong_flow_pair(1.12), time_in_slot_min=5.0, decision_timestamp=decision_ts
+        candles, _strong_flow_pair(1.12), time_in_slot_min=5.0, decision_timestamp=decision_ts,
+        ohlcv_provenance=make_verified_ohlcv_result(candles, last_ok_at=decision_ts),
     )
     assert res.eligible is False
     assert res.setup_type != "BREAKOUT_IGNITION"
@@ -69,6 +71,7 @@ def test_t2_forming_1m_candle_dropped_and_blocks_breakout():
         time_in_slot_min=5.0,
         candles_1m=bars_1m,
         decision_timestamp=decision_ts,
+        ohlcv_provenance=make_verified_ohlcv_result(bars_1m, last_ok_at=decision_ts),
     )
     assert res.eligible is False
     assert res.setup_type == "NONE"
@@ -78,22 +81,26 @@ def test_t2_forming_1m_candle_dropped_and_blocks_breakout():
 
 def test_t3a_exact_interval_boundary_is_eligible():
     candles_5m = _make_breakout_candles(count=18, bar_seconds=300)
+    t_5m = candles_5m[-1]["timestamp"] + 300.0
     res_5m = evaluate_scalper_entry(
         candles_5m,
         _strong_flow_pair(1.12),
         time_in_slot_min=5.0,
-        decision_timestamp=candles_5m[-1]["timestamp"] + 300.0,
+        decision_timestamp=t_5m,
+        ohlcv_provenance=make_verified_ohlcv_result(candles_5m, last_ok_at=t_5m),
     )
     assert res_5m.eligible is True
     assert res_5m.setup_type == "BREAKOUT_IGNITION"
 
     candles_1m = _make_breakout_candles(count=20, bar_seconds=60)
+    t_1m = candles_1m[-1]["timestamp"] + 60.0
     res_1m = evaluate_scalper_entry(
         [],
         _strong_flow_pair(1.12),
         time_in_slot_min=5.0,
         candles_1m=candles_1m,
-        decision_timestamp=candles_1m[-1]["timestamp"] + 60.0,
+        decision_timestamp=t_1m,
+        ohlcv_provenance=make_verified_ohlcv_result(candles_1m, last_ok_at=t_1m),
     )
     assert res_1m.eligible is True
     assert res_1m.setup_type == "BREAKOUT_IGNITION"
@@ -101,22 +108,26 @@ def test_t3a_exact_interval_boundary_is_eligible():
 
 def test_t3b_one_second_before_close_is_ineligible():
     candles_5m = _make_breakout_candles(count=18, bar_seconds=300)
+    t_5m = candles_5m[-1]["timestamp"] + 299.0
     res_5m = evaluate_scalper_entry(
         candles_5m,
         _strong_flow_pair(1.12),
         time_in_slot_min=5.0,
-        decision_timestamp=candles_5m[-1]["timestamp"] + 299.0,
+        decision_timestamp=t_5m,
+        ohlcv_provenance=make_verified_ohlcv_result(candles_5m, last_ok_at=t_5m),
     )
     assert res_5m.eligible is False
     assert res_5m.setup_type != "BREAKOUT_IGNITION"
 
     candles_1m = _make_breakout_candles(count=20, bar_seconds=60)
+    t_1m = candles_1m[-1]["timestamp"] + 59.0
     res_1m = evaluate_scalper_entry(
         [],
         _strong_flow_pair(1.12),
         time_in_slot_min=5.0,
         candles_1m=candles_1m,
-        decision_timestamp=candles_1m[-1]["timestamp"] + 59.0,
+        decision_timestamp=t_1m,
+        ohlcv_provenance=make_verified_ohlcv_result(candles_1m, last_ok_at=t_1m),
     )
     assert res_1m.eligible is False
     assert res_1m.setup_type == "NONE"
@@ -125,11 +136,13 @@ def test_t3b_one_second_before_close_is_ineligible():
 def test_t4_stale_but_closed_candles_retained_by_closed_filter():
     candles_5m = _make_breakout_candles(count=18, bar_seconds=300)
     # 900s after last bar start (600s after close) -> still closed
+    t_5m = candles_5m[-1]["timestamp"] + 900.0
     res = evaluate_scalper_entry(
         candles_5m,
         _strong_flow_pair(1.12),
         time_in_slot_min=5.0,
-        decision_timestamp=candles_5m[-1]["timestamp"] + 900.0,
+        decision_timestamp=t_5m,
+        ohlcv_provenance=make_verified_ohlcv_result(candles_5m, last_ok_at=t_5m),
     )
     assert res.eligible is True
     assert res.setup_type == "BREAKOUT_IGNITION"
@@ -293,6 +306,7 @@ async def test_t6d_preattached_5m_only_candidate_makes_no_1m_network_request(tmp
         "pair_address": "PoolPre111111111111111111111111111111111111",
         "added_at": datetime.fromtimestamp(decision_ts - 360.0, tz=timezone.utc).isoformat(),
         "candles_5m": short_5m,
+        "_ohlcv_5m_result": make_verified_ohlcv_result(short_5m, last_ok_at=decision_ts),
         **_strong_flow_pair(1.12),
     }
     state = {"focus_state": FocusState.SCANNING.value, "sol_balance": 0.7, "safe_candidates": [cand]}
@@ -309,7 +323,7 @@ async def test_t6d_preattached_5m_only_candidate_makes_no_1m_network_request(tmp
 
     assert net_calls["count"] == 0
     assert out["alpha_decisions"][0]["approved"] is False
-    assert "insufficient 5m candles" in out["alpha_decisions"][0]["rationale"]
+    assert "ineligible OHLCV source (unavailable)" in out["alpha_decisions"][0]["rationale"]
     db.close()
 
 
@@ -329,7 +343,8 @@ def test_t7_diagnostic_gap_does_not_reject_valid_closed_candles():
     assert gap_diag["max_recent_gap_seconds"] == 900.0
 
     res = evaluate_scalper_entry(
-        candles, _strong_flow_pair(1.12), time_in_slot_min=5.0, decision_timestamp=decision_ts
+        candles, _strong_flow_pair(1.12), time_in_slot_min=5.0, decision_timestamp=decision_ts,
+        ohlcv_provenance=make_verified_ohlcv_result(candles, last_ok_at=decision_ts),
     )
     assert "insufficient 5m candles" not in (res.rejection_reason or "")
     assert res.eligible is True

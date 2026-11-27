@@ -156,13 +156,14 @@ async def test_e1_pool_identity_full_lifecycle_watchlist_partial_and_final_settl
     dex_id = "pumpswap"
 
     # 1. Watchlist persistence preserves (pair_address, dex_id) and refuses silent overwrite
+    c_life = _make_breakout_candles(18)
     cand = {
         "mint": MINT_LIFE,
         "symbol": "PLIFE",
         "pair_address": POOL_PINNED,
         "dex_id": dex_id,
         "added_at": (now_dt - timedelta(minutes=5)).isoformat(),
-        "candles_5m": _make_breakout_candles(18),
+        "candles_5m": c_life,
         **_strong_flow_pair(),
     }
     db.upsert_watchlist_entry(
@@ -182,7 +183,12 @@ async def test_e1_pool_identity_full_lifecycle_watchlist_partial_and_final_settl
 
     # 2 & 3 (M-3). Even if refreshed candidate disagrees with pinned watchlist (POOL_COMPETING, raydium),
     # alpha_node preserves atomic watchlist tuple (POOL_PINNED, pumpswap) without mixing DEX IDs.
-    drifted_cand = {**cand, "pair_address": POOL_COMPETING, "dex_id": "raydium"}
+    drifted_cand = {
+        **cand,
+        "pair_address": POOL_COMPETING,
+        "dex_id": "raydium",
+        "_ohlcv_5m_result": __import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(c_life, last_ok_at=now_dt.timestamp()),
+    }
     out_alpha = await alpha_node(
         {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "safe_candidates": [drifted_cand]},
         config=cfg, db=db, decision_client=_StubDecision(_buy_decision_answers()), now=now_dt,  # type: ignore[arg-type]
@@ -286,12 +292,14 @@ async def test_e1_missing_or_invalid_pair_address_rejects_breakout_ignition(tmp_
     for bad_pair in ("", "   ", "unknown", "!!!!", "https://bad.url", "PoolNotBase58", MINT_NOPOOL):
         clear_narrative_cache()
         assert not is_valid_pool_address(bad_pair, mint=MINT_NOPOOL)
+        c_bad = _make_breakout_candles(18)
         cand = {
             "mint": MINT_NOPOOL,
             "symbol": "NOPOOL",
             "pair_address": bad_pair,
             "added_at": (now_dt - timedelta(minutes=5)).isoformat(),
-            "candles_5m": _make_breakout_candles(18),
+            "candles_5m": c_bad,
+            "_ohlcv_5m_result": __import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(c_bad, last_ok_at=now_dt.timestamp()),
             **_strong_flow_pair(),
         }
         out = await alpha_node(

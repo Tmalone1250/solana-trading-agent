@@ -224,6 +224,7 @@ async def test_scanner_merges_x_mints_and_alpha_injects_x_snippets_and_telemetry
         cand,
         added_at=(now_dt - timedelta(minutes=5)).isoformat(),
         candles_5m=make_sweep_reclaim_candles(),
+        _ohlcv_5m_result=__import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(make_sweep_reclaim_candles(), last_ok_at=now_dt.timestamp()),
     )
     dec = StubDecisionClient(
         {

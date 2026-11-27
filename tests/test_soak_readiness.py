@@ -365,7 +365,16 @@ async def test_signal_and_telemetry_completeness_mc_usd_exact_quote_and_live_mom
     out_t1 = await alpha_node({"focus_state": FocusState.SCANNING.value, "sol_balance": 1.50, "safe_candidates": [cand_t1]}, config=cfg, db=db, decision_client=dec_client, now=now_dt)  # type: ignore[arg-type]
     assert dec_client.decide_calls == 1 and out_t1["pending_order"] is None
 
-    cand_t2 = {**cand_t1, "market_cap_usd": 485_000.0, "volume_5m_usd": 18_000.0, "price_change_5m_pct": 8.5, "buys_5m": 34, "sells_5m": 10, "candles_5m": make_sweep_reclaim_candles()}
+    cand_t2 = {
+        **cand_t1,
+        "market_cap_usd": 485_000.0,
+        "volume_5m_usd": 18_000.0,
+        "price_change_5m_pct": 8.5,
+        "buys_5m": 34,
+        "sells_5m": 10,
+        "candles_5m": make_sweep_reclaim_candles(),
+        "_ohlcv_5m_result": __import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(make_sweep_reclaim_candles(), last_ok_at=(now_dt + timedelta(seconds=30)).timestamp()),
+    }
     out_t2 = await alpha_node({"focus_state": FocusState.SCANNING.value, "sol_balance": 1.50, "safe_candidates": [cand_t2]}, config=cfg, db=db, decision_client=dec_client, now=now_dt + timedelta(seconds=30))  # type: ignore[arg-type]
     assert dec_client.decide_calls == 1 and out_t2["pending_order"] is not None
     assert out_t2["pending_order"]["side"] == "BUY" and out_t2["pending_order"]["entry_mc_usd"] == 485_000.0

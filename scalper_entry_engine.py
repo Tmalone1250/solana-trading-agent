@@ -13,6 +13,7 @@ from breakout_ignition import (
     validate_decision_timestamp,
 )
 from config import VALID_CHART_STRATEGIES, AgentConfig
+from ohlcv_client import OhlcvFetchResult, evaluate_ohlcv_provenance
 
 
 class ScalperEntryResult(BaseModel):
@@ -175,6 +176,7 @@ def evaluate_scalper_entry(
     config: Optional[AgentConfig] = None,
     candles_1m: Optional[Sequence[Any]] = None,
     decision_timestamp: Optional[float] = None,
+    ohlcv_provenance: Optional[OhlcvFetchResult] = None,
 ) -> ScalperEntryResult:
     """Run all 4 deterministic gates of the Scalper Expert Entry Engine (+ BREAKOUT_IGNITION)."""
     ref_ts, ts_err = validate_decision_timestamp(decision_timestamp)
@@ -183,6 +185,17 @@ def evaluate_scalper_entry(
             eligible=False,
             setup_type="NONE",
             rejection_reason=ts_err or "invalid decision_timestamp",
+        )
+
+    cache_ttl = float(config.OHLCV_CACHE_SECONDS) if config is not None else 90.0
+    prov_ok, prov_err = evaluate_ohlcv_provenance(
+        ohlcv_provenance, decision_timestamp=ref_ts, max_cache_age_seconds=cache_ttl
+    )
+    if not prov_ok:
+        return ScalperEntryResult(
+            eligible=False,
+            setup_type="NONE",
+            rejection_reason=prov_err or "ineligible OHLCV provenance",
         )
 
     min_soak = config.MIN_WATCHLIST_SOAK_MINUTES if config else 3.0

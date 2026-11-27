@@ -35,6 +35,7 @@ class MockDecisionClient:
 
 @pytest.mark.asyncio
 async def test_alpha_node_single_batched_decision_1_call(tmp_path):
+    from tests.test_e3b_cache_provenance import make_verified_ohlcv_result
     from tests.test_scalper_entry_engine import make_sweep_reclaim_candles
 
     db = AgentDatabase(db_path=str(tmp_path / "alpha.duckdb"), starting_sol=0.7)
@@ -42,6 +43,7 @@ async def test_alpha_node_single_batched_decision_1_call(tmp_path):
     soaked_added = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
     valid_candles = make_sweep_reclaim_candles()
 
+    now_ts = datetime.now(timezone.utc).timestamp()
     candidates = [
         {
             "mint": "MintVamp11111111111111111111111111111111111",
@@ -51,6 +53,7 @@ async def test_alpha_node_single_batched_decision_1_call(tmp_path):
             "sells_5m": 10,
             "added_at": soaked_added,
             "candles_5m": valid_candles,
+            "_ohlcv_5m_result": make_verified_ohlcv_result(valid_candles, last_ok_at=now_ts),
         },
         {
             "mint": "MintAlpha1111111111111111111111111111111111",
@@ -60,6 +63,7 @@ async def test_alpha_node_single_batched_decision_1_call(tmp_path):
             "sells_5m": 10,
             "added_at": soaked_added,
             "candles_5m": valid_candles,
+            "_ohlcv_5m_result": make_verified_ohlcv_result(valid_candles, last_ok_at=now_ts),
         },
     ]
     mock_answers = {

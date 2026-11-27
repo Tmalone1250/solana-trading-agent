@@ -303,6 +303,7 @@ async def test_jupiter_is_sus_rejected_at_scanner_and_safety_gate(tmp_path):
         cand,
         added_at=(now_dt - timedelta(minutes=5)).isoformat(),
         candles_5m=make_sweep_reclaim_candles(),
+        _ohlcv_5m_result=__import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(make_sweep_reclaim_candles(), last_ok_at=now_dt.timestamp()),
     )
     dec = StubDecisionClient(
         {

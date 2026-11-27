@@ -25,9 +25,11 @@ from db import AgentDatabase, utc_now
 from decision_client import GeminiDecisionClient
 from narrative_cache import get_cached_narrative, put_cached_narrative
 from ohlcv_client import (
+    OhlcvFetchResult,
     cache_breakout_telemetry,
-    fetch_ohlcv_1m_batch,
-    fetch_ohlcv_batch,
+    fetch_ohlcv_1m_batch_with_provenance,
+    fetch_ohlcv_batch_with_provenance,
+    select_ohlcv_interval_provenance,
     should_fetch_1m_fallback,
 )
 from outcome_tracker import record_outcome_snapshot
@@ -125,16 +127,28 @@ async def alpha_node(
             if p_addr:
                 pairs_to_fetch.append(p_addr)
 
-    ohlcv_by_pair: dict[str, list[dict[str, float]]] = {}
-    ohlcv_1m_by_pair: dict[str, list[dict[str, float]]] = {}
+    ohlcv_by_pair: dict[str, OhlcvFetchResult] = {}
+    ohlcv_1m_by_pair: dict[str, OhlcvFetchResult] = {}
     if pairs_to_fetch:
         owns_client = http_client is None
         client = http_client or httpx.AsyncClient()
         try:
-            ohlcv_by_pair = await fetch_ohlcv_batch(pairs_to_fetch, config, client, now_ts=now_dt.timestamp())
-            short_pairs = [p for p in pairs_to_fetch if should_fetch_1m_fallback(p, ohlcv_by_pair.get(p) or [], now_ts=now_dt.timestamp())]
+            ohlcv_by_pair = await fetch_ohlcv_batch_with_provenance(
+                pairs_to_fetch, config, client, now_ts=now_dt.timestamp()
+            )
+            short_pairs = [
+                p
+                for p in pairs_to_fetch
+                if should_fetch_1m_fallback(
+                    p,
+                    (ohlcv_by_pair[p].candles if p in ohlcv_by_pair else []),
+                    now_ts=now_dt.timestamp(),
+                )
+            ]
             if short_pairs:
-                ohlcv_1m_by_pair = await fetch_ohlcv_1m_batch(short_pairs, config, client, now_ts=now_dt.timestamp())
+                ohlcv_1m_by_pair = await fetch_ohlcv_1m_batch_with_provenance(
+                    short_pairs, config, client, now_ts=now_dt.timestamp()
+                )
         finally:
             if owns_client:
                 await client.aclose()
@@ -153,11 +167,49 @@ async def alpha_node(
         soak_minutes_list.append(round(time_in_slot_min, 2))
 
         p_addr = str(cand.get("pair_address") or (watchlist_by_mint.get(cand["mint"]) or {}).get("pair_address") or "")
-        candles_5m = cand.get("candles_5m") if cand.get("candles_5m") is not None else ohlcv_by_pair.get(p_addr, [])
-        candles_1m = cand.get("candles_1m")
-        if candles_1m is None:
-            candles_1m = ohlcv_1m_by_pair.get(p_addr, [])
+        unavail = OhlcvFetchResult(candles=[], source="unavailable", fetched_at=None, last_ok_at=None, last_status=None)
+        if cand.get("candles_5m") is not None:
+            candles_5m = cand["candles_5m"]
+            raw_5m_prov = cand.get("_ohlcv_5m_result")
+            res_5m = (
+                raw_5m_prov
+                if isinstance(raw_5m_prov, OhlcvFetchResult)
+                else OhlcvFetchResult(
+                    candles=list(candles_5m) if isinstance(candles_5m, list) else [],
+                    source="pre_attached_unknown",
+                    fetched_at=None,
+                    last_ok_at=None,
+                    last_status=None,
+                )
+            )
+        else:
+            res_5m = ohlcv_by_pair.get(p_addr, unavail)
+            candles_5m = res_5m.candles
 
+        if cand.get("candles_1m") is not None:
+            candles_1m = cand["candles_1m"]
+            raw_1m_prov = cand.get("_ohlcv_1m_result")
+            res_1m = (
+                raw_1m_prov
+                if isinstance(raw_1m_prov, OhlcvFetchResult)
+                else OhlcvFetchResult(
+                    candles=list(candles_1m) if isinstance(candles_1m, list) else [],
+                    source="pre_attached_unknown",
+                    fetched_at=None,
+                    last_ok_at=None,
+                    last_status=None,
+                )
+            )
+        else:
+            res_1m = ohlcv_1m_by_pair.get(p_addr, unavail)
+            candles_1m = res_1m.candles
+
+        active_prov, prov_ok, _ = select_ohlcv_interval_provenance(
+            res_5m,
+            res_1m,
+            decision_timestamp=now_dt.timestamp(),
+            max_cache_age_seconds=float(config.OHLCV_CACHE_SECONDS),
+        )
         sc_entry = evaluate_scalper_entry(
             candles_5m,
             cand,
@@ -165,9 +217,16 @@ async def alpha_node(
             config=config,
             candles_1m=candles_1m,
             decision_timestamp=now_dt.timestamp(),
+            ohlcv_provenance=active_prov,
         )
-        if (candles_5m or candles_1m) and sc_entry.breakout_telemetry:
-            cache_breakout_telemetry(cand["mint"], sc_entry.breakout_telemetry, now_ts=now_dt.timestamp())
+        if prov_ok and (candles_5m or candles_1m) and sc_entry.breakout_telemetry:
+            cache_breakout_telemetry(
+                cand["mint"],
+                sc_entry.breakout_telemetry,
+                ohlcv_source=active_prov.source,
+                ohlcv_last_ok_at=active_prov.last_ok_at,
+                now_ts=now_dt.timestamp(),
+            )
         scalper_results.append(sc_entry)
 
     active_social = db.get_active_social_signals(ttl_minutes=config.X_SIGNAL_TTL_MINUTES, now=now_dt)

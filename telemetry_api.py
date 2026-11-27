@@ -20,7 +20,7 @@ from helius_webhook import (
     verify_helius_auth,
 )
 from insider_scanner import InsiderScanRequest, run_insider_scan
-from ohlcv_client import get_cached_breakout_telemetry
+from ohlcv_client import get_cached_breakout_telemetry_with_meta
 from outcome_tracker import render_outcomes_csv
 
 
@@ -233,10 +233,11 @@ def create_telemetry_app(
             else:
                 a_status = None
                 a_reason = None
+            cached_bt_meta = get_cached_breakout_telemetry_with_meta(sig["mint"], now_ts=now_dt.timestamp())
             resolved_bt = (
                 (dec_info.get("breakout_telemetry") if dec_info else None)
                 or watchlist_bt_by_mint.get(sig["mint"])
-                or get_cached_breakout_telemetry(sig["mint"], now_ts=now_dt.timestamp())
+                or (cached_bt_meta.telemetry if cached_bt_meta is not None else None)
             )
             enriched_signals.append(
                 {
@@ -244,6 +245,19 @@ def create_telemetry_app(
                     "agent_status": a_status,
                     "agent_reason": a_reason,
                     "breakout_telemetry": resolved_bt,
+                    "telemetry_age_seconds": (
+                        cached_bt_meta.data_age_seconds
+                        if cached_bt_meta is not None and resolved_bt == cached_bt_meta.telemetry
+                        else None
+                    ),
+                    "telemetry_source": (
+                        cached_bt_meta.ohlcv_source
+                        if cached_bt_meta is not None and resolved_bt == cached_bt_meta.telemetry
+                        else None
+                    ),
+                    "telemetry_is_historical": bool(
+                        cached_bt_meta is not None and resolved_bt == cached_bt_meta.telemetry and cached_bt_meta.is_historical
+                    ),
                 }
             )
 

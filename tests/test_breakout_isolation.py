@@ -25,6 +25,7 @@ from state import ActivePosition, FocusState, PendingOrder
 from state_ledger import clear_buy_reservations, clear_sell_guard, update_lane_positions_only
 from telemetry_api import create_telemetry_app
 from tests.test_breakout_ignition import _make_breakout_candles, _strong_flow_pair
+from tests.test_e3b_cache_provenance import make_verified_ohlcv_result
 from tests.test_scalper_entry_engine import make_displacement_retest_candles, make_sweep_reclaim_candles
 
 
@@ -74,17 +75,31 @@ def test_evaluator_isolation_rejects_disabled_setups_and_prevents_shadowing():
 
     # 1. Valid BREAKOUT_IGNITION qualifies
     bo_candles = _make_breakout_candles(count=18)
-    bo_res = evaluate_scalper_entry(bo_candles, flow, time_in_slot_min=5.0, config=cfg)
+    bo_t = bo_candles[-1]["timestamp"] + 300.0
+    bo_res = evaluate_scalper_entry(
+        bo_candles, flow, time_in_slot_min=5.0, config=cfg,
+        decision_timestamp=bo_t, ohlcv_provenance=make_verified_ohlcv_result(bo_candles, last_ok_at=bo_t),
+    )
     assert bo_res.eligible is True
     assert bo_res.setup_type == "BREAKOUT_IGNITION"
 
     # 2. Valid SWEEP_RECLAIM is rejected when disabled
-    sr_res = evaluate_scalper_entry(make_sweep_reclaim_candles(), {"buys_5m": 25, "sells_5m": 10}, time_in_slot_min=5.0, config=cfg)
+    sr_c = make_sweep_reclaim_candles()
+    sr_t = sr_c[-1]["timestamp"] + 300.0
+    sr_res = evaluate_scalper_entry(
+        sr_c, {"buys_5m": 25, "sells_5m": 10}, time_in_slot_min=5.0, config=cfg,
+        decision_timestamp=sr_t, ohlcv_provenance=make_verified_ohlcv_result(sr_c, last_ok_at=sr_t),
+    )
     assert sr_res.eligible is False
     assert sr_res.setup_type == "NONE"
 
     # 3. Valid DISPLACEMENT_RETEST is rejected when disabled
-    dr_res = evaluate_scalper_entry(make_displacement_retest_candles(), {"buys_5m": 25, "sells_5m": 10}, time_in_slot_min=5.0, config=cfg)
+    dr_c = make_displacement_retest_candles()
+    dr_t = dr_c[-1]["timestamp"] + 300.0
+    dr_res = evaluate_scalper_entry(
+        dr_c, {"buys_5m": 25, "sells_5m": 10}, time_in_slot_min=5.0, config=cfg,
+        decision_timestamp=dr_t, ohlcv_provenance=make_verified_ohlcv_result(dr_c, last_ok_at=dr_t),
+    )
     assert dr_res.eligible is False
     assert dr_res.setup_type == "NONE"
 
@@ -94,11 +109,19 @@ def test_evaluator_isolation_rejects_disabled_setups_and_prevents_shadowing():
     prior_low = min(c["low"] for c in hybrid_candles[-13:-3])
     hybrid_candles[-2]["low"] = prior_low * 0.99
     hybrid_candles[-2]["close"] = prior_low * 1.005
+    hyb_t = hybrid_candles[-1]["timestamp"] + 300.0
+    hyb_prov = make_verified_ohlcv_result(hybrid_candles, last_ok_at=hyb_t)
     # With default config, SWEEP_RECLAIM shadows BREAKOUT_IGNITION:
-    default_res = evaluate_scalper_entry(hybrid_candles, flow, time_in_slot_min=5.0, config=AgentConfig(_env_file=None))
+    default_res = evaluate_scalper_entry(
+        hybrid_candles, flow, time_in_slot_min=5.0, config=AgentConfig(_env_file=None),
+        decision_timestamp=hyb_t, ohlcv_provenance=hyb_prov,
+    )
     assert default_res.setup_type == "SWEEP_RECLAIM"
     # With BREAKOUT_IGNITION-only config, SWEEP_RECLAIM is skipped and BREAKOUT_IGNITION wins:
-    iso_res = evaluate_scalper_entry(hybrid_candles, flow, time_in_slot_min=5.0, config=cfg)
+    iso_res = evaluate_scalper_entry(
+        hybrid_candles, flow, time_in_slot_min=5.0, config=cfg,
+        decision_timestamp=hyb_t, ohlcv_provenance=hyb_prov,
+    )
     assert iso_res.eligible is True
     assert iso_res.setup_type == "BREAKOUT_IGNITION"
 
@@ -135,11 +158,14 @@ async def test_alpha_isolation_blocks_leg2_fast_track_and_cached_promotion_while
     assert out2["alpha_decisions"][0]["action"] != "BUY"
 
     # 2. Enabled BREAKOUT_IGNITION approves normally
+    bo_c = _make_breakout_candles(count=18)
     bo_cand = {
         "mint": "MintBOAllowed", "symbol": "BO1", "added_at": soaked,
         "pair_address": "CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8",
         "dex_id": "pumpswap",
-        "candles_5m": _make_breakout_candles(count=18), **_strong_flow_pair(1.12),
+        "candles_5m": bo_c,
+        "_ohlcv_5m_result": make_verified_ohlcv_result(bo_c, last_ok_at=now_dt.timestamp()),
+        **_strong_flow_pair(1.12),
     }
     dec_buy = _StubDecision({
         "t0_narrative_strength": {"type": "score", "score": 3.8, "confidence": 0.85},

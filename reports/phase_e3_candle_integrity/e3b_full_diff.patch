@@ -1,0 +1,1482 @@
+diff --git a/alpha_node.py b/alpha_node.py
+index c684150..a290464 100644
+--- a/alpha_node.py
++++ b/alpha_node.py
+@@ -25,9 +25,11 @@ from db import AgentDatabase, utc_now
+ from decision_client import GeminiDecisionClient
+ from narrative_cache import get_cached_narrative, put_cached_narrative
+ from ohlcv_client import (
++    OhlcvFetchResult,
+     cache_breakout_telemetry,
+-    fetch_ohlcv_1m_batch,
+-    fetch_ohlcv_batch,
++    fetch_ohlcv_1m_batch_with_provenance,
++    fetch_ohlcv_batch_with_provenance,
++    select_ohlcv_interval_provenance,
+     should_fetch_1m_fallback,
+ )
+ from outcome_tracker import record_outcome_snapshot
+@@ -125,16 +127,28 @@ async def alpha_node(
+             if p_addr:
+                 pairs_to_fetch.append(p_addr)
+ 
+-    ohlcv_by_pair: dict[str, list[dict[str, float]]] = {}
+-    ohlcv_1m_by_pair: dict[str, list[dict[str, float]]] = {}
++    ohlcv_by_pair: dict[str, OhlcvFetchResult] = {}
++    ohlcv_1m_by_pair: dict[str, OhlcvFetchResult] = {}
+     if pairs_to_fetch:
+         owns_client = http_client is None
+         client = http_client or httpx.AsyncClient()
+         try:
+-            ohlcv_by_pair = await fetch_ohlcv_batch(pairs_to_fetch, config, client, now_ts=now_dt.timestamp())
+-            short_pairs = [p for p in pairs_to_fetch if should_fetch_1m_fallback(p, ohlcv_by_pair.get(p) or [], now_ts=now_dt.timestamp())]
++            ohlcv_by_pair = await fetch_ohlcv_batch_with_provenance(
++                pairs_to_fetch, config, client, now_ts=now_dt.timestamp()
++            )
++            short_pairs = [
++                p
++                for p in pairs_to_fetch
++                if should_fetch_1m_fallback(
++                    p,
++                    (ohlcv_by_pair[p].candles if p in ohlcv_by_pair else []),
++                    now_ts=now_dt.timestamp(),
++                )
++            ]
+             if short_pairs:
+-                ohlcv_1m_by_pair = await fetch_ohlcv_1m_batch(short_pairs, config, client, now_ts=now_dt.timestamp())
++                ohlcv_1m_by_pair = await fetch_ohlcv_1m_batch_with_provenance(
++                    short_pairs, config, client, now_ts=now_dt.timestamp()
++                )
+         finally:
+             if owns_client:
+                 await client.aclose()
+@@ -153,11 +167,49 @@ async def alpha_node(
+         soak_minutes_list.append(round(time_in_slot_min, 2))
+ 
+         p_addr = str(cand.get("pair_address") or (watchlist_by_mint.get(cand["mint"]) or {}).get("pair_address") or "")
+-        candles_5m = cand.get("candles_5m") if cand.get("candles_5m") is not None else ohlcv_by_pair.get(p_addr, [])
+-        candles_1m = cand.get("candles_1m")
+-        if candles_1m is None:
+-            candles_1m = ohlcv_1m_by_pair.get(p_addr, [])
++        unavail = OhlcvFetchResult(candles=[], source="unavailable", fetched_at=None, last_ok_at=None, last_status=None)
++        if cand.get("candles_5m") is not None:
++            candles_5m = cand["candles_5m"]
++            raw_5m_prov = cand.get("_ohlcv_5m_result")
++            res_5m = (
++                raw_5m_prov
++                if isinstance(raw_5m_prov, OhlcvFetchResult)
++                else OhlcvFetchResult(
++                    candles=list(candles_5m) if isinstance(candles_5m, list) else [],
++                    source="pre_attached_unknown",
++                    fetched_at=None,
++                    last_ok_at=None,
++                    last_status=None,
++                )
++            )
++        else:
++            res_5m = ohlcv_by_pair.get(p_addr, unavail)
++            candles_5m = res_5m.candles
++
++        if cand.get("candles_1m") is not None:
++            candles_1m = cand["candles_1m"]
++            raw_1m_prov = cand.get("_ohlcv_1m_result")
++            res_1m = (
++                raw_1m_prov
++                if isinstance(raw_1m_prov, OhlcvFetchResult)
++                else OhlcvFetchResult(
++                    candles=list(candles_1m) if isinstance(candles_1m, list) else [],
++                    source="pre_attached_unknown",
++                    fetched_at=None,
++                    last_ok_at=None,
++                    last_status=None,
++                )
++            )
++        else:
++            res_1m = ohlcv_1m_by_pair.get(p_addr, unavail)
++            candles_1m = res_1m.candles
+ 
++        active_prov, prov_ok, _ = select_ohlcv_interval_provenance(
++            res_5m,
++            res_1m,
++            decision_timestamp=now_dt.timestamp(),
++            max_cache_age_seconds=float(config.OHLCV_CACHE_SECONDS),
++        )
+         sc_entry = evaluate_scalper_entry(
+             candles_5m,
+             cand,
+@@ -165,9 +217,16 @@ async def alpha_node(
+             config=config,
+             candles_1m=candles_1m,
+             decision_timestamp=now_dt.timestamp(),
++            ohlcv_provenance=active_prov,
+         )
+-        if (candles_5m or candles_1m) and sc_entry.breakout_telemetry:
+-            cache_breakout_telemetry(cand["mint"], sc_entry.breakout_telemetry, now_ts=now_dt.timestamp())
++        if prov_ok and (candles_5m or candles_1m) and sc_entry.breakout_telemetry:
++            cache_breakout_telemetry(
++                cand["mint"],
++                sc_entry.breakout_telemetry,
++                ohlcv_source=active_prov.source,
++                ohlcv_last_ok_at=active_prov.last_ok_at,
++                now_ts=now_dt.timestamp(),
++            )
+         scalper_results.append(sc_entry)
+ 
+     active_social = db.get_active_social_signals(ttl_minutes=config.X_SIGNAL_TTL_MINUTES, now=now_dt)
+diff --git a/ohlcv_client.py b/ohlcv_client.py
+index 4ee1864..1cb8907 100644
+--- a/ohlcv_client.py
++++ b/ohlcv_client.py
+@@ -4,8 +4,10 @@ from __future__ import annotations
+ 
+ import asyncio
+ import logging
++import math
+ import time
+-from typing import Any, Optional
++from dataclasses import dataclass
++from typing import Any, Literal, Optional
+ 
+ import httpx
+ 
+@@ -23,6 +25,118 @@ GLOBAL_MIN_SPACING_SECONDS = 6.5
+ MAX_BREAKOUT_CACHE_ENTRIES = 64
+ BREAKOUT_CACHE_TTL_SECONDS = 1800.0
+ 
++OhlcvSource = Literal[
++    "network_200",
++    "cache_fresh",
++    "stale_backoff",
++    "stale_429",
++    "stale_error",
++    "unavailable",
++    "pre_attached_verified",
++    "pre_attached_unknown",
++]
++
++ELIGIBLE_OHLCV_SOURCES = frozenset({"network_200", "cache_fresh", "pre_attached_verified"})
++
++
++@dataclass(frozen=True)
++class OhlcvFetchResult:
++    """Typed OHLCV fetch/cache result carrying authoritative provenance metadata."""
++
++    candles: list[dict[str, float]]
++    source: OhlcvSource
++    fetched_at: Optional[float]
++    last_ok_at: Optional[float]
++    last_status: Optional[int]
++
++    def age_seconds(self, decision_timestamp: float) -> Optional[float]:
++        """Return age in seconds since last_ok_at, or None if last_ok_at is missing/invalid."""
++        if self.last_ok_at is None or isinstance(self.last_ok_at, bool):
++            return None
++        if not isinstance(self.last_ok_at, (int, float)):
++            return None
++        ok_at = float(self.last_ok_at)
++        if not math.isfinite(ok_at) or ok_at <= 0.0:
++            return None
++        return decision_timestamp - ok_at
++
++
++@dataclass(frozen=True)
++class BreakoutTelemetryCacheEntry:
++    """Cached breakout telemetry paired with originating OHLCV timestamp and source metadata."""
++
++    telemetry: dict[str, Any]
++    cached_at: float
++    ohlcv_last_ok_at: Optional[float]
++    ohlcv_source: Optional[str]
++    data_age_seconds: Optional[float]
++    is_historical: bool
++    is_trusted: bool
++
++
++def evaluate_ohlcv_provenance(
++    result: Any,
++    *,
++    decision_timestamp: float,
++    max_cache_age_seconds: float = 90.0,
++    clock_skew_seconds: float = 5.0,
++) -> tuple[bool, Optional[str]]:
++    """Authoritatively validate OHLCV provenance; fail closed on missing, stale, or contradictory metadata."""
++    if result is None:
++        return False, "missing OHLCV provenance"
++    if not isinstance(result, OhlcvFetchResult):
++        return False, "invalid OHLCV provenance type"
++    if result.source not in ELIGIBLE_OHLCV_SOURCES:
++        return False, f"ineligible OHLCV source ({result.source})"
++    if result.last_status != 200:
++        return False, f"ineligible OHLCV status ({result.last_status})"
++    age = result.age_seconds(decision_timestamp)
++    if age is None:
++        return False, "missing or invalid OHLCV last_ok_at"
++    if age < -clock_skew_seconds:
++        return False, "future OHLCV last_ok_at"
++    if age > max_cache_age_seconds:
++        return False, f"expired OHLCV cache ({age:.1f}s > {max_cache_age_seconds:.1f}s)"
++    return True, None
++
++
++def select_ohlcv_interval_provenance(
++    res_5m: Any,
++    res_1m: Any,
++    *,
++    decision_timestamp: float,
++    max_cache_age_seconds: float = 90.0,
++) -> tuple[OhlcvFetchResult, bool, Optional[str]]:
++    """Deterministically select active 5m/1m OhlcvFetchResult using provenance and closed-bar count."""
++    unavail = OhlcvFetchResult(candles=[], source="unavailable", fetched_at=None, last_ok_at=None, last_status=None)
++    r5 = res_5m if isinstance(res_5m, OhlcvFetchResult) else unavail
++    r1 = res_1m if isinstance(res_1m, OhlcvFetchResult) else unavail
++
++    ok_5m, err_5m = evaluate_ohlcv_provenance(
++        r5, decision_timestamp=decision_timestamp, max_cache_age_seconds=max_cache_age_seconds
++    )
++    ok_1m, err_1m = evaluate_ohlcv_provenance(
++        r1, decision_timestamp=decision_timestamp, max_cache_age_seconds=max_cache_age_seconds
++    )
++    closed_5m, _, _ = normalize_and_filter_candles(r5.candles, bar_minutes=5, decision_timestamp=decision_timestamp)
++    closed_1m, _, _ = normalize_and_filter_candles(r1.candles, bar_minutes=1, decision_timestamp=decision_timestamp)
++
++    if ok_5m and len(closed_5m) >= 12:
++        return r5, True, None
++
++    if ok_5m:
++        if ok_1m and len(closed_1m) >= 15:
++            return r1, True, None
++        if not ok_1m:
++            return r1, False, err_1m
++        return r5, True, None
++
++    if r1.source == "pre_attached_verified" and ok_1m and len(closed_1m) >= 15:
++        return r1, True, None
++
++    chosen = r5 if r5.source != "unavailable" else r1
++    return chosen, False, err_5m if r5.source != "unavailable" else err_1m
++
+ # Per-pair_address cache:
+ # cache_key -> {"fetched_at": float, "candles": list[dict], "last_ok": bool, "last_status": int}
+ _ohlcv_cache: dict[str, dict[str, Any]] = {}
+@@ -68,14 +182,22 @@ def cache_breakout_telemetry(
+     mint: str,
+     telemetry: Optional[dict[str, Any]],
+     *,
++    ohlcv_source: Optional[str] = None,
++    ohlcv_last_ok_at: Optional[float] = None,
+     now_ts: Optional[float] = None,
+ ) -> None:
+-    """Store latest non-empty breakout_telemetry for a mint in the shared bounded cache."""
++    """Store latest non-empty breakout_telemetry for a mint with originating OHLCV provenance."""
+     m = (mint or "").strip()
+     if not m or not isinstance(telemetry, dict) or telemetry.get("score") is None:
+         return
+     ts = now_ts if now_ts is not None else time.time()
+-    _breakout_telemetry_cache[m] = {"fetched_at": ts, "telemetry": dict(telemetry)}
++    _breakout_telemetry_cache[m] = {
++        "fetched_at": ts,
++        "cached_at": ts,
++        "ohlcv_last_ok_at": ohlcv_last_ok_at,
++        "ohlcv_source": ohlcv_source,
++        "telemetry": dict(telemetry),
++    }
+     prune_timestamped_cache(
+         _breakout_telemetry_cache,
+         now_ts=ts,
+@@ -84,12 +206,13 @@ def cache_breakout_telemetry(
+     )
+ 
+ 
+-def get_cached_breakout_telemetry(
++def get_cached_breakout_telemetry_with_meta(
+     mint: str,
+     *,
+     now_ts: Optional[float] = None,
+-) -> Optional[dict[str, Any]]:
+-    """Return cached breakout_telemetry for a mint if fresh within TTL, else None."""
++    clock_skew_seconds: float = 5.0,
++) -> Optional[BreakoutTelemetryCacheEntry]:
++    """Return cached breakout_telemetry with originating data-age validation, else None."""
+     m = (mint or "").strip()
+     if not m:
+         return None
+@@ -101,9 +224,46 @@ def get_cached_breakout_telemetry(
+         ttl_seconds=BREAKOUT_CACHE_TTL_SECONDS,
+     )
+     entry = _breakout_telemetry_cache.get(m)
+-    if entry and isinstance(entry.get("telemetry"), dict):
+-        return dict(entry["telemetry"])
+-    return None
++    if not entry or not isinstance(entry.get("telemetry"), dict):
++        return None
++
++    cached_at = float(entry.get("cached_at") or entry.get("fetched_at") or ts)
++    raw_ok_at = entry.get("ohlcv_last_ok_at")
++    ohlcv_source = entry.get("ohlcv_source")
++    data_age: Optional[float] = None
++    is_trusted = False
++    validated_ok_at: Optional[float] = None
++
++    if (
++        raw_ok_at is not None
++        and not isinstance(raw_ok_at, bool)
++        and isinstance(raw_ok_at, (int, float))
++    ):
++        ok_at_f = float(raw_ok_at)
++        if math.isfinite(ok_at_f) and ok_at_f > 0.0 and ok_at_f <= ts + clock_skew_seconds:
++            validated_ok_at = ok_at_f
++            data_age = max(0.0, ts - ok_at_f)
++            is_trusted = True
++
++    return BreakoutTelemetryCacheEntry(
++        telemetry=dict(entry["telemetry"]),
++        cached_at=cached_at,
++        ohlcv_last_ok_at=validated_ok_at,
++        ohlcv_source=str(ohlcv_source) if ohlcv_source is not None else None,
++        data_age_seconds=data_age,
++        is_historical=True,
++        is_trusted=is_trusted,
++    )
++
++
++def get_cached_breakout_telemetry(
++    mint: str,
++    *,
++    now_ts: Optional[float] = None,
++) -> Optional[dict[str, Any]]:
++    """Return cached breakout_telemetry for a mint if fresh within TTL, else None."""
++    meta = get_cached_breakout_telemetry_with_meta(mint, now_ts=now_ts)
++    return dict(meta.telemetry) if meta is not None else None
+ 
+ 
+ def get_cached_ohlcv_for_pool(pair_address: str) -> tuple[list[dict[str, float]], list[dict[str, float]]]:
+@@ -176,7 +336,7 @@ def parse_geckoterminal_ohlcv(payload: dict[str, Any]) -> list[dict[str, float]]
+     return candles
+ 
+ 
+-async def _fetch_ohlcv_interval(
++async def _fetch_ohlcv_interval_with_provenance(
+     pair_address: str,
+     config: AgentConfig,
+     client: httpx.AsyncClient,
+@@ -185,20 +345,25 @@ async def _fetch_ohlcv_interval(
+     limit: str,
+     cache_suffix: str,
+     now_ts: Optional[float] = None,
+-) -> tuple[list[dict[str, float]], bool]:
+-    """Fetch GeckoTerminal minute OHLCV bars with global spacing, global 429 backoff & stale-while-revalidate."""
++) -> OhlcvFetchResult:
++    """Fetch GeckoTerminal minute OHLCV bars and return typed provenance metadata."""
+     global _global_backoff_until, _global_429_errors, _last_gecko_request_ts
+ 
+     addr = (pair_address or "").strip()
+     if not addr:
+-        return [], False
++        return OhlcvFetchResult(
++            candles=[], source="unavailable", fetched_at=None, last_ok_at=None, last_status=None
++        )
+ 
+     cache_key = f"{addr}{cache_suffix}"
+     current_ts = now_ts if now_ts is not None else time.time()
+     entry = _ohlcv_cache.get(cache_key)
+     prev_candles = list((entry or {}).get("candles") or [])
++    prev_ok_at: Optional[float] = (entry or {}).get("last_ok_at")
++    if prev_ok_at is None and (entry or {}).get("last_ok"):
++        prev_ok_at = (entry or {}).get("fetched_at")
+ 
+-    # 1. Global 429 Backoff Check (stale-while-revalidate: serve cached candles without hitting API)
++    # 1. Global 429 Backoff Check
+     if current_ts < _global_backoff_until:
+         logger.debug(
+             "[OHLCV] Global GeckoTerminal backoff active (%.0fs remaining) — serving %d cached candles for %s..",
+@@ -206,7 +371,13 @@ async def _fetch_ohlcv_interval(
+             len(prev_candles),
+             addr[:8],
+         )
+-        return prev_candles, False
++        return OhlcvFetchResult(
++            candles=prev_candles,
++            source="stale_backoff",
++            fetched_at=(entry or {}).get("fetched_at"),
++            last_ok_at=prev_ok_at,
++            last_status=(entry or {}).get("last_status"),
++        )
+ 
+     # 2. Fresh Cache Hit Check
+     if entry is not None:
+@@ -216,19 +387,29 @@ async def _fetch_ohlcv_interval(
+             and fetched_at is not None
+             and (current_ts - float(fetched_at)) < config.OHLCV_CACHE_SECONDS
+         ):
+-            return prev_candles, False
++            return OhlcvFetchResult(
++                candles=prev_candles,
++                source="cache_fresh",
++                fetched_at=float(fetched_at),
++                last_ok_at=prev_ok_at,
++                last_status=int(entry.get("last_status") or 200),
++            )
+ 
+     url = f"{config.GECKOTERMINAL_BASE_URL}/networks/solana/pools/{addr}/ohlcv/minute"
+     params = {"aggregate": aggregate, "limit": limit, "currency": "usd"}
+     min_spacing = float(config.OHLCV_PACING_DELAY_SECONDS)
+ 
+     async with _get_gecko_lock():
+-        # Re-check global backoff inside the lock in case another coroutine just hit 429
+         check_ts = now_ts if now_ts is not None else time.time()
+         if check_ts < _global_backoff_until:
+-            return prev_candles, False
++            return OhlcvFetchResult(
++                candles=prev_candles,
++                source="stale_backoff",
++                fetched_at=(entry or {}).get("fetched_at"),
++                last_ok_at=prev_ok_at,
++                last_status=(entry or {}).get("last_status"),
++            )
+ 
+-        # Global minimum spacing across all GeckoTerminal requests (default 6.5s)
+         if min_spacing > 0 and _last_gecko_request_ts > 0:
+             elapsed = check_ts - _last_gecko_request_ts
+             if 0.0 <= elapsed < min_spacing:
+@@ -250,8 +431,10 @@ async def _fetch_ohlcv_interval(
+                     GLOBAL_429_BASE_SECONDS * (2 ** (_global_429_errors - 1)),
+                 )
+                 _global_backoff_until = check_ts + backoff
++                entry_fetched_at = (entry or {}).get("fetched_at") or check_ts
+                 _ohlcv_cache[cache_key] = {
+-                    "fetched_at": (entry or {}).get("fetched_at") or check_ts,
++                    "fetched_at": entry_fetched_at,
++                    "last_ok_at": prev_ok_at,
+                     "candles": prev_candles,
+                     "last_ok": False,
+                     "last_status": 429,
+@@ -264,7 +447,13 @@ async def _fetch_ohlcv_interval(
+                     backoff,
+                     len(prev_candles),
+                 )
+-                return prev_candles, True
++                return OhlcvFetchResult(
++                    candles=prev_candles,
++                    source="stale_429",
++                    fetched_at=entry_fetched_at,
++                    last_ok_at=prev_ok_at,
++                    last_status=429,
++                )
+ 
+             resp.raise_for_status()
+             candles = parse_geckoterminal_ohlcv(resp.json())
+@@ -272,15 +461,24 @@ async def _fetch_ohlcv_interval(
+             _global_backoff_until = 0.0
+             _ohlcv_cache[cache_key] = {
+                 "fetched_at": check_ts,
++                "last_ok_at": check_ts,
+                 "candles": candles,
+                 "last_ok": True,
+                 "last_status": 200,
+             }
+             _prune_ohlcv_cache(check_ts, config)
+-            return list(candles), True
++            return OhlcvFetchResult(
++                candles=list(candles),
++                source="network_200",
++                fetched_at=check_ts,
++                last_ok_at=check_ts,
++                last_status=200,
++            )
+         except Exception as exc:
++            entry_fetched_at = (entry or {}).get("fetched_at") or check_ts
+             _ohlcv_cache[cache_key] = {
+-                "fetched_at": (entry or {}).get("fetched_at") or check_ts,
++                "fetched_at": entry_fetched_at,
++                "last_ok_at": prev_ok_at,
+                 "candles": prev_candles,
+                 "last_ok": False,
+                 "last_status": 0,
+@@ -293,7 +491,30 @@ async def _fetch_ohlcv_interval(
+                 exc,
+                 len(prev_candles),
+             )
+-            return prev_candles, True
++            return OhlcvFetchResult(
++                candles=prev_candles,
++                source="stale_error",
++                fetched_at=entry_fetched_at,
++                last_ok_at=prev_ok_at,
++                last_status=0,
++            )
++
++
++async def _fetch_ohlcv_interval(
++    pair_address: str,
++    config: AgentConfig,
++    client: httpx.AsyncClient,
++    *,
++    aggregate: str,
++    limit: str,
++    cache_suffix: str,
++    now_ts: Optional[float] = None,
++) -> tuple[list[dict[str, float]], bool]:
++    """Legacy wrapper returning (candles, did_network)."""
++    res = await _fetch_ohlcv_interval_with_provenance(
++        pair_address, config, client, aggregate=aggregate, limit=limit, cache_suffix=cache_suffix, now_ts=now_ts
++    )
++    return res.candles, res.source in ("network_200", "stale_429", "stale_error")
+ 
+ 
+ async def fetch_ohlcv_5m(
+@@ -322,6 +543,52 @@ async def fetch_ohlcv_1m(
+     )
+ 
+ 
++async def fetch_ohlcv_batch_with_provenance(
++    pair_addresses: list[str],
++    config: AgentConfig,
++    client: httpx.AsyncClient,
++    *,
++    now_ts: Optional[float] = None,
++) -> dict[str, OhlcvFetchResult]:
++    """Fetch 5m OHLCV for up to MAX_WATCH_BATCH pools with authoritative provenance metadata."""
++    results: dict[str, OhlcvFetchResult] = {}
++    for addr in pair_addresses:
++        if not addr or addr in results:
++            continue
++        results[addr] = await _fetch_ohlcv_interval_with_provenance(
++            addr, config, client, aggregate="5", limit="30", cache_suffix="", now_ts=now_ts
++        )
++    return results
++
++
++async def fetch_ohlcv_1m_batch_with_provenance(
++    pair_addresses: list[str],
++    config: AgentConfig,
++    client: httpx.AsyncClient,
++    *,
++    now_ts: Optional[float] = None,
++) -> dict[str, OhlcvFetchResult]:
++    """Fetch 1m OHLCV fallback ONLY when 5m succeeded (200 OK) with < 12 closed bars; never serve unflagged c1_cached."""
++    results: dict[str, OhlcvFetchResult] = {}
++    for addr in pair_addresses:
++        if not addr or addr in results:
++            continue
++        c5_cached, _ = get_cached_ohlcv_for_pool(addr)
++        if not should_fetch_1m_fallback(addr, c5_cached, now_ts=now_ts):
++            results[addr] = OhlcvFetchResult(
++                candles=[],
++                source="unavailable",
++                fetched_at=None,
++                last_ok_at=None,
++                last_status=None,
++            )
++            continue
++        results[addr] = await _fetch_ohlcv_interval_with_provenance(
++            addr, config, client, aggregate="1", limit="30", cache_suffix=":1m", now_ts=now_ts
++        )
++    return results
++
++
+ async def fetch_ohlcv_batch(
+     pair_addresses: list[str],
+     config: AgentConfig,
+diff --git a/scalper_entry_engine.py b/scalper_entry_engine.py
+index 636cf6c..6efa4d0 100644
+--- a/scalper_entry_engine.py
++++ b/scalper_entry_engine.py
+@@ -13,6 +13,7 @@ from breakout_ignition import (
+     validate_decision_timestamp,
+ )
+ from config import VALID_CHART_STRATEGIES, AgentConfig
++from ohlcv_client import OhlcvFetchResult, evaluate_ohlcv_provenance
+ 
+ 
+ class ScalperEntryResult(BaseModel):
+@@ -175,6 +176,7 @@ def evaluate_scalper_entry(
+     config: Optional[AgentConfig] = None,
+     candles_1m: Optional[Sequence[Any]] = None,
+     decision_timestamp: Optional[float] = None,
++    ohlcv_provenance: Optional[OhlcvFetchResult] = None,
+ ) -> ScalperEntryResult:
+     """Run all 4 deterministic gates of the Scalper Expert Entry Engine (+ BREAKOUT_IGNITION)."""
+     ref_ts, ts_err = validate_decision_timestamp(decision_timestamp)
+@@ -185,6 +187,17 @@ def evaluate_scalper_entry(
+             rejection_reason=ts_err or "invalid decision_timestamp",
+         )
+ 
++    cache_ttl = float(config.OHLCV_CACHE_SECONDS) if config is not None else 90.0
++    prov_ok, prov_err = evaluate_ohlcv_provenance(
++        ohlcv_provenance, decision_timestamp=ref_ts, max_cache_age_seconds=cache_ttl
++    )
++    if not prov_ok:
++        return ScalperEntryResult(
++            eligible=False,
++            setup_type="NONE",
++            rejection_reason=prov_err or "ineligible OHLCV provenance",
++        )
++
+     min_soak = config.MIN_WATCHLIST_SOAK_MINUTES if config else 3.0
+     high_buf = config.ANTI_CHASE_HIGH_BUFFER_PCT if config else 0.05
+     max_rsi = config.SCALPER_MAX_RSI_5M if config else 70.0
+diff --git a/telemetry_api.py b/telemetry_api.py
+index 4b6697a..8ebf7b1 100644
+--- a/telemetry_api.py
++++ b/telemetry_api.py
+@@ -20,7 +20,7 @@ from helius_webhook import (
+     verify_helius_auth,
+ )
+ from insider_scanner import InsiderScanRequest, run_insider_scan
+-from ohlcv_client import get_cached_breakout_telemetry
++from ohlcv_client import get_cached_breakout_telemetry_with_meta
+ from outcome_tracker import render_outcomes_csv
+ 
+ 
+@@ -233,10 +233,11 @@ def create_telemetry_app(
+             else:
+                 a_status = None
+                 a_reason = None
++            cached_bt_meta = get_cached_breakout_telemetry_with_meta(sig["mint"], now_ts=now_dt.timestamp())
+             resolved_bt = (
+                 (dec_info.get("breakout_telemetry") if dec_info else None)
+                 or watchlist_bt_by_mint.get(sig["mint"])
+-                or get_cached_breakout_telemetry(sig["mint"], now_ts=now_dt.timestamp())
++                or (cached_bt_meta.telemetry if cached_bt_meta is not None else None)
+             )
+             enriched_signals.append(
+                 {
+@@ -244,6 +245,19 @@ def create_telemetry_app(
+                     "agent_status": a_status,
+                     "agent_reason": a_reason,
+                     "breakout_telemetry": resolved_bt,
++                    "telemetry_age_seconds": (
++                        cached_bt_meta.data_age_seconds
++                        if cached_bt_meta is not None and resolved_bt == cached_bt_meta.telemetry
++                        else None
++                    ),
++                    "telemetry_source": (
++                        cached_bt_meta.ohlcv_source
++                        if cached_bt_meta is not None and resolved_bt == cached_bt_meta.telemetry
++                        else None
++                    ),
++                    "telemetry_is_historical": bool(
++                        cached_bt_meta is not None and resolved_bt == cached_bt_meta.telemetry and cached_bt_meta.is_historical
++                    ),
+                 }
+             )
+ 
+diff --git a/tests/test_alpha_and_executor.py b/tests/test_alpha_and_executor.py
+index d5e147a..647421a 100644
+--- a/tests/test_alpha_and_executor.py
++++ b/tests/test_alpha_and_executor.py
+@@ -35,6 +35,7 @@ class MockDecisionClient:
+ 
+ @pytest.mark.asyncio
+ async def test_alpha_node_single_batched_decision_1_call(tmp_path):
++    from tests.test_e3b_cache_provenance import make_verified_ohlcv_result
+     from tests.test_scalper_entry_engine import make_sweep_reclaim_candles
+ 
+     db = AgentDatabase(db_path=str(tmp_path / "alpha.duckdb"), starting_sol=0.7)
+@@ -42,6 +43,7 @@ async def test_alpha_node_single_batched_decision_1_call(tmp_path):
+     soaked_added = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+     valid_candles = make_sweep_reclaim_candles()
+ 
++    now_ts = datetime.now(timezone.utc).timestamp()
+     candidates = [
+         {
+             "mint": "MintVamp11111111111111111111111111111111111",
+@@ -51,6 +53,7 @@ async def test_alpha_node_single_batched_decision_1_call(tmp_path):
+             "sells_5m": 10,
+             "added_at": soaked_added,
+             "candles_5m": valid_candles,
++            "_ohlcv_5m_result": make_verified_ohlcv_result(valid_candles, last_ok_at=now_ts),
+         },
+         {
+             "mint": "MintAlpha1111111111111111111111111111111111",
+@@ -60,6 +63,7 @@ async def test_alpha_node_single_batched_decision_1_call(tmp_path):
+             "sells_5m": 10,
+             "added_at": soaked_added,
+             "candles_5m": valid_candles,
++            "_ohlcv_5m_result": make_verified_ohlcv_result(valid_candles, last_ok_at=now_ts),
+         },
+     ]
+     mock_answers = {
+diff --git a/tests/test_breakout_ignition.py b/tests/test_breakout_ignition.py
+index bf085b3..d6bbdd6 100644
+--- a/tests/test_breakout_ignition.py
++++ b/tests/test_breakout_ignition.py
+@@ -13,11 +13,28 @@ from fastapi.testclient import TestClient
+ from alpha_node import alpha_node
+ from config import AgentConfig
+ from db import AgentDatabase
++from ohlcv_client import OhlcvFetchResult
+ from scalper_entry_engine import evaluate_scalper_entry
+ from state import FocusState
+ from telemetry_api import create_telemetry_app
+ 
+ 
++def make_verified_ohlcv_result(
++    candles: list[dict[str, float]],
++    *,
++    last_ok_at: float,
++    source: str = "pre_attached_verified",
++) -> OhlcvFetchResult:
++    """Test helper to supply trusted OHLCV provenance without weakening production validation."""
++    return OhlcvFetchResult(
++        candles=list(candles),
++        source=source,  # type: ignore[arg-type]
++        fetched_at=last_ok_at,
++        last_ok_at=last_ok_at,
++        last_status=200,
++    )
++
++
+ def _make_breakout_candles(
+     count: int = 18,
+     *,
+@@ -87,7 +104,11 @@ def test_breakout_ignition_valid_5m_bypasses_near_1h_high_and_allows_rsi_up_to_7
+     candles = _make_breakout_candles(
+         count=18, breakout_close=1.12, breakout_high=1.13, breakout_low=1.06, breakout_vol=3000.0
+     )
+-    res = evaluate_scalper_entry(candles, _strong_flow_pair(1.12), time_in_slot_min=5.0)
++    t = candles[-1]["timestamp"] + 300.0
++    res = evaluate_scalper_entry(
++        candles, _strong_flow_pair(1.12), time_in_slot_min=5.0,
++        decision_timestamp=t, ohlcv_provenance=make_verified_ohlcv_result(candles, last_ok_at=t),
++    )
+     assert res.eligible is True
+     assert res.setup_type == "BREAKOUT_IGNITION"
+     assert res.dist_from_1h_high_pct < 0.05  # Near 1h high bypassed for breakout ignition
+@@ -103,7 +124,11 @@ def test_breakout_ignition_rejects_over_extended_chase_above_12_pct():
+     candles = _make_breakout_candles(
+         count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.06, breakout_vol=3500.0
+     )
+-    res = evaluate_scalper_entry(candles, _strong_flow_pair(1.34), time_in_slot_min=5.0)
++    t = candles[-1]["timestamp"] + 300.0
++    res = evaluate_scalper_entry(
++        candles, _strong_flow_pair(1.34), time_in_slot_min=5.0,
++        decision_timestamp=t, ohlcv_provenance=make_verified_ohlcv_result(candles, last_ok_at=t),
++    )
+     assert res.eligible is False
+     assert res.setup_type == "NONE"
+     assert res.rejection_reason is not None
+@@ -115,7 +140,11 @@ def test_breakout_ignition_rejects_upper_wick_fakeout():
+     candles = _make_breakout_candles(
+         count=18, breakout_close=1.095, breakout_high=1.20, breakout_low=1.06, breakout_vol=3000.0
+     )
+-    res = evaluate_scalper_entry(candles, _strong_flow_pair(1.095), time_in_slot_min=5.0)
++    t = candles[-1]["timestamp"] + 300.0
++    res = evaluate_scalper_entry(
++        candles, _strong_flow_pair(1.095), time_in_slot_min=5.0,
++        decision_timestamp=t, ohlcv_provenance=make_verified_ohlcv_result(candles, last_ok_at=t),
++    )
+     assert res.eligible is False
+     assert res.setup_type == "NONE"
+     assert res.rejection_reason is not None
+@@ -127,8 +156,10 @@ def test_breakout_ignition_1m_candle_fallback_when_fewer_than_12_5m_bars():
+     bars_1m = _make_breakout_candles(
+         count=20, bar_seconds=60, breakout_close=1.12, breakout_high=1.13, breakout_low=1.06, breakout_vol=3000.0
+     )
++    t = bars_1m[-1]["timestamp"] + 60.0
+     res = evaluate_scalper_entry(
+-        short_5m, _strong_flow_pair(1.12), time_in_slot_min=4.0, candles_1m=bars_1m
++        short_5m, _strong_flow_pair(1.12), time_in_slot_min=4.0, candles_1m=bars_1m,
++        decision_timestamp=t, ohlcv_provenance=make_verified_ohlcv_result(bars_1m, last_ok_at=t),
+     )
+     assert res.eligible is True
+     assert res.setup_type == "BREAKOUT_IGNITION"
+@@ -166,6 +197,7 @@ async def test_coiling_base_retention_and_breakout_ignition_csv_logging(tmp_path
+         "mint": coil_mint, "symbol": "COIL", "added_at": added_20m_ago,
+         "liquidity_usd": 60_000.0, "market_cap_usd": 400_000.0,
+         "price_usd": 1.075, "candles_5m": coil_candles,
++        "_ohlcv_5m_result": make_verified_ohlcv_result(coil_candles, last_ok_at=now_dt.timestamp()),
+         "txns": {"m5": {"buys": 10, "sells": 10}},
+     }
+     # Strike 1 -> retained (NOT evicted!)
+@@ -193,12 +225,14 @@ async def test_coiling_base_retention_and_breakout_ignition_csv_logging(tmp_path
+             }
+ 
+     bo_mint = "MintBreakout1111111111111111111111111111111"
++    bo_c = _make_breakout_candles(count=18)
+     bo_cand = {
+         "mint": bo_mint, "symbol": "IGNITE",
+         "pair_address": "8qbHbw2BbbTHBW1sbeqakYXVKRQM8Ne7pLK7m6CVfeR",
+         "dex_id": "pumpswap",
+         "added_at": (now_dt - timedelta(minutes=5)).isoformat(),
+-        "candles_5m": _make_breakout_candles(count=18),
++        "candles_5m": bo_c,
++        "_ohlcv_5m_result": make_verified_ohlcv_result(bo_c, last_ok_at=now_dt.timestamp()),
+         **_strong_flow_pair(1.12),
+     }
+     out = await alpha_node(
+@@ -253,7 +287,11 @@ def test_breakout_telemetry_score_states_and_failed_gates_formatting():
+     candles_low_vol = _make_breakout_candles(
+         count=18, breakout_close=1.12, breakout_high=1.13, breakout_low=1.06, breakout_vol=1200.0
+     )
+-    res_lv = evaluate_scalper_entry(candles_low_vol, _strong_flow_pair(1.12), time_in_slot_min=5.0)
++    t_lv = candles_low_vol[-1]["timestamp"] + 300.0
++    res_lv = evaluate_scalper_entry(
++        candles_low_vol, _strong_flow_pair(1.12), time_in_slot_min=5.0,
++        decision_timestamp=t_lv, ohlcv_provenance=make_verified_ohlcv_result(candles_low_vol, last_ok_at=t_lv),
++    )
+     bt_lv = res_lv.breakout_telemetry
+     assert bt_lv is not None
+     assert bt_lv["score"] == 95  # 100 - 5 (partial vol credit for 1.2x >= 1.2x)
+@@ -265,7 +303,11 @@ def test_breakout_telemetry_score_states_and_failed_gates_formatting():
+     candles_ext = _make_breakout_candles(
+         count=18, breakout_close=1.34, breakout_high=1.35, breakout_low=1.06, breakout_vol=3500.0
+     )
+-    res_ext = evaluate_scalper_entry(candles_ext, _strong_flow_pair(1.34), time_in_slot_min=5.0)
++    t_ext = candles_ext[-1]["timestamp"] + 300.0
++    res_ext = evaluate_scalper_entry(
++        candles_ext, _strong_flow_pair(1.34), time_in_slot_min=5.0,
++        decision_timestamp=t_ext, ohlcv_provenance=make_verified_ohlcv_result(candles_ext, last_ok_at=t_ext),
++    )
+     assert res_ext.eligible is False
+     assert res_ext.breakout_telemetry is not None
+     assert res_ext.breakout_telemetry["score"] >= 75
+@@ -273,11 +315,15 @@ def test_breakout_telemetry_score_states_and_failed_gates_formatting():
+     assert any(g.startswith("EXT(") for g in res_ext.breakout_telemetry["failed_gates"])
+ 
+     # 1m fallback reports timeframe == "1m_fallback"
++    bars_1m = _make_breakout_candles(count=20, bar_seconds=60)
++    t_1m = bars_1m[-1]["timestamp"] + 60.0
+     res_1m = evaluate_scalper_entry(
+         _make_breakout_candles(count=5),
+         _strong_flow_pair(1.12),
+         time_in_slot_min=4.0,
+-        candles_1m=_make_breakout_candles(count=20, bar_seconds=60),
++        candles_1m=bars_1m,
++        decision_timestamp=t_1m,
++        ohlcv_provenance=make_verified_ohlcv_result(bars_1m, last_ok_at=t_1m),
+     )
+     assert res_1m.breakout_telemetry is not None
+     assert res_1m.breakout_telemetry["timeframe"] == "1m_fallback"
+@@ -302,7 +348,11 @@ def test_breakout_ignition_allows_1_6x_vol_9_5_pct_coil_and_1_0x_buy_accel_and_c
+         "market_cap_usd": 650_000.0,
+         "txns": {"m5": {"buys": 20, "sells": 8}, "h1": {"buys": 240, "sells": 120}},
+     }
+-    res = evaluate_scalper_entry(candles, pair_1x_accel, time_in_slot_min=5.0)
++    t_c = candles[-1]["timestamp"] + 300.0
++    res = evaluate_scalper_entry(
++        candles, pair_1x_accel, time_in_slot_min=5.0,
++        decision_timestamp=t_c, ohlcv_provenance=make_verified_ohlcv_result(candles, last_ok_at=t_c),
++    )
+     assert res.eligible is True
+     assert res.setup_type == "BREAKOUT_IGNITION"
+     assert res.breakout_telemetry is not None
+@@ -318,7 +368,11 @@ def test_breakout_ignition_allows_1_6x_vol_9_5_pct_coil_and_1_0x_buy_accel_and_c
+     candles_greg = _make_breakout_candles(
+         count=18, breakout_close=1.12, breakout_high=1.13, breakout_low=1.06, breakout_vol=120.0
+     )
+-    res_greg = evaluate_scalper_entry(candles_greg, _strong_flow_pair(1.12), time_in_slot_min=5.0)
++    t_g = candles_greg[-1]["timestamp"] + 300.0
++    res_greg = evaluate_scalper_entry(
++        candles_greg, _strong_flow_pair(1.12), time_in_slot_min=5.0,
++        decision_timestamp=t_g, ohlcv_provenance=make_verified_ohlcv_result(candles_greg, last_ok_at=t_g),
++    )
+     assert res_greg.eligible is False
+     assert res_greg.breakout_telemetry is not None
+     assert res_greg.breakout_telemetry["score"] >= 75
+@@ -328,7 +382,11 @@ def test_breakout_ignition_allows_1_6x_vol_9_5_pct_coil_and_1_0x_buy_accel_and_c
+     candles_no_res = _make_breakout_candles(
+         count=18, breakout_close=1.077, breakout_high=1.078, breakout_low=1.06, breakout_vol=3000.0
+     )
+-    res_no_res = evaluate_scalper_entry(candles_no_res, _strong_flow_pair(1.077), time_in_slot_min=5.0)
++    t_nr = candles_no_res[-1]["timestamp"] + 300.0
++    res_no_res = evaluate_scalper_entry(
++        candles_no_res, _strong_flow_pair(1.077), time_in_slot_min=5.0,
++        decision_timestamp=t_nr, ohlcv_provenance=make_verified_ohlcv_result(candles_no_res, last_ok_at=t_nr),
++    )
+     assert res_no_res.eligible is False
+     assert res_no_res.breakout_telemetry is not None
+     assert res_no_res.breakout_telemetry["score"] == 75
+diff --git a/tests/test_breakout_isolation.py b/tests/test_breakout_isolation.py
+index 0711cf6..f959349 100644
+--- a/tests/test_breakout_isolation.py
++++ b/tests/test_breakout_isolation.py
+@@ -25,6 +25,7 @@ from state import ActivePosition, FocusState, PendingOrder
+ from state_ledger import clear_buy_reservations, clear_sell_guard, update_lane_positions_only
+ from telemetry_api import create_telemetry_app
+ from tests.test_breakout_ignition import _make_breakout_candles, _strong_flow_pair
++from tests.test_e3b_cache_provenance import make_verified_ohlcv_result
+ from tests.test_scalper_entry_engine import make_displacement_retest_candles, make_sweep_reclaim_candles
+ 
+ 
+@@ -74,17 +75,31 @@ def test_evaluator_isolation_rejects_disabled_setups_and_prevents_shadowing():
+ 
+     # 1. Valid BREAKOUT_IGNITION qualifies
+     bo_candles = _make_breakout_candles(count=18)
+-    bo_res = evaluate_scalper_entry(bo_candles, flow, time_in_slot_min=5.0, config=cfg)
++    bo_t = bo_candles[-1]["timestamp"] + 300.0
++    bo_res = evaluate_scalper_entry(
++        bo_candles, flow, time_in_slot_min=5.0, config=cfg,
++        decision_timestamp=bo_t, ohlcv_provenance=make_verified_ohlcv_result(bo_candles, last_ok_at=bo_t),
++    )
+     assert bo_res.eligible is True
+     assert bo_res.setup_type == "BREAKOUT_IGNITION"
+ 
+     # 2. Valid SWEEP_RECLAIM is rejected when disabled
+-    sr_res = evaluate_scalper_entry(make_sweep_reclaim_candles(), {"buys_5m": 25, "sells_5m": 10}, time_in_slot_min=5.0, config=cfg)
++    sr_c = make_sweep_reclaim_candles()
++    sr_t = sr_c[-1]["timestamp"] + 300.0
++    sr_res = evaluate_scalper_entry(
++        sr_c, {"buys_5m": 25, "sells_5m": 10}, time_in_slot_min=5.0, config=cfg,
++        decision_timestamp=sr_t, ohlcv_provenance=make_verified_ohlcv_result(sr_c, last_ok_at=sr_t),
++    )
+     assert sr_res.eligible is False
+     assert sr_res.setup_type == "NONE"
+ 
+     # 3. Valid DISPLACEMENT_RETEST is rejected when disabled
+-    dr_res = evaluate_scalper_entry(make_displacement_retest_candles(), {"buys_5m": 25, "sells_5m": 10}, time_in_slot_min=5.0, config=cfg)
++    dr_c = make_displacement_retest_candles()
++    dr_t = dr_c[-1]["timestamp"] + 300.0
++    dr_res = evaluate_scalper_entry(
++        dr_c, {"buys_5m": 25, "sells_5m": 10}, time_in_slot_min=5.0, config=cfg,
++        decision_timestamp=dr_t, ohlcv_provenance=make_verified_ohlcv_result(dr_c, last_ok_at=dr_t),
++    )
+     assert dr_res.eligible is False
+     assert dr_res.setup_type == "NONE"
+ 
+@@ -94,11 +109,19 @@ def test_evaluator_isolation_rejects_disabled_setups_and_prevents_shadowing():
+     prior_low = min(c["low"] for c in hybrid_candles[-13:-3])
+     hybrid_candles[-2]["low"] = prior_low * 0.99
+     hybrid_candles[-2]["close"] = prior_low * 1.005
++    hyb_t = hybrid_candles[-1]["timestamp"] + 300.0
++    hyb_prov = make_verified_ohlcv_result(hybrid_candles, last_ok_at=hyb_t)
+     # With default config, SWEEP_RECLAIM shadows BREAKOUT_IGNITION:
+-    default_res = evaluate_scalper_entry(hybrid_candles, flow, time_in_slot_min=5.0, config=AgentConfig(_env_file=None))
++    default_res = evaluate_scalper_entry(
++        hybrid_candles, flow, time_in_slot_min=5.0, config=AgentConfig(_env_file=None),
++        decision_timestamp=hyb_t, ohlcv_provenance=hyb_prov,
++    )
+     assert default_res.setup_type == "SWEEP_RECLAIM"
+     # With BREAKOUT_IGNITION-only config, SWEEP_RECLAIM is skipped and BREAKOUT_IGNITION wins:
+-    iso_res = evaluate_scalper_entry(hybrid_candles, flow, time_in_slot_min=5.0, config=cfg)
++    iso_res = evaluate_scalper_entry(
++        hybrid_candles, flow, time_in_slot_min=5.0, config=cfg,
++        decision_timestamp=hyb_t, ohlcv_provenance=hyb_prov,
++    )
+     assert iso_res.eligible is True
+     assert iso_res.setup_type == "BREAKOUT_IGNITION"
+ 
+@@ -135,11 +158,14 @@ async def test_alpha_isolation_blocks_leg2_fast_track_and_cached_promotion_while
+     assert out2["alpha_decisions"][0]["action"] != "BUY"
+ 
+     # 2. Enabled BREAKOUT_IGNITION approves normally
++    bo_c = _make_breakout_candles(count=18)
+     bo_cand = {
+         "mint": "MintBOAllowed", "symbol": "BO1", "added_at": soaked,
+         "pair_address": "CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8",
+         "dex_id": "pumpswap",
+-        "candles_5m": _make_breakout_candles(count=18), **_strong_flow_pair(1.12),
++        "candles_5m": bo_c,
++        "_ohlcv_5m_result": make_verified_ohlcv_result(bo_c, last_ok_at=now_dt.timestamp()),
++        **_strong_flow_pair(1.12),
+     }
+     dec_buy = _StubDecision({
+         "t0_narrative_strength": {"type": "score", "score": 3.8, "confidence": 0.85},
+diff --git a/tests/test_e1_pool_identity.py b/tests/test_e1_pool_identity.py
+index b28147a..cd701f1 100644
+--- a/tests/test_e1_pool_identity.py
++++ b/tests/test_e1_pool_identity.py
+@@ -156,13 +156,14 @@ async def test_e1_pool_identity_full_lifecycle_watchlist_partial_and_final_settl
+     dex_id = "pumpswap"
+ 
+     # 1. Watchlist persistence preserves (pair_address, dex_id) and refuses silent overwrite
++    c_life = _make_breakout_candles(18)
+     cand = {
+         "mint": MINT_LIFE,
+         "symbol": "PLIFE",
+         "pair_address": POOL_PINNED,
+         "dex_id": dex_id,
+         "added_at": (now_dt - timedelta(minutes=5)).isoformat(),
+-        "candles_5m": _make_breakout_candles(18),
++        "candles_5m": c_life,
+         **_strong_flow_pair(),
+     }
+     db.upsert_watchlist_entry(
+@@ -182,7 +183,12 @@ async def test_e1_pool_identity_full_lifecycle_watchlist_partial_and_final_settl
+ 
+     # 2 & 3 (M-3). Even if refreshed candidate disagrees with pinned watchlist (POOL_COMPETING, raydium),
+     # alpha_node preserves atomic watchlist tuple (POOL_PINNED, pumpswap) without mixing DEX IDs.
+-    drifted_cand = {**cand, "pair_address": POOL_COMPETING, "dex_id": "raydium"}
++    drifted_cand = {
++        **cand,
++        "pair_address": POOL_COMPETING,
++        "dex_id": "raydium",
++        "_ohlcv_5m_result": __import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(c_life, last_ok_at=now_dt.timestamp()),
++    }
+     out_alpha = await alpha_node(
+         {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "safe_candidates": [drifted_cand]},
+         config=cfg, db=db, decision_client=_StubDecision(_buy_decision_answers()), now=now_dt,  # type: ignore[arg-type]
+@@ -286,12 +292,14 @@ async def test_e1_missing_or_invalid_pair_address_rejects_breakout_ignition(tmp_
+     for bad_pair in ("", "   ", "unknown", "!!!!", "https://bad.url", "PoolNotBase58", MINT_NOPOOL):
+         clear_narrative_cache()
+         assert not is_valid_pool_address(bad_pair, mint=MINT_NOPOOL)
++        c_bad = _make_breakout_candles(18)
+         cand = {
+             "mint": MINT_NOPOOL,
+             "symbol": "NOPOOL",
+             "pair_address": bad_pair,
+             "added_at": (now_dt - timedelta(minutes=5)).isoformat(),
+-            "candles_5m": _make_breakout_candles(18),
++            "candles_5m": c_bad,
++            "_ohlcv_5m_result": __import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(c_bad, last_ok_at=now_dt.timestamp()),
+             **_strong_flow_pair(),
+         }
+         out = await alpha_node(
+diff --git a/tests/test_e3a_candle_eligibility.py b/tests/test_e3a_candle_eligibility.py
+index 3fd0bef..7eccd54 100644
+--- a/tests/test_e3a_candle_eligibility.py
++++ b/tests/test_e3a_candle_eligibility.py
+@@ -28,6 +28,7 @@ from ohlcv_client import (
+ from scalper_entry_engine import evaluate_scalper_entry
+ from state import FocusState
+ from tests.test_breakout_ignition import _make_breakout_candles, _strong_flow_pair
++from tests.test_e3b_cache_provenance import make_verified_ohlcv_result
+ 
+ 
+ class _StubDecisionClient:
+@@ -51,7 +52,8 @@ def test_t1_forming_5m_candle_dropped_and_blocks_breakout():
+     # 150s into the last 5m bar -> forming!
+     decision_ts = last_ts + 150.0
+     res = evaluate_scalper_entry(
+-        candles, _strong_flow_pair(1.12), time_in_slot_min=5.0, decision_timestamp=decision_ts
++        candles, _strong_flow_pair(1.12), time_in_slot_min=5.0, decision_timestamp=decision_ts,
++        ohlcv_provenance=make_verified_ohlcv_result(candles, last_ok_at=decision_ts),
+     )
+     assert res.eligible is False
+     assert res.setup_type != "BREAKOUT_IGNITION"
+@@ -69,6 +71,7 @@ def test_t2_forming_1m_candle_dropped_and_blocks_breakout():
+         time_in_slot_min=5.0,
+         candles_1m=bars_1m,
+         decision_timestamp=decision_ts,
++        ohlcv_provenance=make_verified_ohlcv_result(bars_1m, last_ok_at=decision_ts),
+     )
+     assert res.eligible is False
+     assert res.setup_type == "NONE"
+@@ -78,22 +81,26 @@ def test_t2_forming_1m_candle_dropped_and_blocks_breakout():
+ 
+ def test_t3a_exact_interval_boundary_is_eligible():
+     candles_5m = _make_breakout_candles(count=18, bar_seconds=300)
++    t_5m = candles_5m[-1]["timestamp"] + 300.0
+     res_5m = evaluate_scalper_entry(
+         candles_5m,
+         _strong_flow_pair(1.12),
+         time_in_slot_min=5.0,
+-        decision_timestamp=candles_5m[-1]["timestamp"] + 300.0,
++        decision_timestamp=t_5m,
++        ohlcv_provenance=make_verified_ohlcv_result(candles_5m, last_ok_at=t_5m),
+     )
+     assert res_5m.eligible is True
+     assert res_5m.setup_type == "BREAKOUT_IGNITION"
+ 
+     candles_1m = _make_breakout_candles(count=20, bar_seconds=60)
++    t_1m = candles_1m[-1]["timestamp"] + 60.0
+     res_1m = evaluate_scalper_entry(
+         [],
+         _strong_flow_pair(1.12),
+         time_in_slot_min=5.0,
+         candles_1m=candles_1m,
+-        decision_timestamp=candles_1m[-1]["timestamp"] + 60.0,
++        decision_timestamp=t_1m,
++        ohlcv_provenance=make_verified_ohlcv_result(candles_1m, last_ok_at=t_1m),
+     )
+     assert res_1m.eligible is True
+     assert res_1m.setup_type == "BREAKOUT_IGNITION"
+@@ -101,22 +108,26 @@ def test_t3a_exact_interval_boundary_is_eligible():
+ 
+ def test_t3b_one_second_before_close_is_ineligible():
+     candles_5m = _make_breakout_candles(count=18, bar_seconds=300)
++    t_5m = candles_5m[-1]["timestamp"] + 299.0
+     res_5m = evaluate_scalper_entry(
+         candles_5m,
+         _strong_flow_pair(1.12),
+         time_in_slot_min=5.0,
+-        decision_timestamp=candles_5m[-1]["timestamp"] + 299.0,
++        decision_timestamp=t_5m,
++        ohlcv_provenance=make_verified_ohlcv_result(candles_5m, last_ok_at=t_5m),
+     )
+     assert res_5m.eligible is False
+     assert res_5m.setup_type != "BREAKOUT_IGNITION"
+ 
+     candles_1m = _make_breakout_candles(count=20, bar_seconds=60)
++    t_1m = candles_1m[-1]["timestamp"] + 59.0
+     res_1m = evaluate_scalper_entry(
+         [],
+         _strong_flow_pair(1.12),
+         time_in_slot_min=5.0,
+         candles_1m=candles_1m,
+-        decision_timestamp=candles_1m[-1]["timestamp"] + 59.0,
++        decision_timestamp=t_1m,
++        ohlcv_provenance=make_verified_ohlcv_result(candles_1m, last_ok_at=t_1m),
+     )
+     assert res_1m.eligible is False
+     assert res_1m.setup_type == "NONE"
+@@ -125,11 +136,13 @@ def test_t3b_one_second_before_close_is_ineligible():
+ def test_t4_stale_but_closed_candles_retained_by_closed_filter():
+     candles_5m = _make_breakout_candles(count=18, bar_seconds=300)
+     # 900s after last bar start (600s after close) -> still closed
++    t_5m = candles_5m[-1]["timestamp"] + 900.0
+     res = evaluate_scalper_entry(
+         candles_5m,
+         _strong_flow_pair(1.12),
+         time_in_slot_min=5.0,
+-        decision_timestamp=candles_5m[-1]["timestamp"] + 900.0,
++        decision_timestamp=t_5m,
++        ohlcv_provenance=make_verified_ohlcv_result(candles_5m, last_ok_at=t_5m),
+     )
+     assert res.eligible is True
+     assert res.setup_type == "BREAKOUT_IGNITION"
+@@ -293,6 +306,7 @@ async def test_t6d_preattached_5m_only_candidate_makes_no_1m_network_request(tmp
+         "pair_address": "PoolPre111111111111111111111111111111111111",
+         "added_at": datetime.fromtimestamp(decision_ts - 360.0, tz=timezone.utc).isoformat(),
+         "candles_5m": short_5m,
++        "_ohlcv_5m_result": make_verified_ohlcv_result(short_5m, last_ok_at=decision_ts),
+         **_strong_flow_pair(1.12),
+     }
+     state = {"focus_state": FocusState.SCANNING.value, "sol_balance": 0.7, "safe_candidates": [cand]}
+@@ -309,7 +323,7 @@ async def test_t6d_preattached_5m_only_candidate_makes_no_1m_network_request(tmp
+ 
+     assert net_calls["count"] == 0
+     assert out["alpha_decisions"][0]["approved"] is False
+-    assert "insufficient 5m candles" in out["alpha_decisions"][0]["rationale"]
++    assert "ineligible OHLCV source (unavailable)" in out["alpha_decisions"][0]["rationale"]
+     db.close()
+ 
+ 
+@@ -329,7 +343,8 @@ def test_t7_diagnostic_gap_does_not_reject_valid_closed_candles():
+     assert gap_diag["max_recent_gap_seconds"] == 900.0
+ 
+     res = evaluate_scalper_entry(
+-        candles, _strong_flow_pair(1.12), time_in_slot_min=5.0, decision_timestamp=decision_ts
++        candles, _strong_flow_pair(1.12), time_in_slot_min=5.0, decision_timestamp=decision_ts,
++        ohlcv_provenance=make_verified_ohlcv_result(candles, last_ok_at=decision_ts),
+     )
+     assert "insufficient 5m candles" not in (res.rejection_reason or "")
+     assert res.eligible is True
+diff --git a/tests/test_helius_webhook.py b/tests/test_helius_webhook.py
+index 79fd199..3667dda 100644
+--- a/tests/test_helius_webhook.py
++++ b/tests/test_helius_webhook.py
+@@ -307,6 +307,7 @@ async def test_scanner_merges_whale_mints_and_alpha_injects_whale_confluence_and
+         cand,
+         added_at=(now_dt - timedelta(minutes=5)).isoformat(),
+         candles_5m=make_sweep_reclaim_candles(),
++        _ohlcv_5m_result=__import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(make_sweep_reclaim_candles(), last_ok_at=now_dt.timestamp()),
+     )
+     dec = StubDecisionClient(
+         {
+diff --git a/tests/test_jupiter_token_client.py b/tests/test_jupiter_token_client.py
+index 69b2169..2b2c777 100644
+--- a/tests/test_jupiter_token_client.py
++++ b/tests/test_jupiter_token_client.py
+@@ -303,6 +303,7 @@ async def test_jupiter_is_sus_rejected_at_scanner_and_safety_gate(tmp_path):
+         cand,
+         added_at=(now_dt - timedelta(minutes=5)).isoformat(),
+         candles_5m=make_sweep_reclaim_candles(),
++        _ohlcv_5m_result=__import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(make_sweep_reclaim_candles(), last_ok_at=now_dt.timestamp()),
+     )
+     dec = StubDecisionClient(
+         {
+diff --git a/tests/test_leg2_predictor.py b/tests/test_leg2_predictor.py
+index fb3124f..ce9ab81 100644
+--- a/tests/test_leg2_predictor.py
++++ b/tests/test_leg2_predictor.py
+@@ -180,7 +180,7 @@ async def test_alpha_leg2_fast_track_entries_and_telemetry(tmp_path, caplog):
+             {
+                 "focus_state": FocusState.SCANNING.value,
+                 "sol_balance": 0.7,
+-                "safe_candidates": [strong_cand],
++                "safe_candidates": [{**strong_cand, "_ohlcv_5m_result": __import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(valid_candles, last_ok_at=now_dt.timestamp())}],
+             },
+             config=cfg,
+             db=db,
+@@ -224,7 +224,7 @@ async def test_alpha_leg2_fast_track_entries_and_telemetry(tmp_path, caplog):
+         {
+             "focus_state": FocusState.SCANNING.value,
+             "sol_balance": 0.7,
+-            "safe_candidates": [cand_75_simple],
++            "safe_candidates": [{**cand_75_simple, "_ohlcv_5m_result": __import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(valid_candles, last_ok_at=now_dt.timestamp())}],
+         },
+         config=cfg,
+         db=db,
+diff --git a/tests/test_scalper_entry_engine.py b/tests/test_scalper_entry_engine.py
+index 0a0d140..ae77540 100644
+--- a/tests/test_scalper_entry_engine.py
++++ b/tests/test_scalper_entry_engine.py
+@@ -229,26 +229,35 @@ async def test_ohlcv_90s_cache_and_429_exponential_backoff():
+ 
+ 
+ def test_scalper_blocks_tick1_soak_and_overbought_spike():
++    from tests.test_e3b_cache_provenance import make_verified_ohlcv_result
+     cfg = AgentConfig(_env_file=None)
+     good_flow = {"buys_5m": 30, "sells_5m": 10}  # 75% buys, n=40
+ 
+     # (c) Block tick-1 chase via 3m soak even on a valid SWEEP_RECLAIM
++    c_sr = make_sweep_reclaim_candles()
++    t_sr = c_sr[-1]["timestamp"] + 300.0
+     res_soak = evaluate_scalper_entry(
+-        make_sweep_reclaim_candles(),
++        c_sr,
+         good_flow,
+         time_in_slot_min=0.2,
+         config=cfg,
++        decision_timestamp=t_sr,
++        ohlcv_provenance=make_verified_ohlcv_result(c_sr, last_ok_at=t_sr),
+     )
+     assert res_soak.eligible is False
+     assert res_soak.rejection_reason is not None
+     assert "soak 0.2m < 3m" in res_soak.rejection_reason
+ 
+     # (d) Block overbought vertical spike (RSI > 70 and within 5% of 1h high)
++    c_sp = make_overbought_spike_candles()
++    t_sp = c_sp[-1]["timestamp"] + 300.0
+     res_spike = evaluate_scalper_entry(
+-        make_overbought_spike_candles(),
++        c_sp,
+         good_flow,
+         time_in_slot_min=5.0,
+         config=cfg,
++        decision_timestamp=t_sp,
++        ohlcv_provenance=make_verified_ohlcv_result(c_sp, last_ok_at=t_sp),
+     )
+     assert res_spike.eligible is False
+     assert res_spike.rsi_5m > 70.0
+@@ -258,16 +267,21 @@ def test_scalper_blocks_tick1_soak_and_overbought_spike():
+ 
+ 
+ def test_scalper_approves_sweep_reclaim_and_displacement_retest_with_order_flow():
++    from tests.test_e3b_cache_provenance import make_verified_ohlcv_result
+     cfg = AgentConfig(_env_file=None)
+     good_flow = {"txns": {"m5": {"buys": 24, "sells": 12}}}  # 66.7% >= 58%, n=36 >= 15
+     weak_flow = {"txns": {"m5": {"buys": 8, "sells": 10}}}  # 44% < 58%
+ 
+     # SWEEP_RECLAIM approved with strong order flow
++    c_sr = make_sweep_reclaim_candles()
++    t_sr = c_sr[-1]["timestamp"] + 300.0
+     res_sweep = evaluate_scalper_entry(
+-        make_sweep_reclaim_candles(),
++        c_sr,
+         good_flow,
+         time_in_slot_min=4.5,
+         config=cfg,
++        decision_timestamp=t_sr,
++        ohlcv_provenance=make_verified_ohlcv_result(c_sr, last_ok_at=t_sr),
+     )
+     assert res_sweep.eligible is True
+     assert res_sweep.setup_type == "SWEEP_RECLAIM"
+@@ -276,11 +290,15 @@ def test_scalper_approves_sweep_reclaim_and_displacement_retest_with_order_flow(
+     assert res_sweep.rejection_reason is None
+ 
+     # DISPLACEMENT_RETEST approved with strong order flow
++    c_dr = make_displacement_retest_candles()
++    t_dr = c_dr[-1]["timestamp"] + 300.0
+     res_disp = evaluate_scalper_entry(
+-        make_displacement_retest_candles(),
++        c_dr,
+         good_flow,
+         time_in_slot_min=6.0,
+         config=cfg,
++        decision_timestamp=t_dr,
++        ohlcv_provenance=make_verified_ohlcv_result(c_dr, last_ok_at=t_dr),
+     )
+     assert res_disp.eligible is True
+     assert res_disp.setup_type == "DISPLACEMENT_RETEST"
+@@ -289,10 +307,12 @@ def test_scalper_approves_sweep_reclaim_and_displacement_retest_with_order_flow(
+ 
+     # Weak order flow blocks even a valid SWEEP_RECLAIM
+     res_weak = evaluate_scalper_entry(
+-        make_sweep_reclaim_candles(),
++        c_sr,
+         weak_flow,
+         time_in_slot_min=5.0,
+         config=cfg,
++        decision_timestamp=t_sr,
++        ohlcv_provenance=make_verified_ohlcv_result(c_sr, last_ok_at=t_sr),
+     )
+     assert res_weak.eligible is False
+     assert "buy_ratio" in (res_weak.rejection_reason or "")
+@@ -323,6 +343,7 @@ async def test_alpha_blocks_unsoaked_spike_logs_reason_and_exposes_telemetry(tmp
+         }
+     )
+ 
++    c_w = make_overbought_spike_candles()
+     cand = {
+         "mint": "MintWiggles",
+         "symbol": "WIGGLES",
+@@ -331,7 +352,8 @@ async def test_alpha_blocks_unsoaked_spike_logs_reason_and_exposes_telemetry(tmp
+         "buys_5m": 30,
+         "sells_5m": 10,
+         "added_at": just_added,
+-        "candles_5m": make_overbought_spike_candles(),
++        "candles_5m": c_w,
++        "_ohlcv_5m_result": __import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(c_w, last_ok_at=now_dt.timestamp()),
+     }
+ 
+     with caplog.at_level(logging.INFO, logger="alpha_node"):
+diff --git a/tests/test_soak_readiness.py b/tests/test_soak_readiness.py
+index f030470..4d6090b 100644
+--- a/tests/test_soak_readiness.py
++++ b/tests/test_soak_readiness.py
+@@ -365,7 +365,16 @@ async def test_signal_and_telemetry_completeness_mc_usd_exact_quote_and_live_mom
+     out_t1 = await alpha_node({"focus_state": FocusState.SCANNING.value, "sol_balance": 1.50, "safe_candidates": [cand_t1]}, config=cfg, db=db, decision_client=dec_client, now=now_dt)  # type: ignore[arg-type]
+     assert dec_client.decide_calls == 1 and out_t1["pending_order"] is None
+ 
+-    cand_t2 = {**cand_t1, "market_cap_usd": 485_000.0, "volume_5m_usd": 18_000.0, "price_change_5m_pct": 8.5, "buys_5m": 34, "sells_5m": 10, "candles_5m": make_sweep_reclaim_candles()}
++    cand_t2 = {
++        **cand_t1,
++        "market_cap_usd": 485_000.0,
++        "volume_5m_usd": 18_000.0,
++        "price_change_5m_pct": 8.5,
++        "buys_5m": 34,
++        "sells_5m": 10,
++        "candles_5m": make_sweep_reclaim_candles(),
++        "_ohlcv_5m_result": __import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(make_sweep_reclaim_candles(), last_ok_at=(now_dt + timedelta(seconds=30)).timestamp()),
++    }
+     out_t2 = await alpha_node({"focus_state": FocusState.SCANNING.value, "sol_balance": 1.50, "safe_candidates": [cand_t2]}, config=cfg, db=db, decision_client=dec_client, now=now_dt + timedelta(seconds=30))  # type: ignore[arg-type]
+     assert dec_client.decide_calls == 1 and out_t2["pending_order"] is not None
+     assert out_t2["pending_order"]["side"] == "BUY" and out_t2["pending_order"]["entry_mc_usd"] == 485_000.0
+diff --git a/tests/test_x_discovery_worker.py b/tests/test_x_discovery_worker.py
+index 2a05838..15bdb58 100644
+--- a/tests/test_x_discovery_worker.py
++++ b/tests/test_x_discovery_worker.py
+@@ -224,6 +224,7 @@ async def test_scanner_merges_x_mints_and_alpha_injects_x_snippets_and_telemetry
+         cand,
+         added_at=(now_dt - timedelta(minutes=5)).isoformat(),
+         candles_5m=make_sweep_reclaim_candles(),
++        _ohlcv_5m_result=__import__("tests.test_e3b_cache_provenance", fromlist=["make_verified_ohlcv_result"]).make_verified_ohlcv_result(make_sweep_reclaim_candles(), last_ok_at=now_dt.timestamp()),
+     )
+     dec = StubDecisionClient(
+         {
+diff --git a/whale_lane.py b/whale_lane.py
+index 569c6a1..7e1cffc 100644
+--- a/whale_lane.py
++++ b/whale_lane.py
+@@ -22,10 +22,12 @@ from db import AgentDatabase, utc_now
+ from executor_node import executor_node
+ from jupiter_token_client import enrich_mints
+ from ohlcv_client import (
++    OhlcvFetchResult,
+     cache_breakout_telemetry,
+-    fetch_ohlcv_1m_batch,
+-    fetch_ohlcv_batch,
+-    get_cached_breakout_telemetry,
++    fetch_ohlcv_1m_batch_with_provenance,
++    fetch_ohlcv_batch_with_provenance,
++    get_cached_breakout_telemetry_with_meta,
++    select_ohlcv_interval_provenance,
+     should_fetch_1m_fallback,
+ )
+ from safety_gate_node import check_token_safety
+@@ -348,17 +350,31 @@ async def run_whale_lane_tick(
+         )
+         # Fetch 5m OHLCV (+ 1m fallback ONLY when 5m succeeded 200 OK with < 12 bars) using shared cache
+         pair_addrs = [str(p.get("pairAddress") or "") for p in pairs_by_mint.values() if p.get("pairAddress")]
+-        ohlcv_5m = await fetch_ohlcv_batch(pair_addrs, config, client, now_ts=now_dt.timestamp()) if pair_addrs else {}
++        ohlcv_5m = (
++            await fetch_ohlcv_batch_with_provenance(pair_addrs, config, client, now_ts=now_dt.timestamp())
++            if pair_addrs
++            else {}
++        )
+         short_addrs = [
+-            a for a in pair_addrs
+-            if should_fetch_1m_fallback(a, ohlcv_5m.get(a) or [], now_ts=now_dt.timestamp())
++            a
++            for a in pair_addrs
++            if should_fetch_1m_fallback(
++                a,
++                (ohlcv_5m[a].candles if a in ohlcv_5m else []),
++                now_ts=now_dt.timestamp(),
++            )
+         ]
+-        ohlcv_1m = await fetch_ohlcv_1m_batch(short_addrs, config, client, now_ts=now_dt.timestamp()) if short_addrs else {}
++        ohlcv_1m = (
++            await fetch_ohlcv_1m_batch_with_provenance(short_addrs, config, client, now_ts=now_dt.timestamp())
++            if short_addrs
++            else {}
++        )
+ 
+         open_mints = db.get_all_open_mints()
+         for trig in triggers:
+             mint = trig["mint"]
+-            cached_bt = get_cached_breakout_telemetry(mint, now_ts=now_dt.timestamp())
++            cached_bt_meta = get_cached_breakout_telemetry_with_meta(mint, now_ts=now_dt.timestamp())
++            cached_bt = dict(cached_bt_meta.telemetry) if cached_bt_meta is not None else None
+             if db.is_on_cooldown(mint, now=now_dt):
+                 db.upsert_whale_decision(mint, "SKIPPED", "COOLDOWN", updated_at=now_dt.isoformat(), breakout_telemetry=cached_bt)
+                 continue
+@@ -375,9 +391,44 @@ async def run_whale_lane_tick(
+             p_addr = str(pair.get("pairAddress") or "")
+ 
+             # Compute shared breakout_telemetry (5m or 1m_fallback) or preserve cached meter during backoff
+-            c5 = pair.get("candles_5m") if isinstance(pair.get("candles_5m"), list) else ohlcv_5m.get(p_addr, [])
+-            c1 = pair.get("candles_1m") if isinstance(pair.get("candles_1m"), list) else ohlcv_1m.get(p_addr, [])
+-            has_ohlcv = bool(c5 or c1)
++            unavail = OhlcvFetchResult(
++                candles=[], source="unavailable", fetched_at=None, last_ok_at=None, last_status=None
++            )
++            if isinstance(pair.get("candles_5m"), list):
++                c5 = pair["candles_5m"]
++                raw_5m_prov = pair.get("_ohlcv_5m_result")
++                res_5m = (
++                    raw_5m_prov
++                    if isinstance(raw_5m_prov, OhlcvFetchResult)
++                    else OhlcvFetchResult(
++                        candles=list(c5), source="pre_attached_unknown", fetched_at=None, last_ok_at=None, last_status=None
++                    )
++                )
++            else:
++                res_5m = ohlcv_5m.get(p_addr, unavail)
++                c5 = res_5m.candles
++
++            if isinstance(pair.get("candles_1m"), list):
++                c1 = pair["candles_1m"]
++                raw_1m_prov = pair.get("_ohlcv_1m_result")
++                res_1m = (
++                    raw_1m_prov
++                    if isinstance(raw_1m_prov, OhlcvFetchResult)
++                    else OhlcvFetchResult(
++                        candles=list(c1), source="pre_attached_unknown", fetched_at=None, last_ok_at=None, last_status=None
++                    )
++                )
++            else:
++                res_1m = ohlcv_1m.get(p_addr, unavail)
++                c1 = res_1m.candles
++
++            active_prov, prov_ok, _ = select_ohlcv_interval_provenance(
++                res_5m,
++                res_1m,
++                decision_timestamp=now_dt.timestamp(),
++                max_cache_age_seconds=float(config.OHLCV_CACHE_SECONDS),
++            )
++            has_ohlcv = bool((c5 or c1) and prov_ok)
+             sc_res = evaluate_scalper_entry(
+                 c5,
+                 pair,
+@@ -385,10 +436,17 @@ async def run_whale_lane_tick(
+                 config=config,
+                 candles_1m=c1,
+                 decision_timestamp=now_dt.timestamp(),
++                ohlcv_provenance=active_prov,
+             )
+             bt = sc_res.breakout_telemetry if (has_ohlcv and sc_res.breakout_telemetry) else (cached_bt or sc_res.breakout_telemetry or {})
+             if has_ohlcv and sc_res.breakout_telemetry:
+-                cache_breakout_telemetry(mint, sc_res.breakout_telemetry, now_ts=now_dt.timestamp())
++                cache_breakout_telemetry(
++                    mint,
++                    sc_res.breakout_telemetry,
++                    ohlcv_source=active_prov.source,
++                    ohlcv_last_ok_at=active_prov.last_ok_at,
++                    now_ts=now_dt.timestamp(),
++                )
+             bt_score = int(bt.get("score") or 0)
+             bt_state = str(bt.get("state") or "FORMING")
+             bt_failed_str = "; ".join(bt.get("failed_gates") or []) if bt else ""
+@@ -412,8 +470,7 @@ async def run_whale_lane_tick(
+                 db.upsert_whale_decision(mint, "SKIPPED", mc_reason, updated_at=now_dt.isoformat(), breakout_telemetry=bt)
+                 continue
+ 
+-            # Whale Breakout Gate (applied when OHLCV bars were evaluated; rejects EXTENDED or low score)
+-            has_ohlcv = bool(c5 or c1)
++            # Whale Breakout Gate (applied ONLY when live/verified OHLCV bars were evaluated; rejects EXTENDED or low score)
+             if has_ohlcv and config.WHALE_BLOCK_EXTENDED and bt_state == "EXTENDED":
+                 rej = f"BREAKOUT_EXTENDED ({bt_failed_str})" if bt_failed_str else "BREAKOUT_EXTENDED"
+                 db.upsert_whale_decision(mint, "SKIPPED", rej, updated_at=now_dt.isoformat(), breakout_telemetry=bt)
