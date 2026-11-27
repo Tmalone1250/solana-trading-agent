@@ -62,6 +62,8 @@ async def test_e2b_buy_to_sell_reconciles_account_and_lifecycle_pnl(tmp_path):
     cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.001, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if "/tokens/v2/search" in str(request.url):
+            return httpx.Response(200, json=[{"id": MINT_E2B, "audit": {"isSus": False}}])
         if request.url.params.get("inputMint") == SOL_MINT:
             return httpx.Response(200, json={"outAmount": "1000000", "transaction": None})
         return httpx.Response(200, json={"outAmount": str(int(0.55 * LAMPORTS_PER_SOL)), "transaction": None})
@@ -245,6 +247,8 @@ async def test_e2b_live_unknown_fee_remains_null_and_historical_migration_preser
     unsigned_tx = base64.b64encode(bytes(VersionedTransaction(msg, [kp]))).decode("ascii")
 
     def live_handler(request: httpx.Request) -> httpx.Response:
+        if "/tokens/v2/search" in str(request.url):
+            return httpx.Response(200, json=[{"id": MINT_E2B, "audit": {"isSus": False}}])
         if str(request.url).startswith("https://rpc.example.test"):
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
         if "/swap/v2/order" in str(request.url):
@@ -557,6 +561,8 @@ async def test_e2b_c2_live_unknown_fees_no_zero_substitution(tmp_path, monkeypat
     sell_calls = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if "/tokens/v2/search" in str(request.url):
+            return httpx.Response(200, json=[{"id": MINT_E2B, "audit": {"isSus": False}}])
         if str(request.url).startswith("https://rpc.example.test"):
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 3_000_000_000}})
         if request.url.params.get("inputMint") == SOL_MINT:

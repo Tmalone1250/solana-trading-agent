@@ -308,8 +308,32 @@ def validate_rugcheck_structure(summary: Any) -> Optional[str]:
     return None
 
 
+_SHIELD_EVIDENCE_KEYS = {"warnings", "isFrozen", "freezeAuthority", "mintAuthority"}
+
+
+def _validate_shield_token_obj(token_obj: dict[str, Any]) -> Optional[str]:
+    """Validate that a mints-map or list-entry Shield object contains non-empty recognized shield evidence."""
+    if not token_obj:
+        return "empty Jupiter Shield mint entry"
+    if "shield" in token_obj:
+        shield_obj = token_obj.get("shield")
+        if not isinstance(shield_obj, dict) or not shield_obj:
+            return "empty or malformed nested Jupiter Shield object"
+    else:
+        shield_obj = token_obj
+    if not (_SHIELD_EVIDENCE_KEYS & set(shield_obj.keys())):
+        return "incomplete Jupiter Shield evidence fields"
+    if "warnings" in shield_obj:
+        w_list = shield_obj.get("warnings")
+        if not isinstance(w_list, list) or not all(isinstance(w, (dict, str)) for w in w_list):
+            return "malformed Jupiter Shield warnings list"
+    if "isFrozen" in shield_obj and not isinstance(shield_obj.get("isFrozen"), bool):
+        return "malformed Jupiter Shield isFrozen field"
+    return None
+
+
 def validate_jupiter_shield_structure(shield_payload: Any, mint: str) -> Optional[str]:
-    """Return error reason if Jupiter Shield payload lacks a valid entry for mint, else None."""
+    """Return error reason if Jupiter Shield payload lacks valid evidence for mint, else None."""
     if isinstance(shield_payload, dict):
         warnings_map = shield_payload.get("warnings")
         if isinstance(warnings_map, dict) and mint in warnings_map:
@@ -319,12 +343,12 @@ def validate_jupiter_shield_structure(shield_payload: Any, mint: str) -> Optiona
             return "malformed Jupiter Shield warnings list"
         mints_map = shield_payload.get("mints")
         if isinstance(mints_map, dict) and isinstance(mints_map.get(mint), dict):
-            return None
+            return _validate_shield_token_obj(mints_map[mint])
         return "missing mint entry in Jupiter Shield response"
     if isinstance(shield_payload, list):
         for item in shield_payload:
             if isinstance(item, dict) and item.get("mint") == mint:
-                return None
+                return _validate_shield_token_obj(item)
         return "missing mint entry in Jupiter Shield list response"
     return "malformed Jupiter Shield response"
 

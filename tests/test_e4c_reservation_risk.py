@@ -125,6 +125,8 @@ async def test_e4c_live_rpc_balance_success_insufficient_timeout_and_error(tmp_p
     rpc_mode = {"mode": "ok", "lamports": int(0.56 * LAMPORTS_PER_SOL)}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if "/tokens/v2/search" in str(request.url):
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
         if str(request.url).startswith(RPC_URL):
             if rpc_mode["mode"] == "timeout":
                 raise httpx.ReadTimeout("RPC timed out")
@@ -309,6 +311,8 @@ async def test_e4c_prebroadcast_cancellation_and_post_quote_exception_release_re
 
     # 1. Pre-broadcast CancelledError during quote fetch releases reservation
     async def _cancel_transport(request: httpx.Request) -> httpx.Response:
+        if "/tokens/v2/search" in str(request.url):
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
         if str(request.url).startswith(RPC_URL):
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
         await asyncio.sleep(5.0)
@@ -329,6 +333,8 @@ async def test_e4c_prebroadcast_cancellation_and_post_quote_exception_release_re
 
     # 2. Exception after quote retrieval but before broadcast (missing tx in live mode) releases reservation
     def _no_tx_handler(request: httpx.Request) -> httpx.Response:
+        if "/tokens/v2/search" in str(request.url):
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
         if str(request.url).startswith(RPC_URL):
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
         return httpx.Response(200, json={"outAmount": "1000000", "transaction": None, "requestId": "req-no-tx"})
@@ -360,6 +366,8 @@ async def test_e4c_potentially_broadcast_live_timeout_remains_locked_past_task_e
         db.mark_watchlist_safety_passed(m, True, checked_at=datetime.now(timezone.utc).isoformat())
 
     def _timeout_exec_handler(request: httpx.Request) -> httpx.Response:
+        if "/tokens/v2/search" in str(request.url):
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
         if str(request.url).startswith(RPC_URL):
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
         if "/swap/v2/order" in str(request.url):
@@ -412,6 +420,8 @@ async def test_e4c_concurrent_buys_rpc_outside_lock_and_release_on_prebroadcast_
     fail_quote = {"flag": False}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if "/tokens/v2/search" in str(request.url):
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
         if str(request.url).startswith(RPC_URL):
             # Verify db._lock is NOT held during the RPC call (check from another thread to defeat RLock re-entrancy)
             import threading
@@ -509,6 +519,8 @@ async def test_e4c_post_broadcast_settlement_failure_retains_reservation_and_rol
 
     # 2. End-to-end live executor_node post-broadcast settlement failure -> transitions to BROADCAST_UNRESOLVED
     def _ok_handler(request: httpx.Request) -> httpx.Response:
+        if "/tokens/v2/search" in str(request.url):
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
         if str(request.url).startswith(RPC_URL):
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
         if "/swap/v2/order" in str(request.url):

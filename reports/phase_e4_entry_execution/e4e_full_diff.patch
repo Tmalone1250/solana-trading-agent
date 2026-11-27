@@ -81,7 +81,7 @@ index fa5d942..e4ce69c 100644
          self,
          *,
 diff --git a/executor_node.py b/executor_node.py
-index 67539d4..64e0568 100644
+index 67539d4..03e0a1e 100644
 --- a/executor_node.py
 +++ b/executor_node.py
 @@ -18,6 +18,9 @@ from solders.transaction import VersionedTransaction
@@ -94,7 +94,7 @@ index 67539d4..64e0568 100644
  from state import ActivePosition, AgentGraphState, FocusState, PendingOrder, is_valid_pool_address
  from state_ledger import (
      acquire_exit_guard,
-@@ -452,6 +455,113 @@ def _evaluate_e4b_route_pool(
+@@ -452,6 +455,115 @@ def _evaluate_e4b_route_pool(
      return (router_norm, route_pool_keys, "VERIFIED_PINNED_POOL", None)
  
  
@@ -131,13 +131,14 @@ index 67539d4..64e0568 100644
 +                f"BLOCKED: PINNED_POOL_MISMATCH_AT_SAFETY (order={order.pair_address}, watchlist={w_pair})"
 +            )
 +
-+    if w_row is not None and w_row.get("safety_passed") is True and is_safety_timestamp_fresh(
-+        w_row.get("safety_checked_at"), float(ttl), now_dt=ref_now
-+    ):
-+        return
++    persisted_fresh = bool(
++        w_row is not None
++        and w_row.get("safety_passed") is True
++        and is_safety_timestamp_fresh(w_row.get("safety_checked_at"), float(ttl), now_dt=ref_now)
++    )
 +
 +    confirmed_unsafe: list[str] = []
-+    # 1. Lightweight Jupiter Token v2 explicit audit.isSus check (must be present and bool)
++    # 1. Always run Jupiter Token v2 explicit audit.isSus check (must never be bypassed by fresh persisted safety)
 +    try:
 +        v2_resp = await client.get(
 +            f"{config.JUPITER_TOKENS_V2_BASE_URL}/search",
@@ -167,17 +168,18 @@ index 67539d4..64e0568 100644
 +    except Exception as exc:
 +        raise E4AValidationError(f"BLOCKED: PRE_EXECUTION_JUPITER_V2_UNAVAILABLE ({exc})") from exc
 +
-+    # 2. Full check_token_safety (RugCheck summary + Jupiter Shield) when report is stale/missing
-+    report = await check_token_safety(order.mint, config, client)
-+    if not report.passed:
-+        for r in report.reasons:
-+            if "unavailable/failed" in r.lower():
-+                if not confirmed_unsafe:
-+                    raise E4AValidationError(
-+                        f"BLOCKED: PRE_EXECUTION_SAFETY_UNAVAILABLE ({'; '.join(report.reasons)})"
-+                    )
-+            else:
-+                confirmed_unsafe.append(r)
++    # 2. Full check_token_safety (RugCheck summary + Jupiter Shield) when persisted report is stale/missing
++    if not persisted_fresh:
++        report = await check_token_safety(order.mint, config, client)
++        if not report.passed:
++            for r in report.reasons:
++                if "unavailable/failed" in r.lower():
++                    if not confirmed_unsafe:
++                        raise E4AValidationError(
++                            f"BLOCKED: PRE_EXECUTION_SAFETY_UNAVAILABLE ({'; '.join(report.reasons)})"
++                        )
++                else:
++                    confirmed_unsafe.append(r)
 +
 +    if confirmed_unsafe:
 +        reason_str = "; ".join(confirmed_unsafe)
@@ -201,14 +203,14 @@ index 67539d4..64e0568 100644
 +        )
 +        raise E4AValidationError(f"BLOCKED: PRE_EXECUTION_SAFETY_FAILED ({reason_str})")
 +
-+    if w_row is not None:
++    if not persisted_fresh and w_row is not None:
 +        db.mark_watchlist_safety_passed(order.mint, True, checked_at=ref_now.isoformat())
 +
 +
  async def fetch_live_wallet_sol_balance(
      pubkey: str,
      *,
-@@ -716,6 +826,8 @@ async def executor_node(
+@@ -716,6 +828,8 @@ async def executor_node(
      e4b_pool_status: Optional[str] = None
  
      try:
@@ -219,10 +221,10 @@ index 67539d4..64e0568 100644
                  input_mint=input_mint, output_mint=output_mint,
 diff --git a/reports/phase_e4_entry_execution/e4e_implementation_report.md b/reports/phase_e4_entry_execution/e4e_implementation_report.md
 new file mode 100644
-index 0000000..7a4e29e
+index 0000000..6987dbd
 --- /dev/null
 +++ b/reports/phase_e4_entry_execution/e4e_implementation_report.md
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,64 @@
 +# Phase E4E Implementation Report — Safety Freshness
 +
 +- **Branch:** `impl/e4e-safety-freshness`
@@ -280,16 +282,23 @@ index 0000000..7a4e29e
 +   - `_validate_e4e_pre_execution_safety` requires a positive finite `PRE_EXECUTION_SAFETY_TTL_SECONDS` for every `BUY` in both paper and live modes (all strategies), rejecting before Jupiter quoting/signing/broadcast and leaving `SELL`/`PARTIAL_SELL` unaltered.
 +4. **Fail-closed pinned pool verification (`executor_node.py`):**
 +   - For `BREAKOUT_IGNITION` BUYs, `_validate_e4e_pre_execution_safety` requires an existing watchlist row with a non-empty valid `pair_address` matching `order.pair_address` before any safety API request, Jupiter quote, signing, or broadcast.
++
++## E4E Corrective Pass 2 (from `4445bf8b29a8f635c2634e35ad0f9ca7476c4c98`)
++1. **Token v2 `audit.isSus` always enforced on BUY (`executor_node.py`):**
++   - `_validate_e4e_pre_execution_safety` always performs the matching-mint Jupiter Token v2 lookup and requires an explicit boolean `audit.isSus` even when `safety_checked_at` is fresh within `PRE_EXECUTION_SAFETY_TTL_SECONDS` (which now only skips RugCheck and Jupiter Shield).
++   - `isSus=True` retains eviction/cooldown; missing/malformed Token v2 evidence fails closed without eviction or timestamp refresh.
++2. **Tightened nested Jupiter Shield structure validation (`safety_gate_node.py`):**
++   - Added `_validate_shield_token_obj` inside `validate_jupiter_shield_structure` so `{"mints": {mint: {}}}`, `{"mints": {mint: {"shield": {}}}}`, `[{"mint": mint}]`, and `[{"mint": mint, "shield": {}}]` fail closed as `unavailable/failed` without eviction, cooldown, or timestamp refresh, while preserving valid supported formats.
 diff --git a/reports/phase_e4_entry_execution/e4e_test_results.md b/reports/phase_e4_entry_execution/e4e_test_results.md
 new file mode 100644
-index 0000000..8e2cae9
+index 0000000..0242998
 --- /dev/null
 +++ b/reports/phase_e4_entry_execution/e4e_test_results.md
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,50 @@
 +# Phase E4E Test Results
 +
 +- **Branch:** `impl/e4e-safety-freshness`
-+- **Baseline:** `7ca340f1f9c309dd9dafd9291b0d324c7ac76226` (corrective pass parent `2d221dbf2784584c6a2c3923f644d710c0381b04`)
++- **Baseline:** `7ca340f1f9c309dd9dafd9291b0d324c7ac76226` (corrective pass 2 parent `4445bf8b29a8f635c2634e35ad0f9ca7476c4c98`)
 +
 +## 1. Focused E4E Suite
 +
@@ -298,7 +307,7 @@ index 0000000..8e2cae9
 +venv/bin/pytest -q tests/test_e4e_safety_freshness.py
 +```
 +
-+Result: **`9 passed in 1.42s`**
++Result: **`11 passed in 1.89s`**
 +
 +1. `test_e4e_additive_migration_and_null_timestamp_treated_stale` — PASSED
 +2. `test_e4e_timestamp_validation_edges` — PASSED
@@ -309,15 +318,26 @@ index 0000000..8e2cae9
 +7. `test_e4e_corrective_incomplete_evidence_fails_closed_without_eviction` — PASSED
 +8. `test_e4e_corrective_paper_and_non_breakout_live_require_ttl_and_sell_unaffected` — PASSED
 +9. `test_e4e_corrective_pinned_pool_required_before_any_safety_or_quote` — PASSED
++10. `test_e4e_fresh_watchlist_still_requires_explicit_token_v2_is_sus` — PASSED
++11. `test_e4e_nested_empty_jupiter_shield_rejected_without_eviction` — PASSED
 +
-+## 2. Full Test Suite (Includes E4A–E4D & E1–E3)
++## 2. E4A–E4D & E1–E3 Regression Suites
++
++Command:
++```bash
++venv/bin/pytest -q tests/test_e4a_approval_quote_integrity.py tests/test_e4b_execution_pool_integrity.py tests/test_e4c_reservation_risk.py tests/test_e4d_transaction_reconciliation.py tests/test_e2b_fee_accounting.py tests/test_e3a_candle_eligibility.py tests/test_scanner_and_safety.py tests/test_rotating_watchlist.py tests/test_leg2_predictor.py tests/test_jupiter_token_client.py tests/test_memory_bounds_and_backoff.py tests/test_focus_machine_transitions.py
++```
++
++Result: **`78 passed in 12.24s`**
++
++## 3. Full Test Suite
 +
 +Command:
 +```bash
 +venv/bin/pytest -q tests/
 +```
 +
-+Result: **`206 passed, 3 failed in 35.79s`**
++Result: **`208 passed, 3 failed in 35.43s`**
 +
 +### Pre-Existing E1 Baseline Failures (Unchanged, 3 total)
 +1. `tests/test_insider_scanner.py::test_unconditional_hard_stop_loss_on_leg2_reentry_chart_and_whale_positions_at_minus_11_75_pct`
@@ -326,7 +346,7 @@ index 0000000..8e2cae9
 +
 +Zero new failures introduced across all other tests. `solana_meme_agent.duckdb` (`sha256: ef8a11baf9537e12d91873933f202a68af37ba1566253727caae5d8dd6ecbc03`) and `.env` were not modified.
 diff --git a/safety_gate_node.py b/safety_gate_node.py
-index af3e721..310e083 100644
+index af3e721..cc875fc 100644
 --- a/safety_gate_node.py
 +++ b/safety_gate_node.py
 @@ -3,15 +3,16 @@
@@ -466,7 +486,7 @@ index af3e721..310e083 100644
  
  SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
  CRITICAL_SHIELD_TYPES = {
-@@ -209,6 +287,48 @@ def evaluate_jupiter_shield(shield_payload: dict[str, Any], mint: str) -> list[s
+@@ -209,6 +287,72 @@ def evaluate_jupiter_shield(shield_payload: dict[str, Any], mint: str) -> list[s
      return reasons
  
  
@@ -491,8 +511,32 @@ index af3e721..310e083 100644
 +    return None
 +
 +
++_SHIELD_EVIDENCE_KEYS = {"warnings", "isFrozen", "freezeAuthority", "mintAuthority"}
++
++
++def _validate_shield_token_obj(token_obj: dict[str, Any]) -> Optional[str]:
++    """Validate that a mints-map or list-entry Shield object contains non-empty recognized shield evidence."""
++    if not token_obj:
++        return "empty Jupiter Shield mint entry"
++    if "shield" in token_obj:
++        shield_obj = token_obj.get("shield")
++        if not isinstance(shield_obj, dict) or not shield_obj:
++            return "empty or malformed nested Jupiter Shield object"
++    else:
++        shield_obj = token_obj
++    if not (_SHIELD_EVIDENCE_KEYS & set(shield_obj.keys())):
++        return "incomplete Jupiter Shield evidence fields"
++    if "warnings" in shield_obj:
++        w_list = shield_obj.get("warnings")
++        if not isinstance(w_list, list) or not all(isinstance(w, (dict, str)) for w in w_list):
++            return "malformed Jupiter Shield warnings list"
++    if "isFrozen" in shield_obj and not isinstance(shield_obj.get("isFrozen"), bool):
++        return "malformed Jupiter Shield isFrozen field"
++    return None
++
++
 +def validate_jupiter_shield_structure(shield_payload: Any, mint: str) -> Optional[str]:
-+    """Return error reason if Jupiter Shield payload lacks a valid entry for mint, else None."""
++    """Return error reason if Jupiter Shield payload lacks valid evidence for mint, else None."""
 +    if isinstance(shield_payload, dict):
 +        warnings_map = shield_payload.get("warnings")
 +        if isinstance(warnings_map, dict) and mint in warnings_map:
@@ -502,12 +546,12 @@ index af3e721..310e083 100644
 +            return "malformed Jupiter Shield warnings list"
 +        mints_map = shield_payload.get("mints")
 +        if isinstance(mints_map, dict) and isinstance(mints_map.get(mint), dict):
-+            return None
++            return _validate_shield_token_obj(mints_map[mint])
 +        return "missing mint entry in Jupiter Shield response"
 +    if isinstance(shield_payload, list):
 +        for item in shield_payload:
 +            if isinstance(item, dict) and item.get("mint") == mint:
-+                return None
++                return _validate_shield_token_obj(item)
 +        return "missing mint entry in Jupiter Shield list response"
 +    return "malformed Jupiter Shield response"
 +
@@ -515,7 +559,7 @@ index af3e721..310e083 100644
  async def check_token_safety(
      mint: str,
      config: AgentConfig,
-@@ -226,10 +346,14 @@ async def check_token_safety(
+@@ -226,10 +370,14 @@ async def check_token_safety(
          rug_resp = await client.get(rug_url, timeout=10.0)
          rug_resp.raise_for_status()
          rug_data = rug_resp.json()
@@ -534,7 +578,7 @@ index af3e721..310e083 100644
      except Exception as exc:
          reasons.append(f"RugCheck unavailable/failed: {exc}")
  
-@@ -246,7 +370,11 @@ async def check_token_safety(
+@@ -246,7 +394,11 @@ async def check_token_safety(
          )
          sh_resp.raise_for_status()
          sh_data = sh_resp.json()
@@ -547,7 +591,7 @@ index af3e721..310e083 100644
      except Exception as exc:
          reasons.append(f"Jupiter Shield unavailable/failed: {exc}")
  
-@@ -283,8 +411,20 @@ async def safety_gate_node(
+@@ -283,8 +435,20 @@ async def safety_gate_node(
      if not raw_candidates:
          return {"safe_candidates": [], "rejected_candidates": []}
  
@@ -570,7 +614,7 @@ index af3e721..310e083 100644
          if db is not None
          else {}
      )
-@@ -316,9 +456,24 @@ async def safety_gate_node(
+@@ -316,9 +480,24 @@ async def safety_gate_node(
                  rejected.append({"mint": mint, "symbol": symbol, "reasons": [reason_str]})
                  continue
  
@@ -598,7 +642,7 @@ index af3e721..310e083 100644
                  enriched = dict(cand)
                  enriched["safety_passed"] = True
                  enriched["safety_report"] = {"mint": mint, "passed": True, "cached": True, "reasons": []}
-@@ -326,11 +481,11 @@ async def safety_gate_node(
+@@ -326,11 +505,11 @@ async def safety_gate_node(
                  logger.info("[SafetyGate] $%s | CACHED PASS (skipped redundant API calls)", symbol)
                  continue
  
@@ -641,10 +685,10 @@ index 447fad3..c51dec7 100644
              return httpx.Response(200, json={"outAmount": "575000000", "transaction": None})
          return httpx.Response(200, json={"outAmount": "1000000", "transaction": None})
 diff --git a/tests/test_alpha_and_executor.py b/tests/test_alpha_and_executor.py
-index beb6c75..ace20ed 100644
+index beb6c75..71fc04c 100644
 --- a/tests/test_alpha_and_executor.py
 +++ b/tests/test_alpha_and_executor.py
-@@ -110,7 +110,9 @@ async def test_alpha_node_single_batched_decision_1_call(tmp_path):
+@@ -110,11 +110,15 @@ async def test_alpha_node_single_batched_decision_1_call(tmp_path):
  @pytest.mark.asyncio
  async def test_executor_paper_mode_omits_taker_and_logs_out_amount(tmp_path):
      db = AgentDatabase(db_path=str(tmp_path / "exec_paper.duckdb"), starting_sol=0.7)
@@ -655,7 +699,13 @@ index beb6c75..ace20ed 100644
  
      seen_params = {}
  
-@@ -161,6 +163,8 @@ async def test_executor_paper_mode_omits_taker_and_logs_out_amount(tmp_path):
+     def handler(request: httpx.Request) -> httpx.Response:
++        if "/tokens/v2/search" in str(request.url):
++            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+         assert request.url.path == "/swap/v2/order"
+         assert request.headers.get("x-api-key") == "jup-secret"
+         seen_params.update(dict(request.url.params))
+@@ -161,6 +165,8 @@ async def test_executor_paper_mode_omits_taker_and_logs_out_amount(tmp_path):
  @pytest.mark.asyncio
  async def test_executor_live_mode_passes_taker_signs_and_executes(tmp_path):
      db = AgentDatabase(db_path=str(tmp_path / "exec_live.duckdb"), starting_sol=0.7)
@@ -664,7 +714,7 @@ index beb6c75..ace20ed 100644
      kp = Keypair()
      cfg = AgentConfig(
          _env_file=None,
-@@ -168,6 +172,7 @@ async def test_executor_live_mode_passes_taker_signs_and_executes(tmp_path):
+@@ -168,6 +174,7 @@ async def test_executor_live_mode_passes_taker_signs_and_executes(tmp_path):
          JUPITER_API_KEY="jup-live-key",
          SOLANA_PRIVATE_KEY_BS58=str(kp),
          SOLANA_RPC_URL="https://rpc.example.test",
@@ -672,8 +722,17 @@ index beb6c75..ace20ed 100644
      )
  
      # Build a valid unsigned VersionedTransaction for the mock Jupiter response
+@@ -179,6 +186,8 @@ async def test_executor_live_mode_passes_taker_signs_and_executes(tmp_path):
+     calls: list[str] = []
+ 
+     def handler(request: httpx.Request) -> httpx.Response:
++        if "/tokens/v2/search" in str(request.url):
++            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+         if str(request.url).startswith("https://rpc.example.test"):
+             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 700_000_000}})
+         calls.append(f"{request.method} {request.url.path}")
 diff --git a/tests/test_breakout_isolation.py b/tests/test_breakout_isolation.py
-index f959349..af9d4a9 100644
+index f959349..1f3b771 100644
 --- a/tests/test_breakout_isolation.py
 +++ b/tests/test_breakout_isolation.py
 @@ -39,6 +39,7 @@ def _isolation_cfg(**overrides: Any) -> AgentConfig:
@@ -684,7 +743,7 @@ index f959349..af9d4a9 100644
      )
      defaults.update(overrides)
      return AgentConfig(**defaults)
-@@ -237,7 +238,14 @@ async def test_executor_final_guard_blocks_unauthorized_chart_buy_allows_sells_a
+@@ -237,7 +238,16 @@ async def test_executor_final_guard_blocks_unauthorized_chart_buy_allows_sells_a
      cfg = _isolation_cfg()
  
      def _jup_ok(request: httpx.Request) -> httpx.Response:
@@ -694,13 +753,15 @@ index f959349..af9d4a9 100644
 +            return httpx.Response(200, json=[{"id": request.url.params.get("query", "MintGoodBO"), "audit": {"isSus": False}}])
 +        if "rugcheck.xyz" in url:
 +            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
++        if "/tokens/v2/search" in url:
++            return httpx.Response(200, json=[{"id": bo_mint, "audit": {"isSus": False}}])
 +        if "/ultra/v1/shield" in url:
 +            return httpx.Response(200, json={"warnings": {request.url.params.get("mints", "MintGoodBO"): []}})
 +        if "/swap/v2/order" in url:
              if f"inputMint={SOL_MINT}" in str(request.url):
                  return httpx.Response(200, json={"outAmount": "1000000", "priceImpactPct": "-0.3", "transaction": None})
              return httpx.Response(200, json={"outAmount": str(int(0.30 * LAMPORTS_PER_SOL)), "priceImpactPct": "-0.3", "transaction": None})
-@@ -255,6 +263,11 @@ async def test_executor_final_guard_blocks_unauthorized_chart_buy_allows_sells_a
+@@ -255,6 +265,11 @@ async def test_executor_final_guard_blocks_unauthorized_chart_buy_allows_sells_a
          assert db.get_state()["chart_positions"] == []
  
          # 2. Authorized BREAKOUT_IGNITION BUY is accepted
@@ -712,6 +773,15 @@ index f959349..af9d4a9 100644
          ok_order = PendingOrder(
              side="BUY", mint="MintGoodBO", symbol="GBO", amount_atomic=int(0.50 * LAMPORTS_PER_SOL),
              pair_address="GgBaCs3NCBuZN12kCJgAW63ydqohFkHEdfdEXBPzLHq", dex_id="pumpswap",
+@@ -395,6 +410,8 @@ async def test_end_to_end_breakout_ignition_paper_lifecycle_partial_and_final_ex
+             }])
+         if "rugcheck.xyz" in url:
+             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
++        if "/tokens/v2/search" in url:
++            return httpx.Response(200, json=[{"id": bo_mint, "audit": {"isSus": False}}])
+         if "/ultra/v1/shield" in url:
+             return httpx.Response(200, json={"warnings": {bo_mint: []}})
+         if "/swap/v2/order" in url:
 diff --git a/tests/test_dual_lane_3x3_and_whale_breakout.py b/tests/test_dual_lane_3x3_and_whale_breakout.py
 index 48ef7a8..fd6ef25 100644
 --- a/tests/test_dual_lane_3x3_and_whale_breakout.py
@@ -844,10 +914,10 @@ index cd701f1..c0f18be 100644
              return httpx.Response(200, json={"outAmount": "1000000", "priceImpactPct": "-0.01", "transaction": None})
          if request.url.params.get("amount") == "500000":
 diff --git a/tests/test_e2b_fee_accounting.py b/tests/test_e2b_fee_accounting.py
-index 40e9e30..22a87e5 100644
+index 40e9e30..42bce29 100644
 --- a/tests/test_e2b_fee_accounting.py
 +++ b/tests/test_e2b_fee_accounting.py
-@@ -57,7 +57,9 @@ async def test_e2b_buy_to_sell_reconciles_account_and_lifecycle_pnl(tmp_path):
+@@ -57,9 +57,13 @@ async def test_e2b_buy_to_sell_reconciles_account_and_lifecycle_pnl(tmp_path):
      clear_buy_reservations()
      clear_sell_idempotency_guard()
      db = AgentDatabase(db_path=str(tmp_path / "e2b_buy_sell.duckdb"), starting_sol=2.0)
@@ -857,8 +927,12 @@ index 40e9e30..22a87e5 100644
 +    cfg = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PAPER_TX_FEE_SOL=0.001, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
  
      def handler(request: httpx.Request) -> httpx.Response:
++        if "/tokens/v2/search" in str(request.url):
++            return httpx.Response(200, json=[{"id": MINT_E2B, "audit": {"isSus": False}}])
          if request.url.params.get("inputMint") == SOL_MINT:
-@@ -101,11 +103,20 @@ async def test_e2b_partial_sell_then_final_sell_trailing_and_reentry_scope(tmp_p
+             return httpx.Response(200, json={"outAmount": "1000000", "transaction": None})
+         return httpx.Response(200, json={"outAmount": str(int(0.55 * LAMPORTS_PER_SOL)), "transaction": None})
+@@ -101,11 +105,20 @@ async def test_e2b_partial_sell_then_final_sell_trailing_and_reentry_scope(tmp_p
      clear_buy_reservations()
      clear_sell_idempotency_guard()
      db = AgentDatabase(db_path=str(tmp_path / "e2b_partial_reentry.duckdb"), starting_sol=3.0)
@@ -880,7 +954,7 @@ index 40e9e30..22a87e5 100644
          in_mint = request.url.params.get("inputMint")
          if in_mint == SOL_MINT:
              return httpx.Response(200, json={"outAmount": "1000000", "transaction": None})
-@@ -153,7 +164,7 @@ async def test_e2b_partial_sell_then_final_sell_trailing_and_reentry_scope(tmp_p
+@@ -153,7 +166,7 @@ async def test_e2b_partial_sell_then_final_sell_trailing_and_reentry_scope(tmp_p
          # Re-entry BUY must start a fresh position fee scope (never inherit Leg 1's 0.002+ fees or partial PnL)
          clear_sell_idempotency_guard()
          out_rb = await executor_node(
@@ -889,7 +963,7 @@ index 40e9e30..22a87e5 100644
              config=cfg, db=db, http_client=client,
          )
          pos2 = out_rb["chart_positions"][0]
-@@ -219,10 +230,12 @@ async def test_e2b_live_unknown_fee_remains_null_and_historical_migration_preser
+@@ -219,10 +232,12 @@ async def test_e2b_live_unknown_fee_remains_null_and_historical_migration_preser
      # 2. Live mode BUY without observed RPC fee records tx_fee_sol=NULL & fee_status='UNKNOWN'
      clear_buy_reservations()
      db_live = AgentDatabase(db_path=str(tmp_path / "e2b_live.duckdb"), starting_sol=2.0)
@@ -903,7 +977,16 @@ index 40e9e30..22a87e5 100644
      )
  
      from solders.message import MessageV0
-@@ -526,10 +539,12 @@ async def test_e2b_c2_live_unknown_fees_no_zero_substitution(tmp_path, monkeypat
+@@ -232,6 +247,8 @@ async def test_e2b_live_unknown_fee_remains_null_and_historical_migration_preser
+     unsigned_tx = base64.b64encode(bytes(VersionedTransaction(msg, [kp]))).decode("ascii")
+ 
+     def live_handler(request: httpx.Request) -> httpx.Response:
++        if "/tokens/v2/search" in str(request.url):
++            return httpx.Response(200, json=[{"id": MINT_E2B, "audit": {"isSus": False}}])
+         if str(request.url).startswith("https://rpc.example.test"):
+             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
+         if "/swap/v2/order" in str(request.url):
+@@ -526,10 +543,12 @@ async def test_e2b_c2_live_unknown_fees_no_zero_substitution(tmp_path, monkeypat
      clear_sell_idempotency_guard()
      kp = Keypair()
      db = AgentDatabase(db_path=str(tmp_path / "c2_live.duckdb"), starting_sol=3.0)
@@ -917,6 +1000,15 @@ index 40e9e30..22a87e5 100644
      )
  
      monkeypatch.setattr("executor_node.sign_jupiter_transaction", lambda tx, k: "signed-b64")
+@@ -542,6 +561,8 @@ async def test_e2b_c2_live_unknown_fees_no_zero_substitution(tmp_path, monkeypat
+     sell_calls = {"n": 0}
+ 
+     def handler(request: httpx.Request) -> httpx.Response:
++        if "/tokens/v2/search" in str(request.url):
++            return httpx.Response(200, json=[{"id": MINT_E2B, "audit": {"isSus": False}}])
+         if str(request.url).startswith("https://rpc.example.test"):
+             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 3_000_000_000}})
+         if request.url.params.get("inputMint") == SOL_MINT:
 diff --git a/tests/test_e4a_approval_quote_integrity.py b/tests/test_e4a_approval_quote_integrity.py
 index 048c034..8e54abf 100644
 --- a/tests/test_e4a_approval_quote_integrity.py
@@ -1018,7 +1110,7 @@ index 048c034..8e54abf 100644
  
          async with httpx.AsyncClient(transport=httpx.MockTransport(handler_ok)) as client:
 diff --git a/tests/test_e4b_execution_pool_integrity.py b/tests/test_e4b_execution_pool_integrity.py
-index 62a6335..266cb02 100644
+index 62a6335..0e3f50c 100644
 --- a/tests/test_e4b_execution_pool_integrity.py
 +++ b/tests/test_e4b_execution_pool_integrity.py
 @@ -51,6 +51,7 @@ def _mk_live_e4b_cfg(kp: Keypair, **overrides: Any) -> AgentConfig:
@@ -1073,7 +1165,7 @@ index 62a6335..266cb02 100644
          return httpx.Response(404)
  
      async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-@@ -257,13 +274,15 @@ async def test_e4b_paper_telemetry_all_statuses_and_opt_in_enforcement(tmp_path)
+@@ -257,16 +274,20 @@ async def test_e4b_paper_telemetry_all_statuses_and_opt_in_enforcement(tmp_path)
      ]
  
      # 1. Default paper mode (REQUIRE_PINNED_POOL_ROUTE_IN_PAPER=False): all 4 execute & persist telemetry
@@ -1089,8 +1181,14 @@ index 62a6335..266cb02 100644
 +        db.mark_watchlist_safety_passed(mint_i, True, checked_at=datetime.now(timezone.utc).isoformat())
          order_i = _mk_e4b_order(mint=mint_i)
  
-         def handler_p(_req: httpx.Request, qp: dict[str, Any] = quote_payload) -> httpx.Response:
-@@ -285,11 +304,14 @@ async def test_e4b_paper_telemetry_all_statuses_and_opt_in_enforcement(tmp_path)
+-        def handler_p(_req: httpx.Request, qp: dict[str, Any] = quote_payload) -> httpx.Response:
++        def handler_p(req: httpx.Request, qp: dict[str, Any] = quote_payload) -> httpx.Response:
++            if "/tokens/v2/search" in str(req.url):
++                return httpx.Response(200, json=[{"id": MINT_E4B, "audit": {"isSus": False}}])
+             return httpx.Response(200, json=qp)
+ 
+         async with httpx.AsyncClient(transport=httpx.MockTransport(handler_p)) as client:
+@@ -285,14 +306,19 @@ async def test_e4b_paper_telemetry_all_statuses_and_opt_in_enforcement(tmp_path)
  
      # 2. Paper enforcement enabled (REQUIRE_PINNED_POOL_ROUTE_IN_PAPER=True): non-verified statuses reject cleanly
      cfg_enf = AgentConfig(
@@ -1105,12 +1203,18 @@ index 62a6335..266cb02 100644
 +        db.mark_watchlist_safety_passed(MINT_E4B, True, checked_at=datetime.now(timezone.utc).isoformat())
          order_i = _mk_e4b_order(mint=MINT_E4B)
  
-         def handler_e(_req: httpx.Request, qp: dict[str, Any] = quote_payload) -> httpx.Response:
+-        def handler_e(_req: httpx.Request, qp: dict[str, Any] = quote_payload) -> httpx.Response:
++        def handler_e(req: httpx.Request, qp: dict[str, Any] = quote_payload) -> httpx.Response:
++            if "/tokens/v2/search" in str(req.url):
++                return httpx.Response(200, json=[{"id": MINT_E4B, "audit": {"isSus": False}}])
+             return httpx.Response(200, json=qp)
+ 
+         async with httpx.AsyncClient(transport=httpx.MockTransport(handler_e)) as client:
 diff --git a/tests/test_e4c_reservation_risk.py b/tests/test_e4c_reservation_risk.py
-index 5562e4c..cb2fc92 100644
+index 5562e4c..e550399 100644
 --- a/tests/test_e4c_reservation_risk.py
 +++ b/tests/test_e4c_reservation_risk.py
-@@ -115,10 +115,13 @@ async def test_e4c_live_rpc_balance_success_insufficient_timeout_and_error(tmp_p
+@@ -115,13 +115,18 @@ async def test_e4c_live_rpc_balance_success_insufficient_timeout_and_error(tmp_p
      cfg = AgentConfig(
          _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
          SOLANA_RPC_URL=RPC_URL, LIVE_MIN_SOL_RESERVE=0.05, LIVE_FEE_RESERVATION_BUFFER_SOL=0.01,
@@ -1125,7 +1229,12 @@ index 5562e4c..cb2fc92 100644
      rpc_mode = {"mode": "ok", "lamports": int(0.56 * LAMPORTS_PER_SOL)}
  
      def handler(request: httpx.Request) -> httpx.Response:
-@@ -298,7 +301,11 @@ async def test_e4c_prebroadcast_cancellation_and_post_quote_exception_release_re
++        if "/tokens/v2/search" in str(request.url):
++            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+         if str(request.url).startswith(RPC_URL):
+             if rpc_mode["mode"] == "timeout":
+                 raise httpx.ReadTimeout("RPC timed out")
+@@ -298,10 +303,16 @@ async def test_e4c_prebroadcast_cancellation_and_post_quote_exception_release_re
      db = AgentDatabase(db_path=str(tmp_path / "e4c_cancel.duckdb"), starting_sol=2.0)
      cfg = AgentConfig(
          _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp), SOLANA_RPC_URL=RPC_URL,
@@ -1137,7 +1246,21 @@ index 5562e4c..cb2fc92 100644
  
      # 1. Pre-broadcast CancelledError during quote fetch releases reservation
      async def _cancel_transport(request: httpx.Request) -> httpx.Response:
-@@ -346,8 +353,11 @@ async def test_e4c_potentially_broadcast_live_timeout_remains_locked_past_task_e
++        if "/tokens/v2/search" in str(request.url):
++            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+         if str(request.url).startswith(RPC_URL):
+             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
+         await asyncio.sleep(5.0)
+@@ -322,6 +333,8 @@ async def test_e4c_prebroadcast_cancellation_and_post_quote_exception_release_re
+ 
+     # 2. Exception after quote retrieval but before broadcast (missing tx in live mode) releases reservation
+     def _no_tx_handler(request: httpx.Request) -> httpx.Response:
++        if "/tokens/v2/search" in str(request.url):
++            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+         if str(request.url).startswith(RPC_URL):
+             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
+         return httpx.Response(200, json={"outAmount": "1000000", "transaction": None, "requestId": "req-no-tx"})
+@@ -346,10 +359,15 @@ async def test_e4c_potentially_broadcast_live_timeout_remains_locked_past_task_e
      db = AgentDatabase(db_path=str(tmp_path / "e4c_unres.duckdb"), starting_sol=2.0)
      cfg = AgentConfig(
          _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
@@ -1149,8 +1272,12 @@ index 5562e4c..cb2fc92 100644
 +        db.mark_watchlist_safety_passed(m, True, checked_at=datetime.now(timezone.utc).isoformat())
  
      def _timeout_exec_handler(request: httpx.Request) -> httpx.Response:
++        if "/tokens/v2/search" in str(request.url):
++            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
          if str(request.url).startswith(RPC_URL):
-@@ -392,8 +402,11 @@ async def test_e4c_concurrent_buys_rpc_outside_lock_and_release_on_prebroadcast_
+             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
+         if "/swap/v2/order" in str(request.url):
+@@ -392,13 +410,18 @@ async def test_e4c_concurrent_buys_rpc_outside_lock_and_release_on_prebroadcast_
      db = AgentDatabase(db_path=str(tmp_path / "e4c_conc.duckdb"), starting_sol=2.0)
      cfg = AgentConfig(
          _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
@@ -1163,7 +1290,14 @@ index 5562e4c..cb2fc92 100644
  
      lock_was_free_during_rpc: list[bool] = []
      fail_quote = {"flag": False}
-@@ -461,8 +474,11 @@ async def test_e4c_post_broadcast_settlement_failure_retains_reservation_and_rol
+ 
+     def handler(request: httpx.Request) -> httpx.Response:
++        if "/tokens/v2/search" in str(request.url):
++            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+         if str(request.url).startswith(RPC_URL):
+             # Verify db._lock is NOT held during the RPC call (check from another thread to defeat RLock re-entrancy)
+             import threading
+@@ -461,8 +484,11 @@ async def test_e4c_post_broadcast_settlement_failure_retains_reservation_and_rol
      db = AgentDatabase(db_path=str(tmp_path / "e4c_settle_fail.duckdb"), starting_sol=2.0)
      cfg = AgentConfig(
          _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
@@ -1176,11 +1310,20 @@ index 5562e4c..cb2fc92 100644
  
      # 1. Direct apply_trade_settlement failure: reservation stays present and DB rolls back cleanly
      res_id, rej = db.reserve_buy_slot(
+@@ -493,6 +519,8 @@ async def test_e4c_post_broadcast_settlement_failure_retains_reservation_and_rol
+ 
+     # 2. End-to-end live executor_node post-broadcast settlement failure -> transitions to BROADCAST_UNRESOLVED
+     def _ok_handler(request: httpx.Request) -> httpx.Response:
++        if "/tokens/v2/search" in str(request.url):
++            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+         if str(request.url).startswith(RPC_URL):
+             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
+         if "/swap/v2/order" in str(request.url):
 diff --git a/tests/test_e4d_transaction_reconciliation.py b/tests/test_e4d_transaction_reconciliation.py
-index 82a2d78..71909c8 100644
+index 82a2d78..f5e4393 100644
 --- a/tests/test_e4d_transaction_reconciliation.py
 +++ b/tests/test_e4d_transaction_reconciliation.py
-@@ -174,8 +174,10 @@ async def test_e4d_intent_persisted_before_broadcast_and_timeout_restores_block_
+@@ -174,12 +174,16 @@ async def test_e4d_intent_persisted_before_broadcast_and_timeout_restores_block_
      db1 = AgentDatabase(db_path=db_path, starting_sol=2.0)
      cfg = AgentConfig(
          _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
@@ -1192,12 +1335,18 @@ index 82a2d78..71909c8 100644
  
      seen_pre_broadcast_intent: list[dict[str, Any]] = []
  
+     def timeout_handler(request: httpx.Request) -> httpx.Response:
++        if "/tokens/v2/search" in str(request.url):
++            return httpx.Response(200, json=[{"id": MINT_A, "audit": {"isSus": False}}])
+         if str(request.url).startswith(RPC_URL):
+             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
+         if "/swap/v2/order" in str(request.url):
 diff --git a/tests/test_e4e_safety_freshness.py b/tests/test_e4e_safety_freshness.py
 new file mode 100644
-index 0000000..52352b8
+index 0000000..ec60af6
 --- /dev/null
 +++ b/tests/test_e4e_safety_freshness.py
-@@ -0,0 +1,618 @@
+@@ -0,0 +1,774 @@
 +"""Phase E4E regression tests: Persistent Watchlist Safety TTL & Pre-Execution Safety Boundary."""
 +
 +from __future__ import annotations
@@ -1474,8 +1623,10 @@ index 0000000..52352b8
 +    db.mark_watchlist_safety_passed(mint2, True, checked_at=datetime.now(timezone.utc).isoformat())
 +
 +    def handler_fresh(request: httpx.Request) -> httpx.Response:
-+        if "/tokens/v2/search" in str(request.url) or "rugcheck.xyz" in str(request.url) or "/ultra/v1/shield" in str(request.url):
-+            raise AssertionError("Safety API should not be called when watchlist safety_checked_at is fresh!")
++        if "rugcheck.xyz" in str(request.url) or "/ultra/v1/shield" in str(request.url):
++            raise AssertionError("RugCheck/Shield should not be called when watchlist safety_checked_at is fresh!")
++        if "/tokens/v2/search" in str(request.url):
++            return httpx.Response(200, json=[{"id": mint2, "audit": {"isSus": False}}])
 +        if str(request.url).startswith(RPC_URL):
 +            body = json.loads(request.content.decode("utf-8"))
 +            if body["method"] == "getBalance":
@@ -1816,11 +1967,165 @@ index 0000000..52352b8
 +    assert api_calls["n"] == 0
 +    assert get_inflight_buy_reservations(str(db2.db_path)) == []
 +    db2.close()
++
++
++@pytest.mark.asyncio
++async def test_e4e_fresh_watchlist_still_requires_explicit_token_v2_is_sus(tmp_path):
++    """Finding 1: Fresh safety_checked_at skips RugCheck/Shield but NEVER bypasses Token v2 audit.isSus."""
++    clear_buy_reservations()
++    clear_sell_idempotency_guard()
++    kp = Keypair()
++    unsigned_tx = _mk_unsigned_tx(kp)
++    cfg = _mk_live_e4e_cfg(kp, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
++    fresh_ts = datetime.now(timezone.utc).isoformat()
++
++    # 1. Fresh watchlist + missing/malformed Token v2 -> fails closed WITHOUT evicting
++    for bad_v2 in (
++        [],
++        [{"id": MINT_E4E, "audit": {}}],
++        [{"id": MINT_E4E, "audit": {"isSus": "false"}}],
++    ):
++        clear_buy_reservations()
++        db = AgentDatabase(db_path=str(tmp_path / "e4e_f1_bad.duckdb"), starting_sol=5.0)
++        db.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, safety_passed=True)
++        db.mark_watchlist_safety_passed(MINT_E4E, True, checked_at=fresh_ts)
++
++        def handler_bad_v2(request: httpx.Request, payload=bad_v2) -> httpx.Response:
++            url = str(request.url)
++            if url.startswith(RPC_URL):
++                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
++            if "/tokens/v2/search" in url:
++                return httpx.Response(200, json=payload)
++            raise AssertionError(f"Unexpected call: {url}")
++
++        async with httpx.AsyncClient(transport=httpx.MockTransport(handler_bad_v2)) as client:
++            out = await executor_node(
++                {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4e_order()},
++                config=cfg, db=db, http_client=client,
++            )
++        assert out == {"pending_order": None}
++        assert get_inflight_buy_reservations(str(db.db_path)) == []
++        assert db.get_watchlist_entry(MINT_E4E) is not None
++        assert db.is_on_cooldown(MINT_E4E) is False
++        db.close()
++
++    # 2. Fresh watchlist + isSus=True -> confirmed unsafe: evicts + sets cooldown + aborts
++    db_sus = AgentDatabase(db_path=str(tmp_path / "e4e_f1_sus.duckdb"), starting_sol=5.0)
++    db_sus.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, safety_passed=True)
++    db_sus.mark_watchlist_safety_passed(MINT_E4E, True, checked_at=fresh_ts)
++
++    def handler_sus_v2(request: httpx.Request) -> httpx.Response:
++        url = str(request.url)
++        if url.startswith(RPC_URL):
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
++        if "/tokens/v2/search" in url:
++            return httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"isSus": True}}])
++        raise AssertionError(f"Unexpected call: {url}")
++
++    async with httpx.AsyncClient(transport=httpx.MockTransport(handler_sus_v2)) as client:
++        out_sus = await executor_node(
++            {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4e_order()},
++            config=cfg, db=db_sus, http_client=client,
++        )
++    assert out_sus == {"pending_order": None}
++    assert db_sus.get_watchlist_entry(MINT_E4E) is None
++    assert db_sus.is_on_cooldown(MINT_E4E) is True
++    db_sus.close()
++
++    # 3. Fresh watchlist + explicit isSus=False -> skips RugCheck/Shield and succeeds
++    db_ok = AgentDatabase(db_path=str(tmp_path / "e4e_f1_ok.duckdb"), starting_sol=5.0)
++    db_ok.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, safety_passed=True)
++    db_ok.mark_watchlist_safety_passed(MINT_E4E, True, checked_at=fresh_ts)
++
++    def handler_ok_v2(request: httpx.Request) -> httpx.Response:
++        url = str(request.url)
++        if "rugcheck.xyz" in url or "/ultra/v1/shield" in url:
++            raise AssertionError("RugCheck/Shield should be skipped when fresh!")
++        if url.startswith(RPC_URL):
++            body = json.loads(request.content.decode("utf-8"))
++            if body["method"] == "getBalance":
++                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
++            if body["method"] == "getBlockHeight":
++                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": 990})
++        if "/tokens/v2/search" in url:
++            return httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"isSus": False}}])
++        if "/swap/v2/order" in url:
++            return httpx.Response(200, json={
++                "outAmount": "1000000000", "otherAmountThreshold": "980000000",
++                "slippageBps": 200, "priceImpact": -0.5, "router": "metis", "lastValidBlockHeight": 1000,
++                "routePlan": [{"swapInfo": {"ammKey": POOL_PINNED, "inputMint": SOL_MINT, "outputMint": MINT_E4E, "label": "PumpSwap"}, "percent": 100}],
++                "transaction": unsigned_tx, "requestId": "req-f1-ok",
++            })
++        if "/swap/v2/execute" in url:
++            return httpx.Response(200, json={"signature": "SigF1Ok", "outputAmountResult": "1000000000"})
++        return httpx.Response(404)
++
++    async with httpx.AsyncClient(transport=httpx.MockTransport(handler_ok_v2)) as client:
++        out_ok = await executor_node(
++            {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4e_order()},
++            config=cfg, db=db_ok, http_client=client,
++        )
++    assert len(out_ok["chart_positions"]) == 1
++    db_ok.close()
++
++
++@pytest.mark.asyncio
++async def test_e4e_nested_empty_jupiter_shield_rejected_without_eviction(tmp_path):
++    """Finding 2: Empty/incomplete nested Shield shapes fail closed without eviction; valid shapes pass."""
++    from safety_gate_node import validate_jupiter_shield_structure
++
++    # Direct structure validation checks
++    assert validate_jupiter_shield_structure({"mints": {MINT_E4E: {}}}, MINT_E4E) is not None
++    assert validate_jupiter_shield_structure({"mints": {MINT_E4E: {"shield": {}}}}, MINT_E4E) is not None
++    assert validate_jupiter_shield_structure([{"mint": MINT_E4E}], MINT_E4E) is not None
++    assert validate_jupiter_shield_structure([{"mint": MINT_E4E, "shield": {}}], MINT_E4E) is not None
++
++    assert validate_jupiter_shield_structure({"warnings": {MINT_E4E: []}}, MINT_E4E) is None
++    assert validate_jupiter_shield_structure({"mints": {MINT_E4E: {"shield": {"warnings": []}}}}, MINT_E4E) is None
++    assert validate_jupiter_shield_structure([{"mint": MINT_E4E, "shield": {"warnings": []}}], MINT_E4E) is None
++
++    # End-to-end executor rejection on {"mints": {mint: {}}} and {"mints": {mint: {"shield": {}}}}
++    clear_buy_reservations()
++    clear_sell_idempotency_guard()
++    kp = Keypair()
++    cfg = _mk_live_e4e_cfg(kp, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
++
++    for idx, shield_payload in enumerate((
++        {"mints": {MINT_E4E: {}}},
++        {"mints": {MINT_E4E: {"shield": {}}}},
++    )):
++        clear_buy_reservations()
++        db = AgentDatabase(db_path=str(tmp_path / f"e4e_sh_empty_{idx}.duckdb"), starting_sol=5.0)
++        db.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, safety_passed=False)
++
++        def handler_sh(request: httpx.Request, sp=shield_payload) -> httpx.Response:
++            url = str(request.url)
++            if url.startswith(RPC_URL):
++                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
++            if "/tokens/v2/search" in url:
++                return httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"isSus": False}}])
++            if "rugcheck.xyz" in url:
++                return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
++            if "/ultra/v1/shield" in url:
++                return httpx.Response(200, json=sp)
++            raise AssertionError(f"Unexpected call: {url}")
++
++        async with httpx.AsyncClient(transport=httpx.MockTransport(handler_sh)) as client:
++            out = await executor_node(
++                {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4e_order()},
++                config=cfg, db=db, http_client=client,
++            )
++        assert out == {"pending_order": None}
++        assert get_inflight_buy_reservations(str(db.db_path)) == []
++        row = db.get_watchlist_entry(MINT_E4E)
++        assert row is not None and row["safety_checked_at"] is None
++        assert db.is_on_cooldown(MINT_E4E) is False
++        db.close()
 diff --git a/tests/test_focus_machine_transitions.py b/tests/test_focus_machine_transitions.py
-index def77da..3979ff2 100644
+index def77da..d4c0c00 100644
 --- a/tests/test_focus_machine_transitions.py
 +++ b/tests/test_focus_machine_transitions.py
-@@ -43,7 +43,14 @@ def _make_monitor_client(
+@@ -43,7 +43,16 @@ def _make_monitor_client(
      lamports = int(round(sol_quote * LAMPORTS_PER_SOL))
  
      def handler(request: httpx.Request) -> httpx.Response:
@@ -1830,13 +2135,15 @@ index def77da..3979ff2 100644
 +            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
 +        if "rugcheck.xyz" in url:
 +            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
++        if "/tokens/v2/search" in url:
++            return httpx.Response(200, json=[{"id": "MintGrad11111111111111111111111111111111111", "audit": {"isSus": False}}])
 +        if "/ultra/v1/shield" in url:
 +            return httpx.Response(200, json={"warnings": {request.url.params.get("mints", ""): []}})
 +        if "/swap/v2/order" in url:
              return httpx.Response(200, json={"outAmount": str(lamports), "transaction": None})
          if "/tokens/v1/solana/" in str(request.url):
              req_mint = str(request.url).rsplit("/", 1)[-1].split(",")[0]
-@@ -94,7 +101,7 @@ def _base_in_position(entry_sol: float = 0.5) -> dict[str, Any]:
+@@ -94,7 +103,7 @@ def _base_in_position(entry_sol: float = 0.5) -> dict[str, Any]:
  @pytest.mark.asyncio
  async def test_hard_stop_minus_10_pct_exits_to_scanning_with_cooldown(tmp_path):
      db = AgentDatabase(db_path=str(tmp_path / "hard_stop.duckdb"), starting_sol=0.7)
@@ -1845,7 +2152,7 @@ index def77da..3979ff2 100644
      dec = StubDecisionClient({})
      state = {
          "focus_state": FocusState.IN_POSITION.value,
-@@ -122,7 +129,7 @@ async def test_hard_stop_minus_10_pct_exits_to_scanning_with_cooldown(tmp_path):
+@@ -122,7 +131,7 @@ async def test_hard_stop_minus_10_pct_exits_to_scanning_with_cooldown(tmp_path):
  @pytest.mark.asyncio
  async def test_breakeven_shield_arms_at_plus_8_and_exits_at_plus_2(tmp_path):
      db = AgentDatabase(db_path=str(tmp_path / "breakeven.duckdb"), starting_sol=0.7)
@@ -1854,7 +2161,7 @@ index def77da..3979ff2 100644
      dec = StubDecisionClient({})
      state = {
          "focus_state": FocusState.IN_POSITION.value,
-@@ -155,7 +162,7 @@ async def test_breakeven_shield_arms_at_plus_8_and_exits_at_plus_2(tmp_path):
+@@ -155,7 +164,7 @@ async def test_breakeven_shield_arms_at_plus_8_and_exits_at_plus_2(tmp_path):
  @pytest.mark.asyncio
  async def test_trailing_tp_plus_12_minus_6_transitions_to_watching_and_leg2_reentry(tmp_path):
      db = AgentDatabase(db_path=str(tmp_path / "trail_leg2.duckdb"), starting_sol=0.7)
@@ -1863,7 +2170,7 @@ index def77da..3979ff2 100644
      leg2_approve = StubDecisionClient(
          {
              "leg_2_momentum": {"type": "score", "score": 4.1, "confidence": 0.90},
-@@ -216,7 +223,7 @@ async def test_trailing_tp_plus_12_minus_6_transitions_to_watching_and_leg2_reen
+@@ -216,7 +225,7 @@ async def test_trailing_tp_plus_12_minus_6_transitions_to_watching_and_leg2_reen
  @pytest.mark.asyncio
  async def test_exodus_bleed_and_timeout_abandonment(tmp_path):
      db = AgentDatabase(db_path=str(tmp_path / "abandon.duckdb"), starting_sol=0.7)
@@ -1872,7 +2179,7 @@ index def77da..3979ff2 100644
      dec = StubDecisionClient({})
  
      # 1. Exodus in IN_POSITION (5m sells >= 65% after warm-up & 2 confirmation ticks)
-@@ -308,7 +315,7 @@ async def test_langgraph_end_to_end_and_telemetry_api(tmp_path):
+@@ -308,7 +317,7 @@ async def test_langgraph_end_to_end_and_telemetry_api(tmp_path):
      clear_geckoterminal_cache()
      clear_ohlcv_cache()
      db = AgentDatabase(db_path=str(tmp_path / "e2e.duckdb"), starting_sol=0.7)
@@ -1881,7 +2188,16 @@ index def77da..3979ff2 100644
      # Pre-seed MintGrad in active_watchlist soaked for 5m so the Scalper Entry Engine allows entry
      db.upsert_watchlist_entry(
          mint="MintGrad11111111111111111111111111111111111",
-@@ -444,7 +451,7 @@ async def test_langgraph_end_to_end_and_telemetry_api(tmp_path):
+@@ -360,6 +369,8 @@ async def test_langgraph_end_to_end_and_telemetry_api(tmp_path):
+             )
+         if "rugcheck.xyz" in url:
+             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
++        if "/tokens/v2/search" in url:
++            return httpx.Response(200, json=[{"id": "MintGrad11111111111111111111111111111111111", "audit": {"isSus": False}}])
+         if "/ultra/v1/shield" in url:
+             return httpx.Response(200, json={"warnings": {"MintGrad11111111111111111111111111111111111": []}})
+         if "/swap/v2/order" in url:
+@@ -444,7 +455,7 @@ async def test_langgraph_end_to_end_and_telemetry_api(tmp_path):
  @pytest.mark.asyncio
  async def test_reentry_anti_chase_aborts_if_price_rips_during_decision_1(tmp_path):
      db = AgentDatabase(db_path=str(tmp_path / "anti_chase.duckdb"), starting_sol=0.7)
@@ -1890,7 +2206,7 @@ index def77da..3979ff2 100644
      leg2_approve = StubDecisionClient(
          {
              "leg_2_momentum": {"type": "score", "score": 4.2, "confidence": 0.90},
-@@ -471,7 +478,14 @@ async def test_reentry_anti_chase_aborts_if_price_rips_during_decision_1(tmp_pat
+@@ -471,7 +482,16 @@ async def test_reentry_anti_chase_aborts_if_price_rips_during_decision_1(tmp_pat
      quote_calls = {"n": 0}
  
      def handler(request: httpx.Request) -> httpx.Response:
@@ -1900,13 +2216,15 @@ index def77da..3979ff2 100644
 +            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
 +        if "rugcheck.xyz" in url:
 +            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
++        if "/tokens/v2/search" in url:
++            return httpx.Response(200, json=[{"id": "MintGrad11111111111111111111111111111111111", "audit": {"isSus": False}}])
 +        if "/ultra/v1/shield" in url:
 +            return httpx.Response(200, json={"warnings": {request.url.params.get("mints", ""): []}})
 +        if "/swap/v2/order" in url:
              quote_calls["n"] += 1
              sol_val = 0.5099 if quote_calls["n"] == 1 else 0.6018
              return httpx.Response(200, json={"outAmount": str(int(round(sol_val * 1_000_000_000))), "transaction": None})
-@@ -512,7 +526,7 @@ async def test_reentry_anti_chase_aborts_if_price_rips_during_decision_1(tmp_pat
+@@ -512,7 +532,7 @@ async def test_reentry_anti_chase_aborts_if_price_rips_during_decision_1(tmp_pat
  @pytest.mark.asyncio
  async def test_max_reentries_per_mint_puts_mint_on_cooldown_after_second_reentry(tmp_path):
      db = AgentDatabase(db_path=str(tmp_path / "max_reentries.duckdb"), starting_sol=0.7)
@@ -1915,7 +2233,7 @@ index def77da..3979ff2 100644
      dec = StubDecisionClient({})
      mint = "MintExhaust11111111111111111111111111111111"
  
-@@ -568,7 +582,7 @@ async def test_two_step_partial_tp_scale_out_and_runner_trail_and_breakeven(tmp_
+@@ -568,7 +588,7 @@ async def test_two_step_partial_tp_scale_out_and_runner_trail_and_breakeven(tmp_
      """Verify Step 1 (50% scale-out at +15%) and Step 2 (runner -10% trailing stop & +2% breakeven floor)."""
      db = AgentDatabase(db_path=str(tmp_path / "partial_tp.duckdb"), starting_sol=0.7)
      cfg = AgentConfig(
@@ -1924,6 +2242,21 @@ index def77da..3979ff2 100644
          PARTIAL_TP_TRIGGER_PCT=15.0,
          PARTIAL_TP_SELL_FRACTION=0.50,
          RUNNER_TRAIL_PULLBACK_PCT=10.0,
+@@ -596,6 +616,14 @@ async def test_two_step_partial_tp_scale_out_and_runner_trail_and_breakeven(tmp_
+ 
+     def handler(request: httpx.Request) -> httpx.Response:
+         url = str(request.url)
++        if "/tokens/v2/search" in url:
++            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
++        if "rugcheck.xyz" in url:
++            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
++        if "/tokens/v2/search" in url:
++            return httpx.Response(200, json=[{"id": "MintGrad11111111111111111111111111111111111", "audit": {"isSus": False}}])
++        if "/ultra/v1/shield" in url:
++            return httpx.Response(200, json={"warnings": {request.url.params.get("mints", ""): []}})
+         if "/swap/v2/order" in url:
+             amt = int(request.url.params.get("amount") or 1_000_000)
+             out_sol = amt * unit_sol_price["val"]
 diff --git a/tests/test_leg2_predictor.py b/tests/test_leg2_predictor.py
 index ce9ab81..1481f60 100644
 --- a/tests/test_leg2_predictor.py
@@ -2031,10 +2364,10 @@ index 4d6090b..3520ca0 100644
      soaked_added = (now_dt - timedelta(minutes=6)).isoformat()
  
 diff --git a/tests/test_sprint1_instrumentation.py b/tests/test_sprint1_instrumentation.py
-index 0c8c8fc..f01dacb 100644
+index 0c8c8fc..72f117f 100644
 --- a/tests/test_sprint1_instrumentation.py
 +++ b/tests/test_sprint1_instrumentation.py
-@@ -196,9 +196,16 @@ async def test_jupiter_raw_price_impact_persisted_without_altering_fills(tmp_pat
+@@ -196,10 +196,19 @@ async def test_jupiter_raw_price_impact_persisted_without_altering_fills(tmp_pat
      assert extract_raw_price_impact({"outAmount": "100"}) is None
  
      db = AgentDatabase(db_path=str(tmp_path / "impact.duckdb"), starting_sol=1.0)
@@ -2050,9 +2383,12 @@ index 0c8c8fc..f01dacb 100644
 +    db.mark_watchlist_safety_passed("MintImpact11111111111111111111111111111111", True, checked_at=datetime.now(timezone.utc).isoformat())
 +
      def jup_handler(request: httpx.Request) -> httpx.Response:
++        if "/tokens/v2/search" in str(request.url):
++            return httpx.Response(200, json=[{"id": "MintImpact11111111111111111111111111111111", "audit": {"isSus": False}}])
          return httpx.Response(200, json={"outAmount": "2000000", "priceImpactPct": "25.5", "transaction": None})
  
-@@ -258,7 +265,7 @@ async def test_gemini_narrative_cache_ttl_eviction_and_timestamp_preservation(tm
+     order = PendingOrder(
+@@ -258,7 +267,7 @@ async def test_gemini_narrative_cache_ttl_eviction_and_timestamp_preservation(tm
      # 2. alpha_node 30m TTL cache hit vs expiry without changing decision eligibility
      clear_narrative_cache()
      db = AgentDatabase(db_path=str(tmp_path / "narr_cache.duckdb"), starting_sol=1.0)
@@ -2061,7 +2397,7 @@ index 0c8c8fc..f01dacb 100644
      stub = CountingStubDecisionClient(
          {
              "t0_narrative_strength": {"type": "score", "score": 3.5, "confidence": 0.85},
-@@ -303,7 +310,7 @@ async def test_hard_stop_loss_no_duplicate_sell_in_graph_or_concurrent_executor(
+@@ -303,7 +312,7 @@ async def test_hard_stop_loss_no_duplicate_sell_in_graph_or_concurrent_executor(
  
      # 1. End-to-end LangGraph tick at -12.30% (must execute HARD_STOP_LOSS SELL exactly ONCE)
      db1 = AgentDatabase(db_path=str(tmp_path / "graph_hs.duckdb"), starting_sol=1.0)
@@ -2070,7 +2406,7 @@ index 0c8c8fc..f01dacb 100644
      pos = ActivePosition(
          mint=mint, symbol="ZOL", entry_sol=0.50, token_amount=1_000_000,
          strategy="BREAKOUT_IGNITION", opened_at=t0.isoformat(),
-@@ -385,7 +392,7 @@ async def test_graph_multi_slot_chart_routing_scans_below_cap_and_stops_at_cap(t
+@@ -385,7 +394,7 @@ async def test_graph_multi_slot_chart_routing_scans_below_cap_and_stops_at_cap(t
  
      db = AgentDatabase(db_path=str(tmp_path / "multislot.duckdb"), starting_sol=2.0)
      cfg = AgentConfig(
@@ -2079,6 +2415,15 @@ index 0c8c8fc..f01dacb 100644
          MAX_CHART_POSITIONS=3, MAX_OPEN_POSITIONS=6, TRADE_SIZE_SOL=0.50,
          OHLCV_PACING_DELAY_SECONDS=0.0, ENABLE_JUPITER_DISCOVERY=False,
      )
+@@ -435,6 +444,8 @@ async def test_graph_multi_slot_chart_routing_scans_below_cap_and_stops_at_cap(t
+             ])
+         if "rugcheck.xyz" in url:
+             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
++        if "/tokens/v2/search" in url:
++            return httpx.Response(200, json=[{"id": mint_new, "audit": {"isSus": False}}])
+         if "/ultra/v1/shield" in url:
+             return httpx.Response(200, json={"warnings": {mint_new: []}})
+         if "/swap/v2/order" in url:
 diff --git a/tests/test_two_slot_and_whale_hardening.py b/tests/test_two_slot_and_whale_hardening.py
 index 77ce6c1..bfa954a 100644
 --- a/tests/test_two_slot_and_whale_hardening.py

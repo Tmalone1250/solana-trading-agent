@@ -1,7 +1,7 @@
 # Phase E4E Test Results
 
 - **Branch:** `impl/e4e-safety-freshness`
-- **Baseline:** `7ca340f1f9c309dd9dafd9291b0d324c7ac76226` (corrective pass parent `2d221dbf2784584c6a2c3923f644d710c0381b04`)
+- **Baseline:** `7ca340f1f9c309dd9dafd9291b0d324c7ac76226` (corrective pass 2 parent `4445bf8b29a8f635c2634e35ad0f9ca7476c4c98`)
 
 ## 1. Focused E4E Suite
 
@@ -10,7 +10,7 @@ Command:
 venv/bin/pytest -q tests/test_e4e_safety_freshness.py
 ```
 
-Result: **`9 passed in 1.42s`**
+Result: **`11 passed in 1.89s`**
 
 1. `test_e4e_additive_migration_and_null_timestamp_treated_stale` — PASSED
 2. `test_e4e_timestamp_validation_edges` — PASSED
@@ -21,15 +21,26 @@ Result: **`9 passed in 1.42s`**
 7. `test_e4e_corrective_incomplete_evidence_fails_closed_without_eviction` — PASSED
 8. `test_e4e_corrective_paper_and_non_breakout_live_require_ttl_and_sell_unaffected` — PASSED
 9. `test_e4e_corrective_pinned_pool_required_before_any_safety_or_quote` — PASSED
+10. `test_e4e_fresh_watchlist_still_requires_explicit_token_v2_is_sus` — PASSED
+11. `test_e4e_nested_empty_jupiter_shield_rejected_without_eviction` — PASSED
 
-## 2. Full Test Suite (Includes E4A–E4D & E1–E3)
+## 2. E4A–E4D & E1–E3 Regression Suites
+
+Command:
+```bash
+venv/bin/pytest -q tests/test_e4a_approval_quote_integrity.py tests/test_e4b_execution_pool_integrity.py tests/test_e4c_reservation_risk.py tests/test_e4d_transaction_reconciliation.py tests/test_e2b_fee_accounting.py tests/test_e3a_candle_eligibility.py tests/test_scanner_and_safety.py tests/test_rotating_watchlist.py tests/test_leg2_predictor.py tests/test_jupiter_token_client.py tests/test_memory_bounds_and_backoff.py tests/test_focus_machine_transitions.py
+```
+
+Result: **`78 passed in 12.24s`**
+
+## 3. Full Test Suite
 
 Command:
 ```bash
 venv/bin/pytest -q tests/
 ```
 
-Result: **`206 passed, 3 failed in 35.79s`**
+Result: **`208 passed, 3 failed in 35.43s`**
 
 ### Pre-Existing E1 Baseline Failures (Unchanged, 3 total)
 1. `tests/test_insider_scanner.py::test_unconditional_hard_stop_loss_on_leg2_reentry_chart_and_whale_positions_at_minus_11_75_pct`

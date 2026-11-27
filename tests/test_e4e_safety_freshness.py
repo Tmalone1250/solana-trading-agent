@@ -274,8 +274,10 @@ async def test_e4e_pre_execution_safety_unset_fresh_stale_and_lock_freedom(tmp_p
     db.mark_watchlist_safety_passed(mint2, True, checked_at=datetime.now(timezone.utc).isoformat())
 
     def handler_fresh(request: httpx.Request) -> httpx.Response:
-        if "/tokens/v2/search" in str(request.url) or "rugcheck.xyz" in str(request.url) or "/ultra/v1/shield" in str(request.url):
-            raise AssertionError("Safety API should not be called when watchlist safety_checked_at is fresh!")
+        if "rugcheck.xyz" in str(request.url) or "/ultra/v1/shield" in str(request.url):
+            raise AssertionError("RugCheck/Shield should not be called when watchlist safety_checked_at is fresh!")
+        if "/tokens/v2/search" in str(request.url):
+            return httpx.Response(200, json=[{"id": mint2, "audit": {"isSus": False}}])
         if str(request.url).startswith(RPC_URL):
             body = json.loads(request.content.decode("utf-8"))
             if body["method"] == "getBalance":
@@ -616,3 +618,157 @@ async def test_e4e_corrective_pinned_pool_required_before_any_safety_or_quote(tm
     assert api_calls["n"] == 0
     assert get_inflight_buy_reservations(str(db2.db_path)) == []
     db2.close()
+
+
+@pytest.mark.asyncio
+async def test_e4e_fresh_watchlist_still_requires_explicit_token_v2_is_sus(tmp_path):
+    """Finding 1: Fresh safety_checked_at skips RugCheck/Shield but NEVER bypasses Token v2 audit.isSus."""
+    clear_buy_reservations()
+    clear_sell_idempotency_guard()
+    kp = Keypair()
+    unsigned_tx = _mk_unsigned_tx(kp)
+    cfg = _mk_live_e4e_cfg(kp, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
+    fresh_ts = datetime.now(timezone.utc).isoformat()
+
+    # 1. Fresh watchlist + missing/malformed Token v2 -> fails closed WITHOUT evicting
+    for bad_v2 in (
+        [],
+        [{"id": MINT_E4E, "audit": {}}],
+        [{"id": MINT_E4E, "audit": {"isSus": "false"}}],
+    ):
+        clear_buy_reservations()
+        db = AgentDatabase(db_path=str(tmp_path / "e4e_f1_bad.duckdb"), starting_sol=5.0)
+        db.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, safety_passed=True)
+        db.mark_watchlist_safety_passed(MINT_E4E, True, checked_at=fresh_ts)
+
+        def handler_bad_v2(request: httpx.Request, payload=bad_v2) -> httpx.Response:
+            url = str(request.url)
+            if url.startswith(RPC_URL):
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
+            if "/tokens/v2/search" in url:
+                return httpx.Response(200, json=payload)
+            raise AssertionError(f"Unexpected call: {url}")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler_bad_v2)) as client:
+            out = await executor_node(
+                {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4e_order()},
+                config=cfg, db=db, http_client=client,
+            )
+        assert out == {"pending_order": None}
+        assert get_inflight_buy_reservations(str(db.db_path)) == []
+        assert db.get_watchlist_entry(MINT_E4E) is not None
+        assert db.is_on_cooldown(MINT_E4E) is False
+        db.close()
+
+    # 2. Fresh watchlist + isSus=True -> confirmed unsafe: evicts + sets cooldown + aborts
+    db_sus = AgentDatabase(db_path=str(tmp_path / "e4e_f1_sus.duckdb"), starting_sol=5.0)
+    db_sus.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, safety_passed=True)
+    db_sus.mark_watchlist_safety_passed(MINT_E4E, True, checked_at=fresh_ts)
+
+    def handler_sus_v2(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.startswith(RPC_URL):
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"isSus": True}}])
+        raise AssertionError(f"Unexpected call: {url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler_sus_v2)) as client:
+        out_sus = await executor_node(
+            {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4e_order()},
+            config=cfg, db=db_sus, http_client=client,
+        )
+    assert out_sus == {"pending_order": None}
+    assert db_sus.get_watchlist_entry(MINT_E4E) is None
+    assert db_sus.is_on_cooldown(MINT_E4E) is True
+    db_sus.close()
+
+    # 3. Fresh watchlist + explicit isSus=False -> skips RugCheck/Shield and succeeds
+    db_ok = AgentDatabase(db_path=str(tmp_path / "e4e_f1_ok.duckdb"), starting_sol=5.0)
+    db_ok.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, safety_passed=True)
+    db_ok.mark_watchlist_safety_passed(MINT_E4E, True, checked_at=fresh_ts)
+
+    def handler_ok_v2(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "rugcheck.xyz" in url or "/ultra/v1/shield" in url:
+            raise AssertionError("RugCheck/Shield should be skipped when fresh!")
+        if url.startswith(RPC_URL):
+            body = json.loads(request.content.decode("utf-8"))
+            if body["method"] == "getBalance":
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
+            if body["method"] == "getBlockHeight":
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": 990})
+        if "/tokens/v2/search" in url:
+            return httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"isSus": False}}])
+        if "/swap/v2/order" in url:
+            return httpx.Response(200, json={
+                "outAmount": "1000000000", "otherAmountThreshold": "980000000",
+                "slippageBps": 200, "priceImpact": -0.5, "router": "metis", "lastValidBlockHeight": 1000,
+                "routePlan": [{"swapInfo": {"ammKey": POOL_PINNED, "inputMint": SOL_MINT, "outputMint": MINT_E4E, "label": "PumpSwap"}, "percent": 100}],
+                "transaction": unsigned_tx, "requestId": "req-f1-ok",
+            })
+        if "/swap/v2/execute" in url:
+            return httpx.Response(200, json={"signature": "SigF1Ok", "outputAmountResult": "1000000000"})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler_ok_v2)) as client:
+        out_ok = await executor_node(
+            {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4e_order()},
+            config=cfg, db=db_ok, http_client=client,
+        )
+    assert len(out_ok["chart_positions"]) == 1
+    db_ok.close()
+
+
+@pytest.mark.asyncio
+async def test_e4e_nested_empty_jupiter_shield_rejected_without_eviction(tmp_path):
+    """Finding 2: Empty/incomplete nested Shield shapes fail closed without eviction; valid shapes pass."""
+    from safety_gate_node import validate_jupiter_shield_structure
+
+    # Direct structure validation checks
+    assert validate_jupiter_shield_structure({"mints": {MINT_E4E: {}}}, MINT_E4E) is not None
+    assert validate_jupiter_shield_structure({"mints": {MINT_E4E: {"shield": {}}}}, MINT_E4E) is not None
+    assert validate_jupiter_shield_structure([{"mint": MINT_E4E}], MINT_E4E) is not None
+    assert validate_jupiter_shield_structure([{"mint": MINT_E4E, "shield": {}}], MINT_E4E) is not None
+
+    assert validate_jupiter_shield_structure({"warnings": {MINT_E4E: []}}, MINT_E4E) is None
+    assert validate_jupiter_shield_structure({"mints": {MINT_E4E: {"shield": {"warnings": []}}}}, MINT_E4E) is None
+    assert validate_jupiter_shield_structure([{"mint": MINT_E4E, "shield": {"warnings": []}}], MINT_E4E) is None
+
+    # End-to-end executor rejection on {"mints": {mint: {}}} and {"mints": {mint: {"shield": {}}}}
+    clear_buy_reservations()
+    clear_sell_idempotency_guard()
+    kp = Keypair()
+    cfg = _mk_live_e4e_cfg(kp, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
+
+    for idx, shield_payload in enumerate((
+        {"mints": {MINT_E4E: {}}},
+        {"mints": {MINT_E4E: {"shield": {}}}},
+    )):
+        clear_buy_reservations()
+        db = AgentDatabase(db_path=str(tmp_path / f"e4e_sh_empty_{idx}.duckdb"), starting_sol=5.0)
+        db.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, safety_passed=False)
+
+        def handler_sh(request: httpx.Request, sp=shield_payload) -> httpx.Response:
+            url = str(request.url)
+            if url.startswith(RPC_URL):
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
+            if "/tokens/v2/search" in url:
+                return httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"isSus": False}}])
+            if "rugcheck.xyz" in url:
+                return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+            if "/ultra/v1/shield" in url:
+                return httpx.Response(200, json=sp)
+            raise AssertionError(f"Unexpected call: {url}")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler_sh)) as client:
+            out = await executor_node(
+                {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4e_order()},
+                config=cfg, db=db, http_client=client,
+            )
+        assert out == {"pending_order": None}
+        assert get_inflight_buy_reservations(str(db.db_path)) == []
+        row = db.get_watchlist_entry(MINT_E4E)
+        assert row is not None and row["safety_checked_at"] is None
+        assert db.is_on_cooldown(MINT_E4E) is False
+        db.close()

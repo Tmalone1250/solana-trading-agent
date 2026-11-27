@@ -55,3 +55,10 @@
    - `_validate_e4e_pre_execution_safety` requires a positive finite `PRE_EXECUTION_SAFETY_TTL_SECONDS` for every `BUY` in both paper and live modes (all strategies), rejecting before Jupiter quoting/signing/broadcast and leaving `SELL`/`PARTIAL_SELL` unaltered.
 4. **Fail-closed pinned pool verification (`executor_node.py`):**
    - For `BREAKOUT_IGNITION` BUYs, `_validate_e4e_pre_execution_safety` requires an existing watchlist row with a non-empty valid `pair_address` matching `order.pair_address` before any safety API request, Jupiter quote, signing, or broadcast.
+
+## E4E Corrective Pass 2 (from `4445bf8b29a8f635c2634e35ad0f9ca7476c4c98`)
+1. **Token v2 `audit.isSus` always enforced on BUY (`executor_node.py`):**
+   - `_validate_e4e_pre_execution_safety` always performs the matching-mint Jupiter Token v2 lookup and requires an explicit boolean `audit.isSus` even when `safety_checked_at` is fresh within `PRE_EXECUTION_SAFETY_TTL_SECONDS` (which now only skips RugCheck and Jupiter Shield).
+   - `isSus=True` retains eviction/cooldown; missing/malformed Token v2 evidence fails closed without eviction or timestamp refresh.
+2. **Tightened nested Jupiter Shield structure validation (`safety_gate_node.py`):**
+   - Added `_validate_shield_token_obj` inside `validate_jupiter_shield_structure` so `{"mints": {mint: {}}}`, `{"mints": {mint: {"shield": {}}}}`, `[{"mint": mint}]`, and `[{"mint": mint, "shield": {}}]` fail closed as `unavailable/failed` without eviction, cooldown, or timestamp refresh, while preserving valid supported formats.

@@ -285,7 +285,9 @@ async def test_e4b_paper_telemetry_all_statuses_and_opt_in_enforcement(tmp_path)
         db.mark_watchlist_safety_passed(mint_i, True, checked_at=datetime.now(timezone.utc).isoformat())
         order_i = _mk_e4b_order(mint=mint_i)
 
-        def handler_p(_req: httpx.Request, qp: dict[str, Any] = quote_payload) -> httpx.Response:
+        def handler_p(req: httpx.Request, qp: dict[str, Any] = quote_payload) -> httpx.Response:
+            if "/tokens/v2/search" in str(req.url):
+                return httpx.Response(200, json=[{"id": MINT_E4B, "audit": {"isSus": False}}])
             return httpx.Response(200, json=qp)
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler_p)) as client:
@@ -314,7 +316,9 @@ async def test_e4b_paper_telemetry_all_statuses_and_opt_in_enforcement(tmp_path)
         db.mark_watchlist_safety_passed(MINT_E4B, True, checked_at=datetime.now(timezone.utc).isoformat())
         order_i = _mk_e4b_order(mint=MINT_E4B)
 
-        def handler_e(_req: httpx.Request, qp: dict[str, Any] = quote_payload) -> httpx.Response:
+        def handler_e(req: httpx.Request, qp: dict[str, Any] = quote_payload) -> httpx.Response:
+            if "/tokens/v2/search" in str(req.url):
+                return httpx.Response(200, json=[{"id": MINT_E4B, "audit": {"isSus": False}}])
             return httpx.Response(200, json=qp)
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler_e)) as client:

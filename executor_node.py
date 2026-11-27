@@ -488,13 +488,14 @@ async def _validate_e4e_pre_execution_safety(
                 f"BLOCKED: PINNED_POOL_MISMATCH_AT_SAFETY (order={order.pair_address}, watchlist={w_pair})"
             )
 
-    if w_row is not None and w_row.get("safety_passed") is True and is_safety_timestamp_fresh(
-        w_row.get("safety_checked_at"), float(ttl), now_dt=ref_now
-    ):
-        return
+    persisted_fresh = bool(
+        w_row is not None
+        and w_row.get("safety_passed") is True
+        and is_safety_timestamp_fresh(w_row.get("safety_checked_at"), float(ttl), now_dt=ref_now)
+    )
 
     confirmed_unsafe: list[str] = []
-    # 1. Lightweight Jupiter Token v2 explicit audit.isSus check (must be present and bool)
+    # 1. Always run Jupiter Token v2 explicit audit.isSus check (must never be bypassed by fresh persisted safety)
     try:
         v2_resp = await client.get(
             f"{config.JUPITER_TOKENS_V2_BASE_URL}/search",
@@ -524,17 +525,18 @@ async def _validate_e4e_pre_execution_safety(
     except Exception as exc:
         raise E4AValidationError(f"BLOCKED: PRE_EXECUTION_JUPITER_V2_UNAVAILABLE ({exc})") from exc
 
-    # 2. Full check_token_safety (RugCheck summary + Jupiter Shield) when report is stale/missing
-    report = await check_token_safety(order.mint, config, client)
-    if not report.passed:
-        for r in report.reasons:
-            if "unavailable/failed" in r.lower():
-                if not confirmed_unsafe:
-                    raise E4AValidationError(
-                        f"BLOCKED: PRE_EXECUTION_SAFETY_UNAVAILABLE ({'; '.join(report.reasons)})"
-                    )
-            else:
-                confirmed_unsafe.append(r)
+    # 2. Full check_token_safety (RugCheck summary + Jupiter Shield) when persisted report is stale/missing
+    if not persisted_fresh:
+        report = await check_token_safety(order.mint, config, client)
+        if not report.passed:
+            for r in report.reasons:
+                if "unavailable/failed" in r.lower():
+                    if not confirmed_unsafe:
+                        raise E4AValidationError(
+                            f"BLOCKED: PRE_EXECUTION_SAFETY_UNAVAILABLE ({'; '.join(report.reasons)})"
+                        )
+                else:
+                    confirmed_unsafe.append(r)
 
     if confirmed_unsafe:
         reason_str = "; ".join(confirmed_unsafe)
@@ -558,7 +560,7 @@ async def _validate_e4e_pre_execution_safety(
         )
         raise E4AValidationError(f"BLOCKED: PRE_EXECUTION_SAFETY_FAILED ({reason_str})")
 
-    if w_row is not None:
+    if not persisted_fresh and w_row is not None:
         db.mark_watchlist_safety_passed(order.mint, True, checked_at=ref_now.isoformat())
 
 

@@ -117,6 +117,8 @@ async def test_executor_paper_mode_omits_taker_and_logs_out_amount(tmp_path):
     seen_params = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if "/tokens/v2/search" in str(request.url):
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
         assert request.url.path == "/swap/v2/order"
         assert request.headers.get("x-api-key") == "jup-secret"
         seen_params.update(dict(request.url.params))
@@ -184,6 +186,8 @@ async def test_executor_live_mode_passes_taker_signs_and_executes(tmp_path):
     calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if "/tokens/v2/search" in str(request.url):
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
         if str(request.url).startswith("https://rpc.example.test"):
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 700_000_000}})
         calls.append(f"{request.method} {request.url.path}")

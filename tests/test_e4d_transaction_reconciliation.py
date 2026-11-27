@@ -182,6 +182,8 @@ async def test_e4d_intent_persisted_before_broadcast_and_timeout_restores_block_
     seen_pre_broadcast_intent: list[dict[str, Any]] = []
 
     def timeout_handler(request: httpx.Request) -> httpx.Response:
+        if "/tokens/v2/search" in str(request.url):
+            return httpx.Response(200, json=[{"id": MINT_A, "audit": {"isSus": False}}])
         if str(request.url).startswith(RPC_URL):
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
         if "/swap/v2/order" in str(request.url):
