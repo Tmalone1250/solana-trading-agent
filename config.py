@@ -206,6 +206,9 @@ class AgentConfig(BaseSettings):
     MIN_RFQ_EXPIRY_HEADROOM_SECONDS: float | None = Field(default=None, ge=0.0)
     # Phase E4B: Execution pool integrity (live unconditionally fail-closed; paper opt-in)
     REQUIRE_PINNED_POOL_ROUTE_IN_PAPER: bool = False
+    # Phase E4E: Safety freshness TTLs (None = fail closed at live BREAKOUT_IGNITION BUY boundary)
+    SAFETY_CACHE_TTL_SECONDS: float | None = Field(default=None, gt=0.0)
+    PRE_EXECUTION_SAFETY_TTL_SECONDS: float | None = Field(default=None, gt=0.0)
 
     # Loop, Persistence & Telemetry
     MONITOR_POLL_SECONDS: float = Field(default=5.0, gt=0.0)

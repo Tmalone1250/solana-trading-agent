@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
 
 from config import LAMPORTS_PER_SOL, AgentConfig
-from db import AgentDatabase
+from db import AgentDatabase, utc_now
 from memory_guard import prune_timestamped_cache
 from state import AgentGraphState, FocusState, PendingOrder, SafetyReport
 
@@ -27,31 +28,82 @@ def clear_safety_cache() -> None:
     _safety_cache.clear()
 
 
-def cache_safety_report(mint: str, report: SafetyReport, *, now_ts: Optional[float] = None) -> None:
+def cache_safety_report(
+    mint: str,
+    report: SafetyReport,
+    *,
+    now_ts: Optional[float] = None,
+    ttl_seconds: Optional[float] = None,
+) -> None:
     """Store a SafetyReport in the bounded in-memory cache with TTL & max-size eviction."""
     ts = now_ts if now_ts is not None else time.time()
+    ttl = float(ttl_seconds) if ttl_seconds is not None else SAFETY_CACHE_TTL_SECONDS
     _safety_cache[mint] = {"fetched_at": ts, "report": report}
     prune_timestamped_cache(
         _safety_cache,
         now_ts=ts,
         max_entries=MAX_SAFETY_CACHE_ENTRIES,
-        ttl_seconds=SAFETY_CACHE_TTL_SECONDS,
+        ttl_seconds=ttl,
     )
 
 
-def get_cached_safety_report(mint: str, *, now_ts: Optional[float] = None) -> Optional[SafetyReport]:
+def get_cached_safety_report(
+    mint: str,
+    *,
+    now_ts: Optional[float] = None,
+    ttl_seconds: Optional[float] = None,
+) -> Optional[SafetyReport]:
     """Retrieve a non-expired SafetyReport from the bounded in-memory cache."""
     ts = now_ts if now_ts is not None else time.time()
+    ttl = float(ttl_seconds) if ttl_seconds is not None else SAFETY_CACHE_TTL_SECONDS
     prune_timestamped_cache(
         _safety_cache,
         now_ts=ts,
         max_entries=MAX_SAFETY_CACHE_ENTRIES,
-        ttl_seconds=SAFETY_CACHE_TTL_SECONDS,
+        ttl_seconds=ttl,
     )
     entry = _safety_cache.get(mint)
     if entry and isinstance(entry.get("report"), SafetyReport):
         return entry["report"]
     return None
+
+
+def parse_utc_timestamp(raw: Any) -> Optional[datetime]:
+    """Parse a strict UTC ISO-8601 timestamp; reject missing, malformed, naive, or non-UTC values."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None or dt.utcoffset() != timedelta(0):
+        return None
+    return dt
+
+
+def is_safety_timestamp_fresh(
+    raw_ts: Any,
+    ttl_seconds: Optional[float],
+    *,
+    now_dt: Optional[datetime] = None,
+) -> bool:
+    """Return True iff raw_ts is a valid non-future UTC timestamp within ttl_seconds."""
+    if ttl_seconds is None or isinstance(ttl_seconds, bool):
+        return False
+    try:
+        ttl_val = float(ttl_seconds)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(ttl_val) or ttl_val <= 0.0:
+        return False
+    checked_dt = parse_utc_timestamp(raw_ts)
+    if checked_dt is None:
+        return False
+    ref_now = now_dt or utc_now()
+    if ref_now.tzinfo is None:
+        ref_now = ref_now.replace(tzinfo=timezone.utc)
+    age_sec = (ref_now - checked_dt).total_seconds()
+    return 0.0 <= age_sec <= ttl_val
 
 SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
 CRITICAL_SHIELD_TYPES = {
@@ -283,8 +335,13 @@ async def safety_gate_node(
     if not raw_candidates:
         return {"safe_candidates": [], "rejected_candidates": []}
 
-    watchlist_safety = (
-        {w["mint"]: bool(w.get("safety_passed", False)) for w in db.get_watchlist()}
+    now_dt = now or utc_now()
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=timezone.utc)
+    ttl_cfg = config.SAFETY_CACHE_TTL_SECONDS
+    mem_ttl = float(ttl_cfg) if ttl_cfg is not None else SAFETY_CACHE_TTL_SECONDS
+    watchlist_by_mint = (
+        {w["mint"]: w for w in db.get_watchlist()}
         if db is not None
         else {}
     )
@@ -316,9 +373,15 @@ async def safety_gate_node(
                 rejected.append({"mint": mint, "symbol": symbol, "reasons": [reason_str]})
                 continue
 
-            # Cache hit: skip RugCheck + Jupiter Shield on retained active_watchlist slots or recent safety cache
-            cached_rep = get_cached_safety_report(mint)
-            if cand.get("safety_passed") is True or watchlist_safety.get(mint) is True or (cached_rep and cached_rep.passed):
+            # Cache hit: reuse persisted watchlist pass ONLY when safety_checked_at is valid & within SAFETY_CACHE_TTL_SECONDS
+            w_row = watchlist_by_mint.get(mint)
+            persisted_fresh = bool(
+                w_row
+                and w_row.get("safety_passed") is True
+                and is_safety_timestamp_fresh(w_row.get("safety_checked_at"), ttl_cfg, now_dt=now_dt)
+            )
+            cached_rep = get_cached_safety_report(mint, now_ts=now_dt.timestamp(), ttl_seconds=mem_ttl)
+            if persisted_fresh or (cached_rep and cached_rep.passed):
                 enriched = dict(cand)
                 enriched["safety_passed"] = True
                 enriched["safety_report"] = {"mint": mint, "passed": True, "cached": True, "reasons": []}
@@ -327,10 +390,10 @@ async def safety_gate_node(
                 continue
 
             report = cached_rep or await check_token_safety(mint, config, client)
-            cache_safety_report(mint, report)
             if report.passed:
+                cache_safety_report(mint, report, now_ts=now_dt.timestamp(), ttl_seconds=mem_ttl)
                 if db is not None:
-                    db.mark_watchlist_safety_passed(mint, True)
+                    db.mark_watchlist_safety_passed(mint, True, checked_at=now_dt.isoformat())
                 enriched = dict(cand)
                 enriched["safety_passed"] = True
                 enriched["safety_report"] = report.model_dump()

@@ -58,6 +58,7 @@ def _mk_live_e4a_cfg(kp: Keypair, **overrides: Any) -> AgentConfig:
         "MAX_ENTRY_PRICE_IMPACT_PCT": 2.5,
         "MIN_BLOCK_HEIGHT_HEADROOM": 5,
         "MIN_RFQ_EXPIRY_HEADROOM_SECONDS": 5.0,
+        "PRE_EXECUTION_SAFETY_TTL_SECONDS": 60.0,
     }
     params.update(overrides)
     return AgentConfig(**params)
@@ -297,6 +298,12 @@ async def test_e4a_drift_worst_case_slippage_impact_rtse_and_expiry_gates(tmp_pa
             return httpx.Response(200, json=curr_quote["val"])
         if "/swap/v2/execute" in str(request.url):
             return httpx.Response(200, json={"signature": "SigE4AOk111", "outputAmountResult": "1000000000"})
+        if "/tokens/v2/search" in str(request.url):
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", MINT_E4A), "audit": {"isSus": False}}])
+        if "rugcheck.xyz" in str(request.url):
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/ultra/v1/shield" in str(request.url):
+            return httpx.Response(200, json={"warnings": {}})
         return httpx.Response(404)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -425,6 +432,12 @@ async def test_e4a_corrective_strict_parsing_missing_oat_and_router_allowlist(tm
         if "/swap/v2/execute" in str(request.url):
             exec_calls["n"] += 1
             return httpx.Response(200, json={"signature": "SigE4ACorr111", "outputAmountResult": "1000000000"})
+        if "/tokens/v2/search" in str(request.url):
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", MINT_E4A), "audit": {"isSus": False}}])
+        if "rugcheck.xyz" in str(request.url):
+            return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+        if "/ultra/v1/shield" in str(request.url):
+            return httpx.Response(200, json={"warnings": {}})
         return httpx.Response(404)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -517,6 +530,12 @@ async def test_e4a_post_broadcast_output_amount_result_strict_and_unresolved_lif
                 })
             if "/swap/v2/execute" in str(request.url):
                 return httpx.Response(200, json=payload)
+            if "/tokens/v2/search" in str(request.url):
+                return httpx.Response(200, json=[{"id": request.url.params.get("query", mint_i), "audit": {"isSus": False}}])
+            if "rugcheck.xyz" in str(request.url):
+                return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+            if "/ultra/v1/shield" in str(request.url):
+                return httpx.Response(200, json={"warnings": {}})
             return httpx.Response(404)
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler_bad)) as client:
@@ -566,6 +585,12 @@ async def test_e4a_post_broadcast_output_amount_result_strict_and_unresolved_lif
                 })
             if "/swap/v2/execute" in str(request.url):
                 return httpx.Response(200, json={"signature": f"SigGood{idx}", "outputAmountResult": gv})
+            if "/tokens/v2/search" in str(request.url):
+                return httpx.Response(200, json=[{"id": request.url.params.get("query", mint_i), "audit": {"isSus": False}}])
+            if "rugcheck.xyz" in str(request.url):
+                return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
+            if "/ultra/v1/shield" in str(request.url):
+                return httpx.Response(200, json={"warnings": {}})
             return httpx.Response(404)
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler_ok)) as client:

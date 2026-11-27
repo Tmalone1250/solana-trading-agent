@@ -18,6 +18,9 @@ from solders.transaction import VersionedTransaction
 
 from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
 from db import AgentDatabase, utc_now, utc_now_iso
+from jupiter_token_client import _build_headers as _jup_v2_headers
+from jupiter_token_client import _extract_token_list, parse_jupiter_token_v2
+from safety_gate_node import check_token_safety, is_safety_timestamp_fresh
 from state import ActivePosition, AgentGraphState, FocusState, PendingOrder, is_valid_pool_address
 from state_ledger import (
     acquire_exit_guard,
@@ -452,6 +455,109 @@ def _evaluate_e4b_route_pool(
     return (router_norm, route_pool_keys, "VERIFIED_PINNED_POOL", None)
 
 
+async def _validate_e4e_pre_execution_safety(
+    order: PendingOrder,
+    *,
+    config: AgentConfig,
+    db: AgentDatabase,
+    client: httpx.AsyncClient,
+    now_dt: Optional[datetime] = None,
+) -> None:
+    """Phase E4E: Pre-execution BUY safety freshness boundary (outside db._lock)."""
+    ttl = config.PRE_EXECUTION_SAFETY_TTL_SECONDS
+    is_breakout = (order.strategy or "").strip().upper() == "BREAKOUT_IGNITION"
+    if ttl is None:
+        if config.EXECUTION_MODE == "live" and is_breakout:
+            raise E4AValidationError("BLOCKED: PRE_EXECUTION_SAFETY_TTL_UNSET")
+        return
+    if isinstance(ttl, bool) or not math.isfinite(float(ttl)) or float(ttl) <= 0.0:
+        raise E4AValidationError("BLOCKED: INVALID_PRE_EXECUTION_SAFETY_TTL")
+
+    ref_now = now_dt or utc_now()
+    if ref_now.tzinfo is None:
+        ref_now = ref_now.replace(tzinfo=timezone.utc)
+
+    # Read watchlist entry under db._lock (released before any network request)
+    w_row = db.get_watchlist_entry(order.mint)
+    if w_row is not None and is_breakout:
+        w_pair = str(w_row.get("pair_address") or "").strip()
+        if w_pair and w_pair != str(order.pair_address or "").strip():
+            raise E4AValidationError(
+                f"BLOCKED: PINNED_POOL_MISMATCH_AT_SAFETY (order={order.pair_address}, watchlist={w_pair})"
+            )
+
+    if w_row is not None and w_row.get("safety_passed") is True and is_safety_timestamp_fresh(
+        w_row.get("safety_checked_at"), float(ttl), now_dt=ref_now
+    ):
+        return
+
+    confirmed_unsafe: list[str] = []
+    # 1. Lightweight Jupiter Token v2 isSus check
+    try:
+        v2_resp = await client.get(
+            f"{config.JUPITER_TOKENS_V2_BASE_URL}/search",
+            params={"query": order.mint},
+            headers=_jup_v2_headers(config),
+            timeout=10.0,
+        )
+        v2_resp.raise_for_status()
+        v2_payload = v2_resp.json()
+        items = _extract_token_list(v2_payload)
+        if not items and isinstance(v2_payload, dict) and (v2_payload.get("id") or v2_payload.get("address")):
+            items = [v2_payload]
+        matched_meta: Optional[dict[str, Any]] = None
+        for item in items:
+            parsed = parse_jupiter_token_v2(item)
+            if parsed and parsed[0] == order.mint:
+                matched_meta = parsed[1]
+                break
+        if matched_meta is None:
+            raise E4AValidationError("BLOCKED: PRE_EXECUTION_JUPITER_V2_MISSING_MINT")
+        if matched_meta.get("is_sus") is True:
+            confirmed_unsafe.append("Jupiter Token v2: audit.isSus=True")
+    except E4AValidationError:
+        raise
+    except Exception as exc:
+        raise E4AValidationError(f"BLOCKED: PRE_EXECUTION_JUPITER_V2_UNAVAILABLE ({exc})") from exc
+
+    # 2. Full check_token_safety (RugCheck summary + Jupiter Shield) when report is stale/missing
+    report = await check_token_safety(order.mint, config, client)
+    if not report.passed:
+        for r in report.reasons:
+            if "unavailable/failed" in r.lower():
+                if not confirmed_unsafe:
+                    raise E4AValidationError(
+                        f"BLOCKED: PRE_EXECUTION_SAFETY_UNAVAILABLE ({'; '.join(report.reasons)})"
+                    )
+            else:
+                confirmed_unsafe.append(r)
+
+    if confirmed_unsafe:
+        reason_str = "; ".join(confirmed_unsafe)
+        db.remove_from_watchlist(order.mint)
+        db.set_cooldown_minutes(
+            order.mint,
+            minutes=config.SAFETY_REJECT_COOLDOWN_MINUTES,
+            reason=f"SAFETY_REJECT: {reason_str}",
+            now=ref_now,
+        )
+        db.log_action(
+            mode=config.EXECUTION_MODE,
+            action="EVICT",
+            symbol=order.symbol,
+            asset_id=order.mint,
+            strategy="SAFETY_GATE",
+            reason=f"SAFETY_REJECT: {reason_str}",
+            timestamp_utc=ref_now.isoformat(),
+            pair_address=order.pair_address,
+            dex_id=order.dex_id,
+        )
+        raise E4AValidationError(f"BLOCKED: PRE_EXECUTION_SAFETY_FAILED ({reason_str})")
+
+    if w_row is not None:
+        db.mark_watchlist_safety_passed(order.mint, True, checked_at=ref_now.isoformat())
+
+
 async def fetch_live_wallet_sol_balance(
     pubkey: str,
     *,
@@ -716,6 +822,8 @@ async def executor_node(
     e4b_pool_status: Optional[str] = None
 
     try:
+        if is_buy:
+            await _validate_e4e_pre_execution_safety(order, config=config, db=db, client=client)
         try:
             order_resp = await fetch_jupiter_order(
                 input_mint=input_mint, output_mint=output_mint,

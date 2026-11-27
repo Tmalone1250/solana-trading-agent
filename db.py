@@ -324,6 +324,7 @@ class AgentDatabase:
             ("pair_address", "VARCHAR DEFAULT ''"),
             ("dex_id", "VARCHAR"),
             ("safety_passed", "BOOLEAN DEFAULT FALSE"),
+            ("safety_checked_at", "VARCHAR"),
             ("entry_liquidity_usd", "DOUBLE DEFAULT 0.0"),
             ("peak_mc", "DOUBLE DEFAULT 0.0"),
             ("low_mc", "DOUBLE DEFAULT 0.0"),
@@ -1016,7 +1017,7 @@ class AgentDatabase:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT mint, symbol, pair_address, dex_id, added_at, safety_passed, entry_liquidity_usd,
+                SELECT mint, symbol, pair_address, dex_id, added_at, safety_passed, safety_checked_at, entry_liquidity_usd,
                        peak_mc, low_mc, leg2_score, leg2_breakdown_json, vamp_strikes,
                        rsi_5m, setup_type, scalper_eligible, dist_from_1h_high_pct,
                        discovery_source, jup_organic_score, jup_meta_json,
@@ -1033,6 +1034,7 @@ class AgentDatabase:
             dex_id,
             added_at,
             safety_passed,
+            safety_checked_at,
             entry_liq,
             peak_mc,
             low_mc,
@@ -1060,6 +1062,7 @@ class AgentDatabase:
                     "dex_id": resolved_dex,
                     "added_at": added_at,
                     "safety_passed": bool(safety_passed),
+                    "safety_checked_at": safety_checked_at,
                     "entry_liquidity_usd": float(entry_liq or 0.0),
                     "peak_mc": float(peak_mc or 0.0),
                     "low_mc": float(low_mc or 0.0),
@@ -1166,12 +1169,26 @@ class AgentDatabase:
                 ],
             )
 
-    def mark_watchlist_safety_passed(self, mint: str, passed: bool = True) -> None:
+    def mark_watchlist_safety_passed(
+        self,
+        mint: str,
+        passed: bool = True,
+        *,
+        checked_at: Optional[str] = None,
+    ) -> None:
+        ts = (checked_at or utc_now_iso()) if passed else None
         with self._lock:
             self._conn.execute(
-                "UPDATE active_watchlist SET safety_passed = ? WHERE mint = ?",
-                [bool(passed), mint],
+                "UPDATE active_watchlist SET safety_passed = ?, safety_checked_at = ? WHERE mint = ?",
+                [bool(passed), ts, mint],
             )
+
+    def get_watchlist_entry(self, mint: str) -> Optional[dict[str, Any]]:
+        """Return a single active_watchlist row by mint, or None."""
+        for row in self.get_watchlist():
+            if row.get("mint") == mint:
+                return row
+        return None
 
     def update_watchlist_scores(
         self,
