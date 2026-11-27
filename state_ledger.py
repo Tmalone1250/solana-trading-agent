@@ -9,6 +9,7 @@ import math
 import threading
 import time
 import uuid
+import weakref
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -19,6 +20,9 @@ logger = logging.getLogger(__name__)
 RESERVATION_TTL_SEC = 60.0
 SELL_GUARD_TTL_SEC = 60.0
 SELL_GUARD_MAX = 64
+
+RESERVATION_STATE_ACTIVE = "ACTIVE"
+RESERVATION_STATE_BROADCAST_UNRESOLVED = "BROADCAST_UNRESOLVED"
 
 # Guarded by db._lock: db_path -> list of {id, lane, mint, sol_amount, created_ts}
 _inflight_buy_reservations: dict[str, list[dict[str, Any]]] = {}
@@ -114,29 +118,79 @@ def _utc_now_iso() -> str:
     return _utc_now().isoformat()
 
 
+def _is_reservation_owner_active(rec: dict[str, Any]) -> bool:
+    """Return True only when the reservation's owning asyncio.Task is still alive and not done."""
+    task_ref = rec.get("owner_task_ref")
+    if task_ref is None:
+        return False
+    task = task_ref()
+    return task is not None and not task.done()
+
+
 def get_inflight_buy_reservations(db_path: str) -> list[dict[str, Any]]:
     """Return a shallow copy of current in-flight BUY reservations for inspection/tests."""
-    return [dict(r) for r in _inflight_buy_reservations.get(str(db_path), [])]
+    out: list[dict[str, Any]] = []
+    for r in _inflight_buy_reservations.get(str(db_path), []):
+        item = {k: v for k, v in r.items() if k != "owner_task_ref"}
+        item["owner_active"] = _is_reservation_owner_active(r)
+        out.append(item)
+    return out
 
 
-def _resolve_owner_task_id() -> str:
+def _resolve_owner_task() -> tuple[Optional[weakref.ReferenceType[Any]], str]:
     try:
         curr_task = asyncio.current_task()
         if curr_task is not None:
-            return f"task-{id(curr_task)}"
+            return weakref.ref(curr_task), f"task-{id(curr_task)}"
     except RuntimeError:
         pass
-    return f"thread-{threading.get_ident()}"
+    return None, f"thread-{threading.get_ident()}"
 
 
 def _prune_reservations_locked(db_path: str, now_ts: float) -> list[dict[str, Any]]:
-    active = [
-        r for r in _inflight_buy_reservations.get(db_path, [])
-        if bool(r.get("active_coroutine", False))
-        or (now_ts - float(r.get("created_ts") or 0.0)) < RESERVATION_TTL_SEC
-    ]
+    active: list[dict[str, Any]] = []
+    for r in _inflight_buy_reservations.get(db_path, []):
+        state = str(r.get("state") or RESERVATION_STATE_ACTIVE)
+        # Never prune a potentially broadcast / unresolved live reservation (conservative E4C lock until E4D)
+        if state == RESERVATION_STATE_BROADCAST_UNRESOLVED:
+            active.append(r)
+            continue
+        # Task-owned ACTIVE reservation: keep while owning task is alive & not done; prune abandoned done tasks
+        if r.get("owner_task_ref") is not None:
+            if _is_reservation_owner_active(r):
+                active.append(r)
+            continue
+        # Non-task synchronous caller fallback: honor RESERVATION_TTL_SEC
+        if (now_ts - float(r.get("created_ts") or 0.0)) < RESERVATION_TTL_SEC:
+            active.append(r)
     _inflight_buy_reservations[db_path] = active
     return active
+
+
+def mark_buy_reservation_broadcast_unresolved(
+    db: Any,
+    reservation_id: Optional[str],
+    *,
+    reason: str = "",
+) -> None:
+    """Transition an in-flight BUY reservation to BROADCAST_UNRESOLVED so it remains locked until E4D reconciliation.
+
+    Note (E4C scope): This lock is in-process only; durable restart recovery belongs to E4D.
+    """
+    if not reservation_id:
+        return
+    with db._lock:
+        key = str(db.db_path)
+        for r in _inflight_buy_reservations.get(key, []):
+            if r.get("id") == reservation_id:
+                r["state"] = RESERVATION_STATE_BROADCAST_UNRESOLVED
+                r["unresolved_reason"] = reason
+                r["unresolved_at_ts"] = time.monotonic()
+                logger.warning(
+                    "[Ledger] Reservation %s (%s) transitioned to BROADCAST_UNRESOLVED (locked; reason=%s)",
+                    reservation_id, r.get("mint"), reason or "ambiguous live broadcast outcome",
+                )
+                break
 
 
 def rollover_daily_if_needed_locked(conn: Any) -> tuple[float, float, float, str]:
@@ -316,6 +370,7 @@ def reserve_buy_slot(
             return None, f"INSUFFICIENT_SOL (avail={duck_avail_sol:.4f} < req_with_fee={total_required:.4f})"
 
         res_id = uuid.uuid4().hex
+        task_ref, default_tid = _resolve_owner_task()
         active_res.append(
             {
                 "id": res_id,
@@ -323,8 +378,9 @@ def reserve_buy_slot(
                 "mint": mint,
                 "sol_amount": total_required,
                 "created_ts": time.monotonic(),
-                "active_coroutine": True,
-                "owner_task_id": owner_task_id or _resolve_owner_task_id(),
+                "state": RESERVATION_STATE_ACTIVE,
+                "owner_task_ref": task_ref,
+                "owner_task_id": owner_task_id or default_tid,
             }
         )
         return res_id, None

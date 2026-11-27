@@ -21,6 +21,8 @@ from db import AgentDatabase
 from executor_node import clear_sell_idempotency_guard, executor_node
 from state import FocusState, PendingOrder
 from state_ledger import (
+    RESERVATION_STATE_ACTIVE,
+    RESERVATION_STATE_BROADCAST_UNRESOLVED,
     RESERVATION_TTL_SEC,
     _inflight_buy_reservations,
     clear_buy_reservations,
@@ -97,7 +99,7 @@ def test_e4c_paper_fee_aware_reservation_enforces_required_plus_fee(tmp_path):
     inflight = get_inflight_buy_reservations(str(db2.db_path))
     assert len(inflight) == 1
     assert inflight[0]["sol_amount"] == pytest.approx(0.501)
-    assert inflight[0]["active_coroutine"] is True
+    assert inflight[0]["state"] == RESERVATION_STATE_ACTIVE
     assert inflight[0]["owner_task_id"]
     db.close()
     db2.close()
@@ -239,29 +241,144 @@ def test_e4c_atomic_cooldown_and_daily_max_loss_guards(tmp_path):
     db.close()
 
 
-def test_e4c_active_coroutine_reservation_survives_ttl_eviction(tmp_path):
-    """Active coroutine reservations are never pruned when RESERVATION_TTL_SEC elapses."""
+@pytest.mark.asyncio
+async def test_e4c_active_coroutine_survives_ttl_and_done_task_prunes_abandoned_reservation(tmp_path):
+    """Active asyncio.Task survives TTL; once that task completes without releasing, abandoned pre-broadcast reservation is pruned."""
     clear_buy_reservations()
     db = AgentDatabase(db_path=str(tmp_path / "e4c_ttl.duckdb"), starting_sol=2.0)
 
-    res1, rej1 = db.reserve_buy_slot(
-        lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.001,
-        max_lane_positions=1, max_open_positions=6,
-    )
-    assert res1 is not None and rej1 is None
+    reserved_ev = asyncio.Event()
+    finish_ev = asyncio.Event()
 
-    # Simulate > RESERVATION_TTL_SEC elapsed while coroutine is still active
+    async def _worker() -> str:
+        res1, rej1 = db.reserve_buy_slot(
+            lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.001,
+            max_lane_positions=1, max_open_positions=6,
+        )
+        assert res1 is not None and rej1 is None
+        reserved_ev.set()
+        await finish_ev.wait()
+        return res1  # Intentionally exits without releasing to simulate abandoned pre-broadcast task
+
+    task = asyncio.create_task(_worker())
+    await reserved_ev.wait()
+
+    # Simulate > RESERVATION_TTL_SEC elapsed while owning task is still active
     _inflight_buy_reservations[str(db.db_path)][0]["created_ts"] = time.monotonic() - (RESERVATION_TTL_SEC + 30.0)
+    inflight_now = get_inflight_buy_reservations(str(db.db_path))
+    assert inflight_now[0]["owner_active"] is True
+    assert inflight_now[0]["state"] == RESERVATION_STATE_ACTIVE
 
-    # Concurrent attempt must NOT prune res1 and must be blocked by LANE_CAPACITY
+    # Concurrent attempt must NOT prune active task's reservation
     res2, rej2 = db.reserve_buy_slot(
         lane="chart", mint=MINT_B, required_sol=0.50, tx_fee_sol=0.001,
         max_lane_positions=1, max_open_positions=6,
     )
     assert res2 is None and rej2 is not None and "LANE_CAPACITY" in rej2
-    assert len(get_inflight_buy_reservations(str(db.db_path))) == 1
-    db.release_buy_reservation(res1)
+
+    # Complete owning task without releasing -> abandoned ACTIVE reservation must be pruned on next reserve
+    finish_ev.set()
+    await task
+    res3, rej3 = db.reserve_buy_slot(
+        lane="chart", mint=MINT_B, required_sol=0.50, tx_fee_sol=0.001,
+        max_lane_positions=1, max_open_positions=6,
+    )
+    assert res3 is not None and rej3 is None
+    db.release_buy_reservation(res3)
     assert get_inflight_buy_reservations(str(db.db_path)) == []
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_e4c_prebroadcast_cancellation_and_post_quote_exception_release_reservation(tmp_path):
+    """Pre-broadcast CancelledError and post-quote/pre-broadcast exceptions release reservation cleanly."""
+    clear_buy_reservations()
+    clear_sell_idempotency_guard()
+    kp = Keypair()
+    db = AgentDatabase(db_path=str(tmp_path / "e4c_cancel.duckdb"), starting_sol=2.0)
+    cfg = AgentConfig(
+        _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp), SOLANA_RPC_URL=RPC_URL,
+    )
+
+    # 1. Pre-broadcast CancelledError during quote fetch releases reservation
+    async def _cancel_transport(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith(RPC_URL):
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
+        await asyncio.sleep(5.0)
+        return httpx.Response(200, json={"outAmount": "1000000"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_cancel_transport)) as client:
+        t = asyncio.create_task(
+            executor_node(
+                {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order()},
+                config=cfg, db=db, http_client=client,
+            )
+        )
+        await asyncio.sleep(0.05)
+        t.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t
+    assert get_inflight_buy_reservations(str(db.db_path)) == []
+
+    # 2. Exception after quote retrieval but before broadcast (missing tx in live mode) releases reservation
+    def _no_tx_handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith(RPC_URL):
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
+        return httpx.Response(200, json={"outAmount": "1000000", "transaction": None, "requestId": "req-no-tx"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_no_tx_handler)) as client:
+        with pytest.raises(RuntimeError, match="no transaction"):
+            await executor_node(
+                {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order()},
+                config=cfg, db=db, http_client=client,
+            )
+    assert get_inflight_buy_reservations(str(db.db_path)) == []
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_e4c_potentially_broadcast_live_timeout_remains_locked_past_task_end_and_ttl(tmp_path):
+    """Live timeout during /swap/v2/execute transitions reservation to BROADCAST_UNRESOLVED and stays locked."""
+    clear_buy_reservations()
+    clear_sell_idempotency_guard()
+    kp = Keypair()
+    unsigned_tx = _mk_unsigned_tx(kp)
+    db = AgentDatabase(db_path=str(tmp_path / "e4c_unres.duckdb"), starting_sol=2.0)
+    cfg = AgentConfig(
+        _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
+        SOLANA_RPC_URL=RPC_URL, MAX_CHART_POSITIONS=3,
+    )
+
+    def _timeout_exec_handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith(RPC_URL):
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
+        if "/swap/v2/order" in str(request.url):
+            return httpx.Response(200, json={"outAmount": "1000000", "transaction": unsigned_tx, "requestId": "req-to"})
+        raise httpx.ReadTimeout("execute timed out after broadcast")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_timeout_exec_handler)) as client:
+        task = asyncio.create_task(
+            executor_node(
+                {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order(mint=MINT_A)},
+                config=cfg, db=db, http_client=client,
+            )
+        )
+        with pytest.raises(httpx.ReadTimeout):
+            await task
+
+    # Even though task is done AND TTL has elapsed, BROADCAST_UNRESOLVED reservation must stay locked!
+    _inflight_buy_reservations[str(db.db_path)][0]["created_ts"] = time.monotonic() - (RESERVATION_TTL_SEC + 120.0)
+    inflight = get_inflight_buy_reservations(str(db.db_path))
+    assert len(inflight) == 1
+    assert inflight[0]["state"] == RESERVATION_STATE_BROADCAST_UNRESOLVED
+    assert inflight[0]["owner_active"] is False
+
+    # Duplicate BUY on MINT_A must be blocked!
+    res_dup, rej_dup = db.reserve_buy_slot(
+        lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.01,
+        max_lane_positions=3, max_open_positions=6,
+    )
+    assert res_dup is None and rej_dup is not None and "DUPLICATE_MINT" in rej_dup
     db.close()
 
 

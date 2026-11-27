@@ -1,0 +1,450 @@
+diff --git a/executor_node.py b/executor_node.py
+index 13eac58..7af40e2 100644
+--- a/executor_node.py
++++ b/executor_node.py
+@@ -15,7 +15,12 @@ from solders.transaction import VersionedTransaction
+ from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
+ from db import AgentDatabase, utc_now, utc_now_iso
+ from state import ActivePosition, AgentGraphState, FocusState, PendingOrder, is_valid_pool_address
+-from state_ledger import acquire_exit_guard, clear_sell_guard, finalize_exit_guard
++from state_ledger import (
++    acquire_exit_guard,
++    clear_sell_guard,
++    finalize_exit_guard,
++    mark_buy_reservation_broadcast_unresolved,
++)
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -287,6 +292,8 @@ async def executor_node(
+ 
+     input_mint = SOL_MINT if is_buy else order.mint
+     output_mint = order.mint if is_buy else SOL_MINT
++    broadcast_attempted = False
++    settled_buy = False
+ 
+     try:
+         try:
+@@ -313,6 +320,7 @@ async def executor_node(
+             if not tx_b64:
+                 raise RuntimeError("Jupiter /swap/v2/order returned no transaction in live mode")
+             signed_b64 = sign_jupiter_transaction(tx_b64, config.SOLANA_PRIVATE_KEY_BS58)
++            broadcast_attempted = True
+             exec_resp = await execute_jupiter_signed_order(
+                 signed_tx_base64=signed_b64, request_id=request_id, config=config, client=client,
+             )
+@@ -321,9 +329,13 @@ async def executor_node(
+                 out_amount = int(exec_resp["outputAmountResult"])
+         else:
+             tx_signature = f"paper-{order.side.lower()}-{order.mint[:8]}"
+-    except BaseException:
++    except BaseException as exc:
+         if reservation_id:
+-            db.release_buy_reservation(reservation_id)
++            if broadcast_attempted:
++                # Never release a live reservation after broadcast may have occurred (E4C conservative lock; E4D adds durable reconciliation)
++                mark_buy_reservation_broadcast_unresolved(db, reservation_id, reason=f"{type(exc).__name__}: {exc}")
++            else:
++                db.release_buy_reservation(reservation_id)
+         finalize_exit_guard(db, sell_key, committed=False)
+         raise
+     finally:
+@@ -339,42 +351,51 @@ async def executor_node(
+     rationale_out = order.rationale or state.get("last_decision_rationale")
+ 
+     if is_buy:
+-        spent_sol = order.amount_atomic / LAMPORTS_PER_SOL
+-        sol_delta = -(spent_sol + tx_fee_opt) if tx_fee_opt is not None else -spent_sol
+-        pnl_delta = -tx_fee_opt if tx_fee_opt is not None else 0.0
+-        pos_strategy = order.strategy or "SCALPER"
+-        prev_reentries = (
+-            int(existing_pos_dict.get("reentry_count") or 0)
+-            if isinstance(existing_pos_dict, dict) and existing_pos_dict.get("mint") == order.mint
+-            else 0
+-        )
+-        next_reentry_count = (prev_reentries + 1) if order.reason == "LEG_2_REENTRY" else 0
+-        pos = ActivePosition(
+-            mint=order.mint, symbol=order.symbol, entry_sol=spent_sol, token_amount=out_amount,
+-            pair_address=order.pair_address, dex_id=order.dex_id,
+-            strategy=pos_strategy, triggering_wallets=list(order.triggering_wallets),
+-            whale_shadow_exit_flag=False, opened_at=utc_now_iso(),
+-            entry_liquidity_usd=order.entry_liquidity_usd, entry_mc_usd=order.entry_mc_usd,
+-            whale_sol_flow=order.whale_sol_flow, breakout_telemetry=order.breakout_telemetry,
+-            current_sol_value=spent_sol, peak_sol_value=spent_sol,
+-            partial_tp_taken=False, initial_entry_sol=spent_sol,
+-            remaining_cost_basis_sol=spent_sol, realized_partial_pnl_sol=0.0,
+-            entry_fee_sol=tx_fee_opt,
+-            accumulated_fees_sol=round(tx_fee_opt, 6) if tx_fee_opt is not None else 0.0,
+-            fee_accounting_status=tx_fee_status,
+-            breakeven_armed=False, trail_armed=False, retrace_low_sol=None, run_peak_sol=None,
+-            watch_started_at=None, reference_token_amount=out_amount,
+-            reentry_count=next_reentry_count, last_liquidity_usd=order.entry_liquidity_usd,
+-        )
+-        new_pos_dict = pos.model_dump()
+-        db.remove_from_watchlist(order.mint)
+-        settled = db.apply_trade_settlement(
+-            lane=lane_tag, side="BUY", mint=order.mint, opened_at=pos.opened_at, new_pos_dict=new_pos_dict,
+-            sol_delta=sol_delta, pnl_delta=pnl_delta, focus_state=next_state,
+-            last_decision_rationale=rationale_out, reservation_id=reservation_id,
+-            fallback_base_sol=fb_base_sol, fallback_base_pnl=fb_base_pnl,
+-        )
+-        sol_balance, daily_pnl_sol = settled["sol_balance"], settled["daily_pnl_sol"]
++        try:
++            spent_sol = order.amount_atomic / LAMPORTS_PER_SOL
++            sol_delta = -(spent_sol + tx_fee_opt) if tx_fee_opt is not None else -spent_sol
++            pnl_delta = -tx_fee_opt if tx_fee_opt is not None else 0.0
++            pos_strategy = order.strategy or "SCALPER"
++            prev_reentries = (
++                int(existing_pos_dict.get("reentry_count") or 0)
++                if isinstance(existing_pos_dict, dict) and existing_pos_dict.get("mint") == order.mint
++                else 0
++            )
++            next_reentry_count = (prev_reentries + 1) if order.reason == "LEG_2_REENTRY" else 0
++            pos = ActivePosition(
++                mint=order.mint, symbol=order.symbol, entry_sol=spent_sol, token_amount=out_amount,
++                pair_address=order.pair_address, dex_id=order.dex_id,
++                strategy=pos_strategy, triggering_wallets=list(order.triggering_wallets),
++                whale_shadow_exit_flag=False, opened_at=utc_now_iso(),
++                entry_liquidity_usd=order.entry_liquidity_usd, entry_mc_usd=order.entry_mc_usd,
++                whale_sol_flow=order.whale_sol_flow, breakout_telemetry=order.breakout_telemetry,
++                current_sol_value=spent_sol, peak_sol_value=spent_sol,
++                partial_tp_taken=False, initial_entry_sol=spent_sol,
++                remaining_cost_basis_sol=spent_sol, realized_partial_pnl_sol=0.0,
++                entry_fee_sol=tx_fee_opt,
++                accumulated_fees_sol=round(tx_fee_opt, 6) if tx_fee_opt is not None else 0.0,
++                fee_accounting_status=tx_fee_status,
++                breakeven_armed=False, trail_armed=False, retrace_low_sol=None, run_peak_sol=None,
++                watch_started_at=None, reference_token_amount=out_amount,
++                reentry_count=next_reentry_count, last_liquidity_usd=order.entry_liquidity_usd,
++            )
++            new_pos_dict = pos.model_dump()
++            db.remove_from_watchlist(order.mint)
++            settled = db.apply_trade_settlement(
++                lane=lane_tag, side="BUY", mint=order.mint, opened_at=pos.opened_at, new_pos_dict=new_pos_dict,
++                sol_delta=sol_delta, pnl_delta=pnl_delta, focus_state=next_state,
++                last_decision_rationale=rationale_out, reservation_id=reservation_id,
++                fallback_base_sol=fb_base_sol, fallback_base_pnl=fb_base_pnl,
++            )
++            settled_buy = True
++            sol_balance, daily_pnl_sol = settled["sol_balance"], settled["daily_pnl_sol"]
++        except BaseException as exc:
++            if reservation_id and not settled_buy:
++                if broadcast_attempted:
++                    mark_buy_reservation_broadcast_unresolved(db, reservation_id, reason=f"post-broadcast settlement error: {type(exc).__name__}: {exc}")
++                else:
++                    db.release_buy_reservation(reservation_id)
++            raise
+ 
+         db.log_trade(
+             mode=config.EXECUTION_MODE, side="BUY", mint=order.mint, symbol=order.symbol,
+diff --git a/state_ledger.py b/state_ledger.py
+index 5441f5d..8c14a80 100644
+--- a/state_ledger.py
++++ b/state_ledger.py
+@@ -9,6 +9,7 @@ import math
+ import threading
+ import time
+ import uuid
++import weakref
+ from datetime import datetime, timezone
+ from typing import Any, Optional
+ 
+@@ -20,6 +21,9 @@ RESERVATION_TTL_SEC = 60.0
+ SELL_GUARD_TTL_SEC = 60.0
+ SELL_GUARD_MAX = 64
+ 
++RESERVATION_STATE_ACTIVE = "ACTIVE"
++RESERVATION_STATE_BROADCAST_UNRESOLVED = "BROADCAST_UNRESOLVED"
++
+ # Guarded by db._lock: db_path -> list of {id, lane, mint, sol_amount, created_ts}
+ _inflight_buy_reservations: dict[str, list[dict[str, Any]]] = {}
+ # Shared SELL & PARTIAL_SELL idempotency guard: (db_path, lane, mint, opened_at, side_up)
+@@ -114,31 +118,81 @@ def _utc_now_iso() -> str:
+     return _utc_now().isoformat()
+ 
+ 
++def _is_reservation_owner_active(rec: dict[str, Any]) -> bool:
++    """Return True only when the reservation's owning asyncio.Task is still alive and not done."""
++    task_ref = rec.get("owner_task_ref")
++    if task_ref is None:
++        return False
++    task = task_ref()
++    return task is not None and not task.done()
++
++
+ def get_inflight_buy_reservations(db_path: str) -> list[dict[str, Any]]:
+     """Return a shallow copy of current in-flight BUY reservations for inspection/tests."""
+-    return [dict(r) for r in _inflight_buy_reservations.get(str(db_path), [])]
++    out: list[dict[str, Any]] = []
++    for r in _inflight_buy_reservations.get(str(db_path), []):
++        item = {k: v for k, v in r.items() if k != "owner_task_ref"}
++        item["owner_active"] = _is_reservation_owner_active(r)
++        out.append(item)
++    return out
+ 
+ 
+-def _resolve_owner_task_id() -> str:
++def _resolve_owner_task() -> tuple[Optional[weakref.ReferenceType[Any]], str]:
+     try:
+         curr_task = asyncio.current_task()
+         if curr_task is not None:
+-            return f"task-{id(curr_task)}"
++            return weakref.ref(curr_task), f"task-{id(curr_task)}"
+     except RuntimeError:
+         pass
+-    return f"thread-{threading.get_ident()}"
++    return None, f"thread-{threading.get_ident()}"
+ 
+ 
+ def _prune_reservations_locked(db_path: str, now_ts: float) -> list[dict[str, Any]]:
+-    active = [
+-        r for r in _inflight_buy_reservations.get(db_path, [])
+-        if bool(r.get("active_coroutine", False))
+-        or (now_ts - float(r.get("created_ts") or 0.0)) < RESERVATION_TTL_SEC
+-    ]
++    active: list[dict[str, Any]] = []
++    for r in _inflight_buy_reservations.get(db_path, []):
++        state = str(r.get("state") or RESERVATION_STATE_ACTIVE)
++        # Never prune a potentially broadcast / unresolved live reservation (conservative E4C lock until E4D)
++        if state == RESERVATION_STATE_BROADCAST_UNRESOLVED:
++            active.append(r)
++            continue
++        # Task-owned ACTIVE reservation: keep while owning task is alive & not done; prune abandoned done tasks
++        if r.get("owner_task_ref") is not None:
++            if _is_reservation_owner_active(r):
++                active.append(r)
++            continue
++        # Non-task synchronous caller fallback: honor RESERVATION_TTL_SEC
++        if (now_ts - float(r.get("created_ts") or 0.0)) < RESERVATION_TTL_SEC:
++            active.append(r)
+     _inflight_buy_reservations[db_path] = active
+     return active
+ 
+ 
++def mark_buy_reservation_broadcast_unresolved(
++    db: Any,
++    reservation_id: Optional[str],
++    *,
++    reason: str = "",
++) -> None:
++    """Transition an in-flight BUY reservation to BROADCAST_UNRESOLVED so it remains locked until E4D reconciliation.
++
++    Note (E4C scope): This lock is in-process only; durable restart recovery belongs to E4D.
++    """
++    if not reservation_id:
++        return
++    with db._lock:
++        key = str(db.db_path)
++        for r in _inflight_buy_reservations.get(key, []):
++            if r.get("id") == reservation_id:
++                r["state"] = RESERVATION_STATE_BROADCAST_UNRESOLVED
++                r["unresolved_reason"] = reason
++                r["unresolved_at_ts"] = time.monotonic()
++                logger.warning(
++                    "[Ledger] Reservation %s (%s) transitioned to BROADCAST_UNRESOLVED (locked; reason=%s)",
++                    reservation_id, r.get("mint"), reason or "ambiguous live broadcast outcome",
++                )
++                break
++
++
+ def rollover_daily_if_needed_locked(conn: Any) -> tuple[float, float, float, str]:
+     """Ensure UTC midnight rollover is applied atomically inside db._lock.
+ 
+@@ -316,6 +370,7 @@ def reserve_buy_slot(
+             return None, f"INSUFFICIENT_SOL (avail={duck_avail_sol:.4f} < req_with_fee={total_required:.4f})"
+ 
+         res_id = uuid.uuid4().hex
++        task_ref, default_tid = _resolve_owner_task()
+         active_res.append(
+             {
+                 "id": res_id,
+@@ -323,8 +378,9 @@ def reserve_buy_slot(
+                 "mint": mint,
+                 "sol_amount": total_required,
+                 "created_ts": time.monotonic(),
+-                "active_coroutine": True,
+-                "owner_task_id": owner_task_id or _resolve_owner_task_id(),
++                "state": RESERVATION_STATE_ACTIVE,
++                "owner_task_ref": task_ref,
++                "owner_task_id": owner_task_id or default_tid,
+             }
+         )
+         return res_id, None
+diff --git a/tests/test_e4c_reservation_risk.py b/tests/test_e4c_reservation_risk.py
+index e7e0e71..31c1b51 100644
+--- a/tests/test_e4c_reservation_risk.py
++++ b/tests/test_e4c_reservation_risk.py
+@@ -21,6 +21,8 @@ from db import AgentDatabase
+ from executor_node import clear_sell_idempotency_guard, executor_node
+ from state import FocusState, PendingOrder
+ from state_ledger import (
++    RESERVATION_STATE_ACTIVE,
++    RESERVATION_STATE_BROADCAST_UNRESOLVED,
+     RESERVATION_TTL_SEC,
+     _inflight_buy_reservations,
+     clear_buy_reservations,
+@@ -97,7 +99,7 @@ def test_e4c_paper_fee_aware_reservation_enforces_required_plus_fee(tmp_path):
+     inflight = get_inflight_buy_reservations(str(db2.db_path))
+     assert len(inflight) == 1
+     assert inflight[0]["sol_amount"] == pytest.approx(0.501)
+-    assert inflight[0]["active_coroutine"] is True
++    assert inflight[0]["state"] == RESERVATION_STATE_ACTIVE
+     assert inflight[0]["owner_task_id"]
+     db.close()
+     db2.close()
+@@ -239,29 +241,144 @@ def test_e4c_atomic_cooldown_and_daily_max_loss_guards(tmp_path):
+     db.close()
+ 
+ 
+-def test_e4c_active_coroutine_reservation_survives_ttl_eviction(tmp_path):
+-    """Active coroutine reservations are never pruned when RESERVATION_TTL_SEC elapses."""
++@pytest.mark.asyncio
++async def test_e4c_active_coroutine_survives_ttl_and_done_task_prunes_abandoned_reservation(tmp_path):
++    """Active asyncio.Task survives TTL; once that task completes without releasing, abandoned pre-broadcast reservation is pruned."""
+     clear_buy_reservations()
+     db = AgentDatabase(db_path=str(tmp_path / "e4c_ttl.duckdb"), starting_sol=2.0)
+ 
+-    res1, rej1 = db.reserve_buy_slot(
+-        lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.001,
+-        max_lane_positions=1, max_open_positions=6,
+-    )
+-    assert res1 is not None and rej1 is None
++    reserved_ev = asyncio.Event()
++    finish_ev = asyncio.Event()
++
++    async def _worker() -> str:
++        res1, rej1 = db.reserve_buy_slot(
++            lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.001,
++            max_lane_positions=1, max_open_positions=6,
++        )
++        assert res1 is not None and rej1 is None
++        reserved_ev.set()
++        await finish_ev.wait()
++        return res1  # Intentionally exits without releasing to simulate abandoned pre-broadcast task
++
++    task = asyncio.create_task(_worker())
++    await reserved_ev.wait()
+ 
+-    # Simulate > RESERVATION_TTL_SEC elapsed while coroutine is still active
++    # Simulate > RESERVATION_TTL_SEC elapsed while owning task is still active
+     _inflight_buy_reservations[str(db.db_path)][0]["created_ts"] = time.monotonic() - (RESERVATION_TTL_SEC + 30.0)
++    inflight_now = get_inflight_buy_reservations(str(db.db_path))
++    assert inflight_now[0]["owner_active"] is True
++    assert inflight_now[0]["state"] == RESERVATION_STATE_ACTIVE
+ 
+-    # Concurrent attempt must NOT prune res1 and must be blocked by LANE_CAPACITY
++    # Concurrent attempt must NOT prune active task's reservation
+     res2, rej2 = db.reserve_buy_slot(
+         lane="chart", mint=MINT_B, required_sol=0.50, tx_fee_sol=0.001,
+         max_lane_positions=1, max_open_positions=6,
+     )
+     assert res2 is None and rej2 is not None and "LANE_CAPACITY" in rej2
+-    assert len(get_inflight_buy_reservations(str(db.db_path))) == 1
+-    db.release_buy_reservation(res1)
++
++    # Complete owning task without releasing -> abandoned ACTIVE reservation must be pruned on next reserve
++    finish_ev.set()
++    await task
++    res3, rej3 = db.reserve_buy_slot(
++        lane="chart", mint=MINT_B, required_sol=0.50, tx_fee_sol=0.001,
++        max_lane_positions=1, max_open_positions=6,
++    )
++    assert res3 is not None and rej3 is None
++    db.release_buy_reservation(res3)
++    assert get_inflight_buy_reservations(str(db.db_path)) == []
++    db.close()
++
++
++@pytest.mark.asyncio
++async def test_e4c_prebroadcast_cancellation_and_post_quote_exception_release_reservation(tmp_path):
++    """Pre-broadcast CancelledError and post-quote/pre-broadcast exceptions release reservation cleanly."""
++    clear_buy_reservations()
++    clear_sell_idempotency_guard()
++    kp = Keypair()
++    db = AgentDatabase(db_path=str(tmp_path / "e4c_cancel.duckdb"), starting_sol=2.0)
++    cfg = AgentConfig(
++        _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp), SOLANA_RPC_URL=RPC_URL,
++    )
++
++    # 1. Pre-broadcast CancelledError during quote fetch releases reservation
++    async def _cancel_transport(request: httpx.Request) -> httpx.Response:
++        if str(request.url).startswith(RPC_URL):
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
++        await asyncio.sleep(5.0)
++        return httpx.Response(200, json={"outAmount": "1000000"})
++
++    async with httpx.AsyncClient(transport=httpx.MockTransport(_cancel_transport)) as client:
++        t = asyncio.create_task(
++            executor_node(
++                {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order()},
++                config=cfg, db=db, http_client=client,
++            )
++        )
++        await asyncio.sleep(0.05)
++        t.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await t
+     assert get_inflight_buy_reservations(str(db.db_path)) == []
++
++    # 2. Exception after quote retrieval but before broadcast (missing tx in live mode) releases reservation
++    def _no_tx_handler(request: httpx.Request) -> httpx.Response:
++        if str(request.url).startswith(RPC_URL):
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
++        return httpx.Response(200, json={"outAmount": "1000000", "transaction": None, "requestId": "req-no-tx"})
++
++    async with httpx.AsyncClient(transport=httpx.MockTransport(_no_tx_handler)) as client:
++        with pytest.raises(RuntimeError, match="no transaction"):
++            await executor_node(
++                {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order()},
++                config=cfg, db=db, http_client=client,
++            )
++    assert get_inflight_buy_reservations(str(db.db_path)) == []
++    db.close()
++
++
++@pytest.mark.asyncio
++async def test_e4c_potentially_broadcast_live_timeout_remains_locked_past_task_end_and_ttl(tmp_path):
++    """Live timeout during /swap/v2/execute transitions reservation to BROADCAST_UNRESOLVED and stays locked."""
++    clear_buy_reservations()
++    clear_sell_idempotency_guard()
++    kp = Keypair()
++    unsigned_tx = _mk_unsigned_tx(kp)
++    db = AgentDatabase(db_path=str(tmp_path / "e4c_unres.duckdb"), starting_sol=2.0)
++    cfg = AgentConfig(
++        _env_file=None, EXECUTION_MODE="live", SOLANA_PRIVATE_KEY_BS58=str(kp),
++        SOLANA_RPC_URL=RPC_URL, MAX_CHART_POSITIONS=3,
++    )
++
++    def _timeout_exec_handler(request: httpx.Request) -> httpx.Response:
++        if str(request.url).startswith(RPC_URL):
++            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
++        if "/swap/v2/order" in str(request.url):
++            return httpx.Response(200, json={"outAmount": "1000000", "transaction": unsigned_tx, "requestId": "req-to"})
++        raise httpx.ReadTimeout("execute timed out after broadcast")
++
++    async with httpx.AsyncClient(transport=httpx.MockTransport(_timeout_exec_handler)) as client:
++        task = asyncio.create_task(
++            executor_node(
++                {"focus_state": FocusState.SCANNING.value, "sol_balance": 2.0, "daily_pnl_sol": 0.0, "pending_order": _mk_buy_order(mint=MINT_A)},
++                config=cfg, db=db, http_client=client,
++            )
++        )
++        with pytest.raises(httpx.ReadTimeout):
++            await task
++
++    # Even though task is done AND TTL has elapsed, BROADCAST_UNRESOLVED reservation must stay locked!
++    _inflight_buy_reservations[str(db.db_path)][0]["created_ts"] = time.monotonic() - (RESERVATION_TTL_SEC + 120.0)
++    inflight = get_inflight_buy_reservations(str(db.db_path))
++    assert len(inflight) == 1
++    assert inflight[0]["state"] == RESERVATION_STATE_BROADCAST_UNRESOLVED
++    assert inflight[0]["owner_active"] is False
++
++    # Duplicate BUY on MINT_A must be blocked!
++    res_dup, rej_dup = db.reserve_buy_slot(
++        lane="chart", mint=MINT_A, required_sol=0.50, tx_fee_sol=0.01,
++        max_lane_positions=3, max_open_positions=6,
++    )
++    assert res_dup is None and rej_dup is not None and "DUPLICATE_MINT" in rej_dup
+     db.close()
+ 
+ 

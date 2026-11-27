@@ -15,7 +15,12 @@ from solders.transaction import VersionedTransaction
 from config import LAMPORTS_PER_SOL, SOL_MINT, AgentConfig
 from db import AgentDatabase, utc_now, utc_now_iso
 from state import ActivePosition, AgentGraphState, FocusState, PendingOrder, is_valid_pool_address
-from state_ledger import acquire_exit_guard, clear_sell_guard, finalize_exit_guard
+from state_ledger import (
+    acquire_exit_guard,
+    clear_sell_guard,
+    finalize_exit_guard,
+    mark_buy_reservation_broadcast_unresolved,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -287,6 +292,8 @@ async def executor_node(
 
     input_mint = SOL_MINT if is_buy else order.mint
     output_mint = order.mint if is_buy else SOL_MINT
+    broadcast_attempted = False
+    settled_buy = False
 
     try:
         try:
@@ -313,6 +320,7 @@ async def executor_node(
             if not tx_b64:
                 raise RuntimeError("Jupiter /swap/v2/order returned no transaction in live mode")
             signed_b64 = sign_jupiter_transaction(tx_b64, config.SOLANA_PRIVATE_KEY_BS58)
+            broadcast_attempted = True
             exec_resp = await execute_jupiter_signed_order(
                 signed_tx_base64=signed_b64, request_id=request_id, config=config, client=client,
             )
@@ -321,9 +329,13 @@ async def executor_node(
                 out_amount = int(exec_resp["outputAmountResult"])
         else:
             tx_signature = f"paper-{order.side.lower()}-{order.mint[:8]}"
-    except BaseException:
+    except BaseException as exc:
         if reservation_id:
-            db.release_buy_reservation(reservation_id)
+            if broadcast_attempted:
+                # Never release a live reservation after broadcast may have occurred (E4C conservative lock; E4D adds durable reconciliation)
+                mark_buy_reservation_broadcast_unresolved(db, reservation_id, reason=f"{type(exc).__name__}: {exc}")
+            else:
+                db.release_buy_reservation(reservation_id)
         finalize_exit_guard(db, sell_key, committed=False)
         raise
     finally:
@@ -339,42 +351,51 @@ async def executor_node(
     rationale_out = order.rationale or state.get("last_decision_rationale")
 
     if is_buy:
-        spent_sol = order.amount_atomic / LAMPORTS_PER_SOL
-        sol_delta = -(spent_sol + tx_fee_opt) if tx_fee_opt is not None else -spent_sol
-        pnl_delta = -tx_fee_opt if tx_fee_opt is not None else 0.0
-        pos_strategy = order.strategy or "SCALPER"
-        prev_reentries = (
-            int(existing_pos_dict.get("reentry_count") or 0)
-            if isinstance(existing_pos_dict, dict) and existing_pos_dict.get("mint") == order.mint
-            else 0
-        )
-        next_reentry_count = (prev_reentries + 1) if order.reason == "LEG_2_REENTRY" else 0
-        pos = ActivePosition(
-            mint=order.mint, symbol=order.symbol, entry_sol=spent_sol, token_amount=out_amount,
-            pair_address=order.pair_address, dex_id=order.dex_id,
-            strategy=pos_strategy, triggering_wallets=list(order.triggering_wallets),
-            whale_shadow_exit_flag=False, opened_at=utc_now_iso(),
-            entry_liquidity_usd=order.entry_liquidity_usd, entry_mc_usd=order.entry_mc_usd,
-            whale_sol_flow=order.whale_sol_flow, breakout_telemetry=order.breakout_telemetry,
-            current_sol_value=spent_sol, peak_sol_value=spent_sol,
-            partial_tp_taken=False, initial_entry_sol=spent_sol,
-            remaining_cost_basis_sol=spent_sol, realized_partial_pnl_sol=0.0,
-            entry_fee_sol=tx_fee_opt,
-            accumulated_fees_sol=round(tx_fee_opt, 6) if tx_fee_opt is not None else 0.0,
-            fee_accounting_status=tx_fee_status,
-            breakeven_armed=False, trail_armed=False, retrace_low_sol=None, run_peak_sol=None,
-            watch_started_at=None, reference_token_amount=out_amount,
-            reentry_count=next_reentry_count, last_liquidity_usd=order.entry_liquidity_usd,
-        )
-        new_pos_dict = pos.model_dump()
-        db.remove_from_watchlist(order.mint)
-        settled = db.apply_trade_settlement(
-            lane=lane_tag, side="BUY", mint=order.mint, opened_at=pos.opened_at, new_pos_dict=new_pos_dict,
-            sol_delta=sol_delta, pnl_delta=pnl_delta, focus_state=next_state,
-            last_decision_rationale=rationale_out, reservation_id=reservation_id,
-            fallback_base_sol=fb_base_sol, fallback_base_pnl=fb_base_pnl,
-        )
-        sol_balance, daily_pnl_sol = settled["sol_balance"], settled["daily_pnl_sol"]
+        try:
+            spent_sol = order.amount_atomic / LAMPORTS_PER_SOL
+            sol_delta = -(spent_sol + tx_fee_opt) if tx_fee_opt is not None else -spent_sol
+            pnl_delta = -tx_fee_opt if tx_fee_opt is not None else 0.0
+            pos_strategy = order.strategy or "SCALPER"
+            prev_reentries = (
+                int(existing_pos_dict.get("reentry_count") or 0)
+                if isinstance(existing_pos_dict, dict) and existing_pos_dict.get("mint") == order.mint
+                else 0
+            )
+            next_reentry_count = (prev_reentries + 1) if order.reason == "LEG_2_REENTRY" else 0
+            pos = ActivePosition(
+                mint=order.mint, symbol=order.symbol, entry_sol=spent_sol, token_amount=out_amount,
+                pair_address=order.pair_address, dex_id=order.dex_id,
+                strategy=pos_strategy, triggering_wallets=list(order.triggering_wallets),
+                whale_shadow_exit_flag=False, opened_at=utc_now_iso(),
+                entry_liquidity_usd=order.entry_liquidity_usd, entry_mc_usd=order.entry_mc_usd,
+                whale_sol_flow=order.whale_sol_flow, breakout_telemetry=order.breakout_telemetry,
+                current_sol_value=spent_sol, peak_sol_value=spent_sol,
+                partial_tp_taken=False, initial_entry_sol=spent_sol,
+                remaining_cost_basis_sol=spent_sol, realized_partial_pnl_sol=0.0,
+                entry_fee_sol=tx_fee_opt,
+                accumulated_fees_sol=round(tx_fee_opt, 6) if tx_fee_opt is not None else 0.0,
+                fee_accounting_status=tx_fee_status,
+                breakeven_armed=False, trail_armed=False, retrace_low_sol=None, run_peak_sol=None,
+                watch_started_at=None, reference_token_amount=out_amount,
+                reentry_count=next_reentry_count, last_liquidity_usd=order.entry_liquidity_usd,
+            )
+            new_pos_dict = pos.model_dump()
+            db.remove_from_watchlist(order.mint)
+            settled = db.apply_trade_settlement(
+                lane=lane_tag, side="BUY", mint=order.mint, opened_at=pos.opened_at, new_pos_dict=new_pos_dict,
+                sol_delta=sol_delta, pnl_delta=pnl_delta, focus_state=next_state,
+                last_decision_rationale=rationale_out, reservation_id=reservation_id,
+                fallback_base_sol=fb_base_sol, fallback_base_pnl=fb_base_pnl,
+            )
+            settled_buy = True
+            sol_balance, daily_pnl_sol = settled["sol_balance"], settled["daily_pnl_sol"]
+        except BaseException as exc:
+            if reservation_id and not settled_buy:
+                if broadcast_attempted:
+                    mark_buy_reservation_broadcast_unresolved(db, reservation_id, reason=f"post-broadcast settlement error: {type(exc).__name__}: {exc}")
+                else:
+                    db.release_buy_reservation(reservation_id)
+            raise
 
         db.log_trade(
             mode=config.EXECUTION_MODE, side="BUY", mint=order.mint, symbol=order.symbol,
