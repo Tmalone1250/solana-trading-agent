@@ -164,7 +164,7 @@ index f2a27d7..0761eda 100644
      # Loop, Persistence & Telemetry
      MONITOR_POLL_SECONDS: float = Field(default=5.0, gt=0.0)
 diff --git a/executor_node.py b/executor_node.py
-index 0701b36..2edc5db 100644
+index 0701b36..59ffb19 100644
 --- a/executor_node.py
 +++ b/executor_node.py
 @@ -4,6 +4,8 @@ from __future__ import annotations
@@ -589,7 +589,24 @@ index 0701b36..2edc5db 100644
                  db.transition_order_intent(
                      intent_id, new_status="SUBMITTED", expected_statuses=("PREPARED",),
                  )
-@@ -398,6 +745,22 @@ async def executor_node(
+@@ -388,8 +735,14 @@ async def executor_node(
+                 signed_tx_base64=signed_b64, request_id=request_id, config=config, client=client,
+             )
+             tx_signature = str(exec_resp.get("signature") or exec_resp.get("txid") or pre_sig or "")
+-            if exec_resp.get("outputAmountResult") is not None and str(exec_resp.get("outputAmountResult")).strip() != "":
+-                out_amount = int(exec_resp["outputAmountResult"])
++            raw_out_res = exec_resp.get("outputAmountResult")
++            if raw_out_res is not None:
++                try:
++                    out_amount = _parse_strict_int(raw_out_res, "OUTPUT_AMOUNT_RESULT", min_value=1)
++                except E4AValidationError as exc:
++                    raise RuntimeError(f"Live execution outcome unresolved: {exc}") from exc
++            elif _e4a_is_active(order, config):
++                raise RuntimeError("Live E4A BUY outcome unresolved: missing outputAmountResult")
+             if intent_id and tx_signature:
+                 db.transition_order_intent(intent_id, new_status="SUBMITTED", tx_signature=tx_signature)
+             if is_buy and (not tx_signature or out_amount <= 0):
+@@ -398,6 +751,22 @@ async def executor_node(
                  )
          else:
              tx_signature = f"paper-{order.side.lower()}-{order.mint[:8]}"
@@ -614,10 +631,10 @@ index 0701b36..2edc5db 100644
              if broadcast_attempted:
 diff --git a/reports/phase_e4_entry_execution/e4a_implementation_report.md b/reports/phase_e4_entry_execution/e4a_implementation_report.md
 new file mode 100644
-index 0000000..d07ec23
+index 0000000..e7d2807
 --- /dev/null
 +++ b/reports/phase_e4_entry_execution/e4a_implementation_report.md
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,67 @@
 +# Phase E4A Implementation Report — BREAKOUT_IGNITION Pre-Broadcast Approval & Quote Integrity
 +
 +- **Branch:** `impl/e4a-approval-quote-integrity`
@@ -680,16 +697,21 @@ index 0000000..d07ec23
 +- **Strict atomic/integer parsing:** Added `_parse_strict_int` in `executor_node.py` (rejecting `None`, `bool`, `float`, fractional/scientific strings, empty/whitespace strings, and out-of-range values) and applied it to `outAmount` (outside the paper-SELL fallback `try/except`, rejecting malformed `outAmount` in both paper and live modes), `otherAmountThreshold`, `lastValidBlockHeight`, and `slippageBps`.
 +- **Explicit router allowlist & expiry handling:** In `_validate_e4a_quote_timing_and_expiry`, `metis`/`dflow`/`okx` route to RPC `getBlockHeight` + `lastValidBlockHeight` headroom, `jupiterz` routes to `expireAt` RFQ headroom, and missing, empty, malformed, or unsupported router identifiers fail closed in live mode (`UNSUPPORTED_OR_MISSING_ROUTER_<STAGE>`) without falling into the block-height branch.
 +- **Regression coverage:** Added `test_e4a_corrective_strict_parsing_missing_oat_and_router_allowlist` in `tests/test_e4a_approval_quote_integrity.py`. Only `executor_node.py`, `tests/test_e4a_approval_quote_integrity.py`, and E4A report artifacts were modified in this corrective pass.
++
++## E4A Post-Broadcast Output Validation Correction (from `531272a637905f105d85a2f11ea1e973874b22af`)
++- **Strict `outputAmountResult` validation:** Replaced permissive `int(exec_resp["outputAmountResult"])` in `executor_node.py` with `_parse_strict_int(..., "OUTPUT_AMOUNT_RESULT", min_value=1)`, rejecting booleans, floats, fractional/scientific strings, empty/malformed strings, zero, and negatives while preserving valid positive integers and canonical integer strings.
++- **Unresolved post-broadcast lifecycle preserved:** Any missing (for active E4A), malformed, or non-positive `outputAmountResult` raises `RuntimeError` (never `E4AValidationError`) after `broadcast_attempted = True`, keeping the E4D intent `UNRESOLVED` (never `FAILED`), transitioning the reservation to `BROADCAST_UNRESOLVED`, skipping position/trade settlement, and leaving resolution to startup reconciliation.
++- **Regression coverage:** Added `test_e4a_post_broadcast_output_amount_result_strict_and_unresolved_lifecycle` in `tests/test_e4a_approval_quote_integrity.py`.
 diff --git a/reports/phase_e4_entry_execution/e4a_test_results.md b/reports/phase_e4_entry_execution/e4a_test_results.md
 new file mode 100644
-index 0000000..f8249dd
+index 0000000..6e5b1b1
 --- /dev/null
 +++ b/reports/phase_e4_entry_execution/e4a_test_results.md
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,38 @@
 +# Phase E4A Test Results
 +
 +- **Branch:** `impl/e4a-approval-quote-integrity`
-+- **Baseline:** `f7c04c27279524fe12f442236df3be205a65718b` (corrective pass parent `0688fb704aedfb75f3bac329f52064d7af9a9aae`)
++- **Baseline:** `f7c04c27279524fe12f442236df3be205a65718b` (post-broadcast corrective pass parent `531272a637905f105d85a2f11ea1e973874b22af`)
 +
 +## 1. Focused Suites (`E4A`, `E4C`, `E4D`, `E2B`, `E3A`)
 +
@@ -698,15 +720,16 @@ index 0000000..f8249dd
 +venv/bin/pytest -q tests/test_e4a_approval_quote_integrity.py tests/test_e4c_reservation_risk.py tests/test_e4d_transaction_reconciliation.py tests/test_e2b_fee_accounting.py tests/test_e3a_candle_eligibility.py
 +```
 +
-+Result: **`44 passed in 3.48s`**
++Result: **`45 passed in 3.95s`**
 +
-+### `tests/test_e4a_approval_quote_integrity.py` (6 tests)
++### `tests/test_e4a_approval_quote_integrity.py` (7 tests)
 +1. `test_e4a_alpha_node_selects_exact_pinned_pool_price_and_decimals` — PASSED
 +2. `test_e4a_approval_provenance_rejects_wrong_pool_invalid_price_decimals_and_stale` — PASSED
 +3. `test_e4a_live_fails_closed_when_thresholds_unset_and_paper_rejects_zero_out_amount` — PASSED
 +4. `test_e4a_quote_receipt_rejects_slippage_impact_drift_worst_case_and_expiry_headroom` — PASSED
 +5. `test_e4a_quote_age_enforced_at_all_three_checkpoints` — PASSED
 +6. `test_e4a_corrective_strict_parsing_missing_oat_and_router_allowlist` — PASSED
++7. `test_e4a_post_broadcast_output_amount_result_strict_and_unresolved_lifecycle` — PASSED
 +
 +## 2. Full Test Suite
 +
@@ -715,7 +738,7 @@ index 0000000..f8249dd
 +venv/bin/pytest -q tests/
 +```
 +
-+Result: **`193 passed, 3 failed in 31.44s`**
++Result: **`194 passed, 3 failed in 32.25s`**
 +
 +### Pre-Existing E1 Baseline Failures (Unchanged, 3 total)
 +1. `tests/test_insider_scanner.py::test_unconditional_hard_stop_loss_on_leg2_reentry_chart_and_whale_positions_at_minus_11_75_pct`
@@ -808,10 +831,10 @@ index 7eccd54..b3e027c 100644
          "mint": "MintFB1111111111111111111111111111111111111",
 diff --git a/tests/test_e4a_approval_quote_integrity.py b/tests/test_e4a_approval_quote_integrity.py
 new file mode 100644
-index 0000000..c5c3224
+index 0000000..df264c6
 --- /dev/null
 +++ b/tests/test_e4a_approval_quote_integrity.py
-@@ -0,0 +1,468 @@
+@@ -0,0 +1,581 @@
 +"""Phase E4A Tests: BREAKOUT_IGNITION Pre-Broadcast Approval & Quote Integrity."""
 +
 +from __future__ import annotations
@@ -1280,6 +1303,119 @@ index 0000000..c5c3224
 +            )
 +            assert len(out_ok["chart_positions"]) >= 1
 +    db.close()
++
++
++@pytest.mark.asyncio
++async def test_e4a_post_broadcast_output_amount_result_strict_and_unresolved_lifecycle(tmp_path):
++    """Missing, boolean, float, fractional, malformed, zero, or negative outputAmountResult leaves intent UNRESOLVED and reservation BROADCAST_UNRESOLVED."""
++    clear_buy_reservations()
++    clear_sell_idempotency_guard()
++    kp = Keypair()
++    unsigned_tx = _mk_unsigned_tx(kp)
++    cfg = _mk_live_e4a_cfg(kp)
++
++    bad_exec_outputs: list[dict[str, Any]] = [
++        {"signature": "SigUnres1"},  # missing outputAmountResult
++        {"signature": "SigUnres2", "outputAmountResult": None},
++        {"signature": "SigUnres3", "outputAmountResult": True},
++        {"signature": "SigUnres4", "outputAmountResult": False},
++        {"signature": "SigUnres5", "outputAmountResult": 1000000000.0},
++        {"signature": "SigUnres6", "outputAmountResult": "1000000000.5"},
++        {"signature": "SigUnres7", "outputAmountResult": "1e9"},
++        {"signature": "SigUnres8", "outputAmountResult": ""},
++        {"signature": "SigUnres9", "outputAmountResult": "abc"},
++        {"signature": "SigUnres10", "outputAmountResult": 0},
++        {"signature": "SigUnres11", "outputAmountResult": "0"},
++        {"signature": "SigUnres12", "outputAmountResult": -1},
++        {"signature": "SigUnres13", "outputAmountResult": "-100"},
++    ]
++
++    for idx, exec_payload in enumerate(bad_exec_outputs):
++        clear_buy_reservations()
++        db = AgentDatabase(db_path=str(tmp_path / f"e4a_unres_{idx}.duckdb"), starting_sol=5.0)
++        mint_i = str(Keypair().pubkey())
++        order_i = _mk_e4a_order()
++        order_i["mint"] = mint_i
++
++        def handler_bad(request: httpx.Request, payload: dict[str, Any] = exec_payload) -> httpx.Response:
++            if str(request.url).startswith(RPC_URL):
++                body = __import__("json").loads(request.content.decode("utf-8"))
++                if body["method"] == "getBalance":
++                    return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
++                if body["method"] == "getBlockHeight":
++                    return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": 990})
++            if "/swap/v2/order" in str(request.url):
++                return httpx.Response(200, json={
++                    "outAmount": "1000000000",
++                    "otherAmountThreshold": "980000000",
++                    "slippageBps": 200,
++                    "priceImpact": -0.5,
++                    "router": "metis",
++                    "lastValidBlockHeight": 1000,
++                    "transaction": unsigned_tx,
++                    "requestId": f"req-unres-{idx}",
++                })
++            if "/swap/v2/execute" in str(request.url):
++                return httpx.Response(200, json=payload)
++            return httpx.Response(404)
++
++        async with httpx.AsyncClient(transport=httpx.MockTransport(handler_bad)) as client:
++            with pytest.raises(RuntimeError, match="unresolved"):
++                await executor_node(
++                    {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": order_i},
++                    config=cfg, db=db, http_client=client,
++                )
++
++        # Intent must remain UNRESOLVED (never FAILED) and reservation BROADCAST_UNRESOLVED
++        intents = db.get_active_locking_intents(mint=mint_i)
++        assert len(intents) == 1
++        assert intents[0]["status"] == "UNRESOLVED"
++        res_list = get_inflight_buy_reservations(str(db.db_path))
++        assert len(res_list) == 1
++        assert res_list[0]["state"] == "BROADCAST_UNRESOLVED"
++        assert db.get_all_open_mints() == set()
++        assert db.get_recent_trades(limit=5) == []
++        db.close()
++
++    # Valid positive integer and integer string outputAmountResult settle cleanly
++    for idx, good_val in enumerate(("1000000000", 1000000000)):
++        clear_buy_reservations()
++        db = AgentDatabase(db_path=str(tmp_path / f"e4a_ok_{idx}.duckdb"), starting_sol=5.0)
++        mint_i = str(Keypair().pubkey())
++        order_i = _mk_e4a_order()
++        order_i["mint"] = mint_i
++
++        def handler_ok(request: httpx.Request, gv: Any = good_val) -> httpx.Response:
++            if str(request.url).startswith(RPC_URL):
++                body = __import__("json").loads(request.content.decode("utf-8"))
++                if body["method"] == "getBalance":
++                    return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
++                if body["method"] == "getBlockHeight":
++                    return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": 990})
++            if "/swap/v2/order" in str(request.url):
++                return httpx.Response(200, json={
++                    "outAmount": "1000000000",
++                    "otherAmountThreshold": "980000000",
++                    "slippageBps": 200,
++                    "priceImpact": -0.5,
++                    "router": "metis",
++                    "lastValidBlockHeight": 1000,
++                    "transaction": unsigned_tx,
++                    "requestId": f"req-ok-{idx}",
++                })
++            if "/swap/v2/execute" in str(request.url):
++                return httpx.Response(200, json={"signature": f"SigGood{idx}", "outputAmountResult": gv})
++            return httpx.Response(404)
++
++        async with httpx.AsyncClient(transport=httpx.MockTransport(handler_ok)) as client:
++            out_ok = await executor_node(
++                {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": order_i},
++                config=cfg, db=db, http_client=client,
++            )
++        assert len(out_ok["chart_positions"]) == 1
++        assert out_ok["chart_positions"][0]["token_amount"] == 1000000000
++        assert get_inflight_buy_reservations(str(db.db_path)) == []
++        db.close()
 diff --git a/tests/test_e4c_reservation_risk.py b/tests/test_e4c_reservation_risk.py
 index bcef3bb..5562e4c 100644
 --- a/tests/test_e4c_reservation_risk.py

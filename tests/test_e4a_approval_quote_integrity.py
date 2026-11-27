@@ -466,3 +466,116 @@ async def test_e4a_corrective_strict_parsing_missing_oat_and_router_allowlist(tm
             )
             assert len(out_ok["chart_positions"]) >= 1
     db.close()
+
+
+@pytest.mark.asyncio
+async def test_e4a_post_broadcast_output_amount_result_strict_and_unresolved_lifecycle(tmp_path):
+    """Missing, boolean, float, fractional, malformed, zero, or negative outputAmountResult leaves intent UNRESOLVED and reservation BROADCAST_UNRESOLVED."""
+    clear_buy_reservations()
+    clear_sell_idempotency_guard()
+    kp = Keypair()
+    unsigned_tx = _mk_unsigned_tx(kp)
+    cfg = _mk_live_e4a_cfg(kp)
+
+    bad_exec_outputs: list[dict[str, Any]] = [
+        {"signature": "SigUnres1"},  # missing outputAmountResult
+        {"signature": "SigUnres2", "outputAmountResult": None},
+        {"signature": "SigUnres3", "outputAmountResult": True},
+        {"signature": "SigUnres4", "outputAmountResult": False},
+        {"signature": "SigUnres5", "outputAmountResult": 1000000000.0},
+        {"signature": "SigUnres6", "outputAmountResult": "1000000000.5"},
+        {"signature": "SigUnres7", "outputAmountResult": "1e9"},
+        {"signature": "SigUnres8", "outputAmountResult": ""},
+        {"signature": "SigUnres9", "outputAmountResult": "abc"},
+        {"signature": "SigUnres10", "outputAmountResult": 0},
+        {"signature": "SigUnres11", "outputAmountResult": "0"},
+        {"signature": "SigUnres12", "outputAmountResult": -1},
+        {"signature": "SigUnres13", "outputAmountResult": "-100"},
+    ]
+
+    for idx, exec_payload in enumerate(bad_exec_outputs):
+        clear_buy_reservations()
+        db = AgentDatabase(db_path=str(tmp_path / f"e4a_unres_{idx}.duckdb"), starting_sol=5.0)
+        mint_i = str(Keypair().pubkey())
+        order_i = _mk_e4a_order()
+        order_i["mint"] = mint_i
+
+        def handler_bad(request: httpx.Request, payload: dict[str, Any] = exec_payload) -> httpx.Response:
+            if str(request.url).startswith(RPC_URL):
+                body = __import__("json").loads(request.content.decode("utf-8"))
+                if body["method"] == "getBalance":
+                    return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
+                if body["method"] == "getBlockHeight":
+                    return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": 990})
+            if "/swap/v2/order" in str(request.url):
+                return httpx.Response(200, json={
+                    "outAmount": "1000000000",
+                    "otherAmountThreshold": "980000000",
+                    "slippageBps": 200,
+                    "priceImpact": -0.5,
+                    "router": "metis",
+                    "lastValidBlockHeight": 1000,
+                    "transaction": unsigned_tx,
+                    "requestId": f"req-unres-{idx}",
+                })
+            if "/swap/v2/execute" in str(request.url):
+                return httpx.Response(200, json=payload)
+            return httpx.Response(404)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler_bad)) as client:
+            with pytest.raises(RuntimeError, match="unresolved"):
+                await executor_node(
+                    {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": order_i},
+                    config=cfg, db=db, http_client=client,
+                )
+
+        # Intent must remain UNRESOLVED (never FAILED) and reservation BROADCAST_UNRESOLVED
+        intents = db.get_active_locking_intents(mint=mint_i)
+        assert len(intents) == 1
+        assert intents[0]["status"] == "UNRESOLVED"
+        res_list = get_inflight_buy_reservations(str(db.db_path))
+        assert len(res_list) == 1
+        assert res_list[0]["state"] == "BROADCAST_UNRESOLVED"
+        assert db.get_all_open_mints() == set()
+        assert db.get_recent_trades(limit=5) == []
+        db.close()
+
+    # Valid positive integer and integer string outputAmountResult settle cleanly
+    for idx, good_val in enumerate(("1000000000", 1000000000)):
+        clear_buy_reservations()
+        db = AgentDatabase(db_path=str(tmp_path / f"e4a_ok_{idx}.duckdb"), starting_sol=5.0)
+        mint_i = str(Keypair().pubkey())
+        order_i = _mk_e4a_order()
+        order_i["mint"] = mint_i
+
+        def handler_ok(request: httpx.Request, gv: Any = good_val) -> httpx.Response:
+            if str(request.url).startswith(RPC_URL):
+                body = __import__("json").loads(request.content.decode("utf-8"))
+                if body["method"] == "getBalance":
+                    return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
+                if body["method"] == "getBlockHeight":
+                    return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": 990})
+            if "/swap/v2/order" in str(request.url):
+                return httpx.Response(200, json={
+                    "outAmount": "1000000000",
+                    "otherAmountThreshold": "980000000",
+                    "slippageBps": 200,
+                    "priceImpact": -0.5,
+                    "router": "metis",
+                    "lastValidBlockHeight": 1000,
+                    "transaction": unsigned_tx,
+                    "requestId": f"req-ok-{idx}",
+                })
+            if "/swap/v2/execute" in str(request.url):
+                return httpx.Response(200, json={"signature": f"SigGood{idx}", "outputAmountResult": gv})
+            return httpx.Response(404)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler_ok)) as client:
+            out_ok = await executor_node(
+                {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": order_i},
+                config=cfg, db=db, http_client=client,
+            )
+        assert len(out_ok["chart_positions"]) == 1
+        assert out_ok["chart_positions"][0]["token_amount"] == 1000000000
+        assert get_inflight_buy_reservations(str(db.db_path)) == []
+        db.close()

@@ -735,8 +735,14 @@ async def executor_node(
                 signed_tx_base64=signed_b64, request_id=request_id, config=config, client=client,
             )
             tx_signature = str(exec_resp.get("signature") or exec_resp.get("txid") or pre_sig or "")
-            if exec_resp.get("outputAmountResult") is not None and str(exec_resp.get("outputAmountResult")).strip() != "":
-                out_amount = int(exec_resp["outputAmountResult"])
+            raw_out_res = exec_resp.get("outputAmountResult")
+            if raw_out_res is not None:
+                try:
+                    out_amount = _parse_strict_int(raw_out_res, "OUTPUT_AMOUNT_RESULT", min_value=1)
+                except E4AValidationError as exc:
+                    raise RuntimeError(f"Live execution outcome unresolved: {exc}") from exc
+            elif _e4a_is_active(order, config):
+                raise RuntimeError("Live E4A BUY outcome unresolved: missing outputAmountResult")
             if intent_id and tx_signature:
                 db.transition_order_intent(intent_id, new_status="SUBMITTED", tx_signature=tx_signature)
             if is_buy and (not tx_signature or out_amount <= 0):
