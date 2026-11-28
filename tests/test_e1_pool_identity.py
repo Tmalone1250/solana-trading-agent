@@ -205,7 +205,7 @@ async def test_e1_pool_identity_full_lifecycle_watchlist_partial_and_final_settl
     def jup_handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": MINT_LIFE, "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": MINT_LIFE, "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
         if "/ultra/v1/shield" in url:

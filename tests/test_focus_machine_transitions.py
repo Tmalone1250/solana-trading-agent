@@ -45,11 +45,11 @@ def _make_monitor_client(
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": "MintGrad11111111111111111111111111111111111", "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": "MintGrad11111111111111111111111111111111111", "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "/ultra/v1/shield" in url:
             return httpx.Response(200, json={"warnings": {request.url.params.get("mints", ""): []}})
         if "/swap/v2/order" in url:
@@ -370,7 +370,7 @@ async def test_langgraph_end_to_end_and_telemetry_api(tmp_path):
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": "MintGrad11111111111111111111111111111111111", "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": "MintGrad11111111111111111111111111111111111", "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "/ultra/v1/shield" in url:
             return httpx.Response(200, json={"warnings": {"MintGrad11111111111111111111111111111111111": []}})
         if "/swap/v2/order" in url:
@@ -484,11 +484,11 @@ async def test_reentry_anti_chase_aborts_if_price_rips_during_decision_1(tmp_pat
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": "MintGrad11111111111111111111111111111111111", "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": "MintGrad11111111111111111111111111111111111", "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "/ultra/v1/shield" in url:
             return httpx.Response(200, json={"warnings": {request.url.params.get("mints", ""): []}})
         if "/swap/v2/order" in url:
@@ -617,11 +617,11 @@ async def test_two_step_partial_tp_scale_out_and_runner_trail_and_breakeven(tmp_
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": "MintGrad11111111111111111111111111111111111", "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": "MintGrad11111111111111111111111111111111111", "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "/ultra/v1/shield" in url:
             return httpx.Response(200, json={"warnings": {request.url.params.get("mints", ""): []}})
         if "/swap/v2/order" in url:

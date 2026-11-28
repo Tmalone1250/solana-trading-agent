@@ -95,7 +95,7 @@ async def test_whale_scalp_fast_track_confluence_and_solo_buy_within_mcap_band(t
         if "/tokens/v2/search" in url:
             return httpx.Response(
                 200,
-                json=[{"id": mint_conf, "symbol": "MICRO", "organicScore": 75.0, "audit": {"isSus": False}}],
+                json=[{"id": mint_conf, "symbol": "MICRO", "organicScore": 75.0, "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}],
             )
         if "geckoterminal.com" in url:
             return httpx.Response(200, json={"data": []})
@@ -233,7 +233,7 @@ async def test_whale_scalp_mcap_band_gating_stale_60s_and_is_sus(tmp_path):
                 200,
                 json=[
                     {"id": "MintSus", "symbol": "SUS", "organicScore": 50.0, "audit": {"isSus": True}},
-                    {"id": "MintJustRight", "symbol": "RIGHT", "organicScore": 85.0, "audit": {"isSus": False}},
+                    {"id": "MintJustRight", "symbol": "RIGHT", "organicScore": 85.0, "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}},
                 ],
             )
         if "geckoterminal.com" in url:

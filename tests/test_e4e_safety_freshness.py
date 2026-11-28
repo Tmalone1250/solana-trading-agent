@@ -239,7 +239,7 @@ async def test_e4e_pre_execution_safety_unset_fresh_stale_and_lock_freedom(tmp_p
             if acquired:
                 lock_free_during_network["ok"] = True
                 db._lock.release()
-            return httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "rugcheck.xyz" in url:
             safety_calls["rug"] += 1
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
@@ -279,7 +279,7 @@ async def test_e4e_pre_execution_safety_unset_fresh_stale_and_lock_freedom(tmp_p
         if "rugcheck.xyz" in str(request.url) or "/ultra/v1/shield" in str(request.url):
             raise AssertionError("RugCheck/Shield should not be called when watchlist safety_checked_at is fresh!")
         if "/tokens/v2/search" in str(request.url):
-            return httpx.Response(200, json=[{"id": mint2, "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": mint2, "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if str(request.url).startswith(RPC_URL):
             body = json.loads(request.content.decode("utf-8"))
             if body["method"] == "getBalance":
@@ -351,7 +351,7 @@ async def test_e4e_pre_execution_rejects_shield_issus_api_error_and_pool_mismatc
         if str(request.url).startswith(RPC_URL):
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
         if "/ultra/v1/shield" in url:
@@ -468,24 +468,28 @@ async def test_e4e_corrective_incomplete_evidence_fails_closed_without_eviction(
     cfg = _mk_live_e4e_cfg(kp, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
 
     incomplete_scenarios = [
-        # Missing isSus in audit
-        ([{"id": MINT_E4E, "audit": {}}], {"rugged": False}, {"warnings": {MINT_E4E: []}}),
-        # Null isSus
+        # Explicit isSus=False (ambiguous under Jupiter presence-only contract)
+        ([{"id": MINT_E4E, "audit": {"isSus": False}}], {"rugged": False}, {"warnings": {MINT_E4E: []}}),
+        # Missing audit key / null audit / non-dict audit
+        ([{"id": MINT_E4E}], {"rugged": False}, {"warnings": {MINT_E4E: []}}),
+        ([{"id": MINT_E4E, "audit": None}], {"rugged": False}, {"warnings": {MINT_E4E: []}}),
+        ([{"id": MINT_E4E, "audit": []}], {"rugged": False}, {"warnings": {MINT_E4E: []}}),
+        # Null / non-bool isSus
         ([{"id": MINT_E4E, "audit": {"isSus": None}}], {"rugged": False}, {"warnings": {MINT_E4E: []}}),
-        # String isSus
         ([{"id": MINT_E4E, "audit": {"isSus": "false"}}], {"rugged": False}, {"warnings": {MINT_E4E: []}}),
+        ([{"id": MINT_E4E, "audit": {"isSus": 1}}], {"rugged": False}, {"warnings": {MINT_E4E: []}}),
         # Wrong-mint Token v2 result
-        ([{"id": "WrongMint1111111111111111111111111111111111", "audit": {"isSus": False}}], {"rugged": False}, {"warnings": {MINT_E4E: []}}),
+        ([{"id": "WrongMint1111111111111111111111111111111111", "audit": {}}], {"rugged": False}, {"warnings": {MINT_E4E: []}}),
         # Empty RugCheck JSON
-        ([{"id": MINT_E4E, "audit": {"isSus": False}}], {}, {"warnings": {MINT_E4E: []}}),
+        ([{"id": MINT_E4E, "audit": {}}], {}, {"warnings": {MINT_E4E: []}}),
         # Malformed RugCheck JSON
-        ([{"id": MINT_E4E, "audit": {"isSus": False}}], {"unexpected": True}, {"warnings": {MINT_E4E: []}}),
+        ([{"id": MINT_E4E, "audit": {}}], {"unexpected": True}, {"warnings": {MINT_E4E: []}}),
         # Empty Shield JSON
-        ([{"id": MINT_E4E, "audit": {"isSus": False}}], {"rugged": False}, {}),
+        ([{"id": MINT_E4E, "audit": {}}], {"rugged": False}, {}),
         # Missing-mint Shield JSON
-        ([{"id": MINT_E4E, "audit": {"isSus": False}}], {"rugged": False}, {"warnings": {}}),
+        ([{"id": MINT_E4E, "audit": {}}], {"rugged": False}, {"warnings": {}}),
         # Malformed Shield warnings
-        ([{"id": MINT_E4E, "audit": {"isSus": False}}], {"rugged": False}, {"warnings": {MINT_E4E: "bad"}}),
+        ([{"id": MINT_E4E, "audit": {}}], {"rugged": False}, {"warnings": {MINT_E4E: "bad"}}),
     ]
 
     for idx, (v2_body, rug_body, shield_body) in enumerate(incomplete_scenarios):
@@ -726,10 +730,12 @@ async def test_e4e_fresh_watchlist_still_requires_explicit_token_v2_is_sus(tmp_p
     cfg = _mk_live_e4e_cfg(kp, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
     fresh_ts = datetime.now(timezone.utc).isoformat()
 
-    # 1. Fresh watchlist + missing/malformed Token v2 -> fails closed WITHOUT evicting
+    # 1. Fresh watchlist + missing/ambiguous/malformed Token v2 -> fails closed WITHOUT evicting
     for bad_v2 in (
         [],
-        [{"id": MINT_E4E, "audit": {}}],
+        [{"id": MINT_E4E}],
+        [{"id": MINT_E4E, "audit": None}],
+        [{"id": MINT_E4E, "audit": {"isSus": False}}],
         [{"id": MINT_E4E, "audit": {"isSus": "false"}}],
     ):
         clear_buy_reservations()
@@ -795,7 +801,7 @@ async def test_e4e_fresh_watchlist_still_requires_explicit_token_v2_is_sus(tmp_p
             if body["method"] == "getBlockHeight":
                 return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": 990})
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "/swap/v2/order" in url:
             return httpx.Response(200, json={
                 "outAmount": "1000000000", "otherAmountThreshold": "980000000",
@@ -850,7 +856,7 @@ async def test_e4e_nested_empty_jupiter_shield_rejected_without_eviction(tmp_pat
             if url.startswith(RPC_URL):
                 return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
             if "/tokens/v2/search" in url:
-                return httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"isSus": False}}])
+                return httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
             if "rugcheck.xyz" in url:
                 return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
             if "/ultra/v1/shield" in url:
@@ -962,3 +968,160 @@ async def test_e4e_safety_gate_unavailable_does_not_evict_while_confirmed_and_mi
     assert db4.is_on_cooldown(MINT_E4E, now=t1) is True
     assert len(db4.get_action_log(limit=5, actions=["EVICT"])) == 1
     db4.close()
+
+
+@pytest.mark.asyncio
+async def test_e4f_unflagged_audit_without_issus_paper_and_live_parity(tmp_path, caplog):
+    """E4F: Documented unflagged audit dicts (without isSus) proceed in paper & live while preserving all independent checks."""
+    import logging
+
+    clear_buy_reservations()
+    clear_sell_idempotency_guard()
+    kp = Keypair()
+    unsigned_tx = _mk_unsigned_tx(kp)
+    fresh_ts = datetime.now(timezone.utc).isoformat()
+
+    unflagged_audits = (
+        {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46},
+        {},
+    )
+    for idx, audit_doc in enumerate(unflagged_audits):
+        # 1. Paper mode + fresh watchlist -> logs JUPITER_SUSPICIOUS_FLAG_NOT_PRESENT, skips RugCheck/Shield, settles BUY
+        clear_buy_reservations()
+        cfg_paper = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
+        db_p = AgentDatabase(db_path=str(tmp_path / f"e4f_paper_{idx}.duckdb"), starting_sol=5.0)
+        db_p.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, safety_passed=True)
+        db_p.mark_watchlist_safety_passed(MINT_E4E, True, checked_at=fresh_ts)
+
+        def h_paper(req: httpx.Request, ad=audit_doc) -> httpx.Response:
+            u = str(req.url)
+            if "rugcheck.xyz" in u or "/ultra/v1/shield" in u:
+                raise AssertionError("RugCheck/Shield should be skipped when fresh!")
+            if "/tokens/v2/search" in u:
+                return httpx.Response(200, json=[{"id": MINT_E4E, "audit": ad}])
+            if "/swap/v2/order" in u:
+                return httpx.Response(200, json={"outAmount": "1000000000", "slippageBps": 200, "priceImpact": -0.5, "router": "metis", "routePlan": [{"swapInfo": {"ammKey": POOL_PINNED, "inputMint": SOL_MINT, "outputMint": MINT_E4E}, "percent": 100}]})
+            return httpx.Response(404)
+
+        with caplog.at_level(logging.DEBUG, logger="executor_node"):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(h_paper)) as client:
+                out_p = await executor_node(
+                    {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4e_order()},
+                    config=cfg_paper, db=db_p, http_client=client,
+                )
+        assert len(out_p["chart_positions"]) == 1
+        assert "JUPITER_SUSPICIOUS_FLAG_NOT_PRESENT" in caplog.text
+        assert get_inflight_buy_reservations(str(db_p.db_path)) == []
+        db_p.close()
+
+        # 2. Mocked live mode + stale watchlist + confirmed-unsafe Shield -> MUST still run Shield, evict, cooldown, zero quote/sign
+        clear_buy_reservations()
+        cfg_live = _mk_live_e4e_cfg(kp, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
+        db_l = AgentDatabase(db_path=str(tmp_path / f"e4f_live_unsafe_{idx}.duckdb"), starting_sol=5.0)
+        db_l.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, safety_passed=False)
+
+        def h_live_unsafe(req: httpx.Request, ad=audit_doc) -> httpx.Response:
+            u = str(req.url)
+            if u.startswith(RPC_URL):
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
+            if "/tokens/v2/search" in u:
+                return httpx.Response(200, json=[{"id": MINT_E4E, "audit": ad}])
+            if "rugcheck.xyz" in u:
+                return httpx.Response(200, json={"rugged": False})
+            if "/ultra/v1/shield" in u:
+                return httpx.Response(200, json={"warnings": {MINT_E4E: [{"type": "HONEYPOT", "severity": "critical", "message": "Honeypot"}]}})
+            raise AssertionError(f"Unexpected quote/execute after Shield rejection: {u}")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(h_live_unsafe)) as client:
+            out_l = await executor_node(
+                {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4e_order()},
+                config=cfg_live, db=db_l, http_client=client,
+            )
+        assert out_l == {"pending_order": None}
+        assert db_l.get_watchlist_entry(MINT_E4E) is None
+        assert db_l.is_on_cooldown(MINT_E4E) is True
+        assert get_inflight_buy_reservations(str(db_l.db_path)) == []
+        db_l.close()
+
+        # 3. Mocked live mode + stale watchlist + unavailable Shield (429) -> rejects WITHOUT eviction/cooldown/timestamp refresh
+        clear_buy_reservations()
+        db_u = AgentDatabase(db_path=str(tmp_path / f"e4f_live_unavail_{idx}.duckdb"), starting_sol=5.0)
+        db_u.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, safety_passed=False)
+
+        def h_live_unavail(req: httpx.Request, ad=audit_doc) -> httpx.Response:
+            u = str(req.url)
+            if u.startswith(RPC_URL):
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
+            if "/tokens/v2/search" in u:
+                return httpx.Response(200, json=[{"id": MINT_E4E, "audit": ad}])
+            if "rugcheck.xyz" in u:
+                return httpx.Response(200, json={"rugged": False})
+            if "/ultra/v1/shield" in u:
+                return httpx.Response(429)
+            raise AssertionError(f"Unexpected quote/execute after Shield 429: {u}")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(h_live_unavail)) as client:
+            out_u = await executor_node(
+                {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4e_order()},
+                config=cfg_live, db=db_u, http_client=client,
+            )
+        assert out_u == {"pending_order": None}
+        row_u = db_u.get_watchlist_entry(MINT_E4E)
+        assert row_u is not None and row_u["safety_checked_at"] is None
+        assert db_u.is_on_cooldown(MINT_E4E) is False
+        assert get_inflight_buy_reservations(str(db_u.db_path)) == []
+        db_u.close()
+
+
+@pytest.mark.asyncio
+async def test_e4f_ambiguous_and_error_token_v2_responses_fail_closed_paper_and_live(tmp_path):
+    """E4F: Explicit isSus=False, invalid isSus types, missing/null audit, bad envelopes, and HTTP/decode errors fail closed without eviction."""
+    clear_buy_reservations()
+    clear_sell_idempotency_guard()
+    kp = Keypair()
+    cfg_paper = AgentConfig(_env_file=None, EXECUTION_MODE="paper", PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
+    cfg_live = _mk_live_e4e_cfg(kp, PRE_EXECUTION_SAFETY_TTL_SECONDS=60.0)
+    fresh_ts = datetime.now(timezone.utc).isoformat()
+
+    bad_responses = [
+        httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"isSus": False}}]),
+        httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"isSus": None}}]),
+        httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"isSus": "false"}}]),
+        httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"isSus": 1}}]),
+        httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"isSus": []}}]),
+        httpx.Response(200, json=[{"id": MINT_E4E, "audit": {"isSus": {}}}]),
+        httpx.Response(200, json=[{"id": MINT_E4E}]),
+        httpx.Response(200, json=[{"id": MINT_E4E, "audit": None}]),
+        httpx.Response(200, json=[{"id": MINT_E4E, "audit": "bad"}]),
+        httpx.Response(200, json="unexpected-envelope"),
+        httpx.Response(429, json={"error": "rate limited"}),
+        httpx.Response(503, json={"error": "unavailable"}),
+        httpx.Response(200, content=b"{not-json"),
+    ]
+
+    for mode_name, cfg in (("paper", cfg_paper), ("live", cfg_live)):
+        for idx, v2_resp in enumerate(bad_responses):
+            clear_buy_reservations()
+            db = AgentDatabase(db_path=str(tmp_path / f"e4f_bad_{mode_name}_{idx}.duckdb"), starting_sol=5.0)
+            db.upsert_watchlist_entry(mint=MINT_E4E, symbol="E4E", pair_address=POOL_PINNED, candidate={"mint": MINT_E4E}, safety_passed=True)
+            db.mark_watchlist_safety_passed(MINT_E4E, True, checked_at=fresh_ts)
+
+            def handler(req: httpx.Request, resp=v2_resp) -> httpx.Response:
+                u = str(req.url)
+                if u.startswith(RPC_URL):
+                    return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 5_000_000_000}})
+                if "/tokens/v2/search" in u:
+                    return resp
+                raise AssertionError(f"Unexpected downstream call after Token v2 rejection: {u}")
+
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                out = await executor_node(
+                    {"focus_state": FocusState.SCANNING.value, "sol_balance": 5.0, "daily_pnl_sol": 0.0, "pending_order": _mk_e4e_order()},
+                    config=cfg, db=db, http_client=client,
+                )
+            assert out == {"pending_order": None}
+            assert get_inflight_buy_reservations(str(db.db_path)) == []
+            assert db.get_active_locking_intents() == []
+            assert db.get_watchlist_entry(MINT_E4E) is not None
+            assert db.is_on_cooldown(MINT_E4E) is False
+            db.close()

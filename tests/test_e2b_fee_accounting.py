@@ -63,7 +63,7 @@ async def test_e2b_buy_to_sell_reconciles_account_and_lifecycle_pnl(tmp_path):
 
     def handler(request: httpx.Request) -> httpx.Response:
         if "/tokens/v2/search" in str(request.url):
-            return httpx.Response(200, json=[{"id": MINT_E2B, "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": MINT_E2B, "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if request.url.params.get("inputMint") == SOL_MINT:
             return httpx.Response(200, json={"outAmount": "1000000", "transaction": None})
         return httpx.Response(200, json={"outAmount": str(int(0.55 * LAMPORTS_PER_SOL)), "transaction": None})
@@ -114,7 +114,7 @@ async def test_e2b_partial_sell_then_final_sell_trailing_and_reentry_scope(tmp_p
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": MINT_E2B, "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": MINT_E2B, "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
         if "/ultra/v1/shield" in url:
@@ -248,7 +248,7 @@ async def test_e2b_live_unknown_fee_remains_null_and_historical_migration_preser
 
     def live_handler(request: httpx.Request) -> httpx.Response:
         if "/tokens/v2/search" in str(request.url):
-            return httpx.Response(200, json=[{"id": MINT_E2B, "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": MINT_E2B, "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if str(request.url).startswith("https://rpc.example.test"):
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 2_000_000_000}})
         if "/swap/v2/order" in str(request.url):
@@ -562,7 +562,7 @@ async def test_e2b_c2_live_unknown_fees_no_zero_substitution(tmp_path, monkeypat
 
     def handler(request: httpx.Request) -> httpx.Response:
         if "/tokens/v2/search" in str(request.url):
-            return httpx.Response(200, json=[{"id": MINT_E2B, "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": MINT_E2B, "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if str(request.url).startswith("https://rpc.example.test"):
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {"context": {"slot": 1}, "value": 3_000_000_000}})
         if request.url.params.get("inputMint") == SOL_MINT:

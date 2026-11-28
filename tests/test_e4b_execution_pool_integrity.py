@@ -136,7 +136,7 @@ async def test_e4b_live_metis_verified_pinned_pool_and_multi_hop_continuity(tmp_
         if "/swap/v2/execute" in str(request.url):
             return httpx.Response(200, json={"signature": "SigE4BOk111", "outputAmountResult": "1000000000"})
         if "/tokens/v2/search" in str(request.url):
-            return httpx.Response(200, json=[{"id": request.url.params.get("query", MINT_E4B), "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", MINT_E4B), "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "rugcheck.xyz" in str(request.url):
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
         if "/ultra/v1/shield" in str(request.url):
@@ -236,7 +236,7 @@ async def test_e4b_live_rejects_mismatched_missing_and_unverifiable_routes_witho
             exec_calls["n"] += 1
             return httpx.Response(200, json={"signature": "ShouldNeverBroadcast"})
         if "/tokens/v2/search" in str(request.url):
-            return httpx.Response(200, json=[{"id": request.url.params.get("query", MINT_E4B), "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", MINT_E4B), "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "rugcheck.xyz" in str(request.url):
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
         if "/ultra/v1/shield" in str(request.url):
@@ -287,7 +287,7 @@ async def test_e4b_paper_telemetry_all_statuses_and_opt_in_enforcement(tmp_path)
 
         def handler_p(req: httpx.Request, qp: dict[str, Any] = quote_payload) -> httpx.Response:
             if "/tokens/v2/search" in str(req.url):
-                return httpx.Response(200, json=[{"id": MINT_E4B, "audit": {"isSus": False}}])
+                return httpx.Response(200, json=[{"id": MINT_E4B, "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
             return httpx.Response(200, json=qp)
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler_p)) as client:
@@ -318,7 +318,7 @@ async def test_e4b_paper_telemetry_all_statuses_and_opt_in_enforcement(tmp_path)
 
         def handler_e(req: httpx.Request, qp: dict[str, Any] = quote_payload) -> httpx.Response:
             if "/tokens/v2/search" in str(req.url):
-                return httpx.Response(200, json=[{"id": MINT_E4B, "audit": {"isSus": False}}])
+                return httpx.Response(200, json=[{"id": MINT_E4B, "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
             return httpx.Response(200, json=qp)
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler_e)) as client:

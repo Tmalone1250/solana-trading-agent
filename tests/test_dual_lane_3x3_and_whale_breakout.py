@@ -41,11 +41,11 @@ async def test_3x3_dual_lane_caps_and_duplicate_mint_rejection(tmp_path):
     def jup_handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": request.url.params.get("query", ign_mint), "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ign_mint), "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "/ultra/v1/shield" in url:
             return httpx.Response(200, json={"warnings": {request.url.params.get("mints", ""): []}})
         return httpx.Response(200, json={"outAmount": "1000000", "transaction": None})
@@ -218,7 +218,7 @@ async def test_whale_breakout_gate_blocks_extended_and_low_score_and_logs_csv(tm
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": request.url.params.get("query", ign_mint), "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ign_mint), "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "/ultra/v1/shield" in url:
             return httpx.Response(200, json={"warnings": {ign_mint: []}})
         if "/swap/v2/order" in url:
@@ -265,7 +265,7 @@ async def test_jupiter_v3_flat_schema_dexscreener_pricenative_fallback_and_telem
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
         if "/ultra/v1/shield" in url:

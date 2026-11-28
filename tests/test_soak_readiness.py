@@ -27,7 +27,7 @@ def _jup_order_handler(out_tokens: int = 1_000_000, out_lamports: int = int(0.55
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", ""), "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
         if "/ultra/v1/shield" in url:

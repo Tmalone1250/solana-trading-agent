@@ -208,7 +208,7 @@ async def test_jupiter_raw_price_impact_persisted_without_altering_fills(tmp_pat
 
     def jup_handler(request: httpx.Request) -> httpx.Response:
         if "/tokens/v2/search" in str(request.url):
-            return httpx.Response(200, json=[{"id": "MintImpact11111111111111111111111111111111", "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": "MintImpact11111111111111111111111111111111", "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         return httpx.Response(200, json={"outAmount": "2000000", "priceImpactPct": "25.5", "transaction": None})
 
     order = PendingOrder(
@@ -445,7 +445,7 @@ async def test_graph_multi_slot_chart_routing_scans_below_cap_and_stops_at_cap(t
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": mint_new, "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": mint_new, "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "/ultra/v1/shield" in url:
             return httpx.Response(200, json={"warnings": {mint_new: []}})
         if "/swap/v2/order" in url:
