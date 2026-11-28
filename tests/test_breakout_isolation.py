@@ -240,11 +240,11 @@ async def test_executor_final_guard_blocks_unauthorized_chart_buy_allows_sells_a
     def _jup_ok(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": request.url.params.get("query", "MintGoodBO"), "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", "MintGoodBO"), "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": bo_mint, "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": bo_mint, "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "/ultra/v1/shield" in url:
             return httpx.Response(200, json={"warnings": {request.url.params.get("mints", "MintGoodBO"): []}})
         if "/swap/v2/order" in url:
@@ -411,7 +411,7 @@ async def test_end_to_end_breakout_ignition_paper_lifecycle_partial_and_final_ex
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": bo_mint, "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": bo_mint, "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "/ultra/v1/shield" in url:
             return httpx.Response(200, json={"warnings": {bo_mint: []}})
         if "/swap/v2/order" in url:

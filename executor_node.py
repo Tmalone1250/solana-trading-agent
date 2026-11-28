@@ -516,10 +516,22 @@ async def _validate_e4e_pre_execution_safety(
         if matched_item is None:
             raise E4AValidationError("BLOCKED: PRE_EXECUTION_JUPITER_V2_MISSING_MINT")
         audit_obj = matched_item.get("audit")
-        if not isinstance(audit_obj, dict) or "isSus" not in audit_obj or not isinstance(audit_obj["isSus"], bool):
+        if not isinstance(audit_obj, dict):
             raise E4AValidationError("BLOCKED: PRE_EXECUTION_JUPITER_V2_MALFORMED_AUDIT")
-        if audit_obj["isSus"] is True:
-            confirmed_unsafe.append("Jupiter Token v2: audit.isSus=True")
+        if "isSus" in audit_obj:
+            is_sus_val = audit_obj["isSus"]
+            if is_sus_val is True:
+                confirmed_unsafe.append("Jupiter Token v2: audit.isSus=True")
+            else:
+                # Official Jupiter v2 docs: isSus is only present when flagged ("check for presence, not value").
+                # Explicit False or non-boolean values are rejected conservatively as ambiguous evidence (no eviction).
+                raise E4AValidationError("BLOCKED: PRE_EXECUTION_JUPITER_V2_MALFORMED_AUDIT")
+        else:
+            logger.debug(
+                "[Executor] JUPITER_SUSPICIOUS_FLAG_NOT_PRESENT for %s (%s); continuing independent safety checks",
+                order.symbol,
+                order.mint,
+            )
     except E4AValidationError:
         raise
     except Exception as exc:

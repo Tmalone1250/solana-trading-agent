@@ -75,7 +75,7 @@ async def test_action_ledger_logs_buy_sell_evict_circuit_breaker_and_csv_export(
     def jup_handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": "MintWin", "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": "MintWin", "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
         if "/ultra/v1/shield" in url:

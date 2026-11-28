@@ -85,7 +85,7 @@ async def test_concurrent_chart_and_whale_slots_and_duplicate_mint_guard(tmp_pat
         if "rugcheck.xyz" in url:
             return httpx.Response(200, json={"rugged": False, "markets": [{"lp": {"lpLockedPct": 100.0}}], "risks": []})
         if "/tokens/v2/search" in url:
-            return httpx.Response(200, json=[{"id": request.url.params.get("query", whale_mint), "audit": {"isSus": False}}])
+            return httpx.Response(200, json=[{"id": request.url.params.get("query", whale_mint), "audit": {"mintAuthorityDisabled": True, "freezeAuthorityDisabled": True, "topHoldersPercentage": 15.46}}])
         if "/ultra/v1/shield" in url:
             return httpx.Response(200, json={"warnings": {whale_mint: []}})
         if "/swap/v2/order" in url:
